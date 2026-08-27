@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+from rova.ai.models import Model
+from rova.agent_session.compaction import CompactionPolicy
+from rova.config import load_project_env
+from .paths import RovaDataPaths
+
+
+@dataclass(frozen=True)
+class AppSettings:
+    provider: str = "mock"
+    model: str = "mock"
+    base_url: str | None = None
+    context_window: int | None = None
+    compaction_reserve_tokens: int | None = None
+    compaction_keep_recent_tokens: int | None = None
+    artifact_root: Path | None = None
+    memory_root: Path | None = None
+    memory_provider: str | None = None
+    memory_model: str | None = None
+    memory_base_url: str | None = None
+    memory_context_window: int | None = None
+    memory_update_interval: int = 3
+    memory_max_chars: int = 6_000
+    memory_consolidation_threshold: int = 4_800
+    data_dir: Path | None = None
+
+    @classmethod
+    def from_env(
+        cls,
+        env: Mapping[str, str] | None = None,
+        *,
+        dotenv_path: Path | None = None,
+    ) -> "AppSettings":
+        source = load_project_env(env, dotenv_path=dotenv_path)
+        context_window = source.get("ROVA_CONTEXT_WINDOW")
+        reserve_tokens = source.get("ROVA_COMPACTION_RESERVE_TOKENS")
+        keep_recent_tokens = source.get("ROVA_COMPACTION_KEEP_RECENT_TOKENS")
+        artifact_root = source.get("ROVA_ARTIFACT_ROOT")
+        memory_root = source.get("ROVA_MEMORY_ROOT")
+        memory_context_window = source.get("ROVA_MEMORY_CONTEXT_WINDOW")
+        memory_update_interval = source.get("ROVA_MEMORY_UPDATE_INTERVAL")
+        memory_max_chars = source.get("ROVA_MEMORY_MAX_CHARS")
+        memory_consolidation_threshold = source.get("ROVA_MEMORY_CONSOLIDATION_THRESHOLD")
+        data_dir = source.get("ROVA_DATA_DIR")
+        return cls(
+            provider=source.get("ROVA_PROVIDER", "mock"),
+            model=source.get("ROVA_MODEL", "mock"),
+            base_url=source.get("ROVA_BASE_URL") or None,
+            context_window=int(context_window) if context_window else None,
+            compaction_reserve_tokens=int(reserve_tokens) if reserve_tokens else None,
+            compaction_keep_recent_tokens=int(keep_recent_tokens) if keep_recent_tokens else None,
+            artifact_root=Path(artifact_root).expanduser() if artifact_root else None,
+            memory_root=Path(memory_root).expanduser() if memory_root else None,
+            memory_provider=source.get("ROVA_MEMORY_PROVIDER") or None,
+            memory_model=source.get("ROVA_MEMORY_MODEL") or None,
+            memory_base_url=source.get("ROVA_MEMORY_BASE_URL") or None,
+            memory_context_window=int(memory_context_window) if memory_context_window else None,
+            memory_update_interval=int(memory_update_interval) if memory_update_interval else 3,
+            memory_max_chars=int(memory_max_chars) if memory_max_chars else 6_000,
+            memory_consolidation_threshold=(
+                int(memory_consolidation_threshold) if memory_consolidation_threshold else 4_800
+            ),
+            data_dir=Path(data_dir).expanduser() if data_dir else None,
+        )
+
+    def to_model(self) -> Model:
+        return Model(
+            provider=self.provider,
+            model=self.model,
+            base_url=self.base_url,
+            context_window=self.context_window,
+        )
+
+    def to_memory_model(self) -> Model:
+        return Model(
+            provider=self.memory_provider or self.provider,
+            model=self.memory_model or self.model,
+            base_url=self.memory_base_url if self.memory_base_url is not None else self.base_url,
+            context_window=(
+                self.memory_context_window
+                if self.memory_context_window is not None
+                else self.context_window
+            ),
+        )
+
+    def data_paths(self, explicit_data_dir: Path | None = None) -> RovaDataPaths:
+        return RovaDataPaths.resolve(explicit_data_dir or self.data_dir)
+
+    def to_compaction_policy(self) -> CompactionPolicy | None:
+        if self.compaction_reserve_tokens is None and self.compaction_keep_recent_tokens is None:
+            return None
+        if self.compaction_reserve_tokens is None or self.compaction_keep_recent_tokens is None:
+            raise ValueError("both compaction reserve and keep-recent settings are required")
+        return CompactionPolicy(self.compaction_reserve_tokens, self.compaction_keep_recent_tokens)
