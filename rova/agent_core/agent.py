@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -7,7 +8,7 @@ from contextvars import ContextVar
 
 from rova.ai.context import Context
 from rova.ai.events import Start, StreamDone, StreamError, TextDelta, ToolCallDelta
-from rova.ai.messages import AssistantMessage, TextBlock, UserMessage
+from rova.ai.messages import AssistantMessage, TextBlock, ToolResultMessage, UserMessage
 from rova.ai.models import Model
 from .events import AgentEvent, AgentTerminationReason
 from .tools import AgentTool, ToolRegistry
@@ -86,7 +87,28 @@ class Agent:
                 return assistant_messages
             for tool_call in assistant.tool_calls:
                 await self._emit(AgentEvent("tool_execution_start", tool_call_id=tool_call.id, tool_name=tool_call.name, args=tool_call.arguments))
-                result = await self.registry.execute(tool_call, scope=self.current_tool_output_scope())
+                try:
+                    result = await self.registry.execute(tool_call, scope=self.current_tool_output_scope())
+                except asyncio.CancelledError:
+                    result = ToolResultMessage(
+                        tool_call.id,
+                        tool_call.name,
+                        [TextBlock("Tool execution cancelled by user.")],
+                        is_error=True,
+                        metadata={"outcome": "cancelled"},
+                    )
+                    self.messages.append(result)
+                    await self._emit(
+                        AgentEvent(
+                            "tool_execution_end",
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            result=result.text,
+                            is_error=True,
+                            metadata=result.metadata,
+                        )
+                    )
+                    raise
                 self.messages.append(result)
                 await self._emit(AgentEvent("tool_execution_end", tool_call_id=tool_call.id, tool_name=tool_call.name, result=result.text, is_error=result.is_error, metadata=result.metadata))
             await self._emit(AgentEvent("turn_end", message=assistant))

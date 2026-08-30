@@ -3,7 +3,7 @@ import {readFileSync} from 'node:fs';
 
 import {TUI_RENDER_OPTIONS} from './tui_render_options.js';
 
-assert.equal(TUI_RENDER_OPTIONS.alternateScreen, true);
+assert.equal(TUI_RENDER_OPTIONS.alternateScreen, false);
 assert.equal(TUI_RENDER_OPTIONS.exitOnCtrlC, false);
 assert.equal(TUI_RENDER_OPTIONS.interactive, true);
 

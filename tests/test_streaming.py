@@ -125,6 +125,18 @@ async def test_streaming_translator_preserves_usage_from_terminal_usage_only_chu
 
 
 @pytest.mark.asyncio
+async def test_streaming_translator_requests_terminal_usage_chunk():
+    client = FakeStreamingHttpClient([
+        sse_chunk({"content": "done"}, "stop"), "",
+        "data: [DONE]", "",
+    ])
+
+    _ = [event async for event in OpenAICompatibleProvider("key", client).stream(Model(provider="openai_compatible"), context())]
+
+    assert client.calls[0][2]["stream_options"] == {"include_usage": True}
+
+
+@pytest.mark.asyncio
 async def test_streaming_translator_closes_transport_before_exposing_text_done():
     client = TrackingStreamingHttpClient([[
         sse_chunk({"content": "done"}), "",

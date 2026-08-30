@@ -148,6 +148,31 @@ async def test_gateway_accepts_prompt_and_forwards_existing_agent_stream_events(
 
 
 @pytest.mark.asyncio
+async def test_gateway_cancels_the_active_prompt_and_allows_a_follow_up_prompt(tmp_path):
+    frames = []
+    runtime = FakeRuntime("session-1")
+    gateway = TuiGateway(
+        runtime_factory=lambda session_id, approval_handler: runtime,
+        session_store=JsonlSessionStore(tmp_path),
+        emit_frame=frames.append,
+    )
+    await gateway.initialize()
+
+    await gateway.process_line(_request("first", "prompt.submit", {"text": "cancel this"}))
+    await runtime.prompt_started.wait()
+    await gateway.process_line(_request("cancel", "prompt.cancel"))
+    runtime.prompt_release.set()
+    await gateway.wait_for_prompt()
+
+    assert next(frame for frame in frames if frame.get("id") == "cancel")["result"] == {"cancelled": True}
+    assert any(frame.get("params", {}).get("type") == "run.cancelled" for frame in frames)
+
+    await gateway.process_line(_request("second", "prompt.submit", {"text": "next turn"}))
+    assert next(frame for frame in frames if frame.get("id") == "second")["result"] == {"accepted": True}
+    await gateway.wait_for_prompt()
+
+
+@pytest.mark.asyncio
 async def test_gateway_approval_resolves_only_matching_request_and_eof_fails_closed():
     events = []
     handler = GatewayApprovalHandler(lambda event_type, payload: events.append((event_type, payload)))
@@ -165,6 +190,20 @@ async def test_gateway_approval_resolves_only_matching_request_and_eof_fails_clo
     await asyncio.sleep(0)
     handler.deny_pending()
     assert await pending is ApprovalDecision.DENY
+
+
+@pytest.mark.asyncio
+async def test_gateway_approval_cancellation_propagates_to_the_active_turn():
+    handler = GatewayApprovalHandler(lambda _event_type, _payload: None)
+    request = ApprovalRequest("shell", {"command": "python -V"}, "requires approval", "Run command")
+    pending = asyncio.create_task(handler.request_approval(request))
+    await asyncio.sleep(0)
+
+    pending.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert handler._pending == {}
 
 
 @pytest.mark.asyncio

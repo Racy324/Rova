@@ -7,8 +7,10 @@ from rova.ai.events import Start, StreamDone, TextDelta
 from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage, UserMessage
 from rova.ai.models import Model
 from rova.agent_core.agent import Agent
+from rova.agent_core.tools import AgentTool, AgentToolResult
 from rova.agent_session.agent_session import AgentSession, SessionBranchError, SessionIncompleteError, SessionPersistenceError
 from rova.agent_session.session_store import JsonlSessionStore, SessionStoreError
+from rova.ai.tools import Tool
 from tests.tool_helpers import make_test_calc_tool
 
 
@@ -64,6 +66,38 @@ async def test_durable_session_persists_only_final_streaming_message_once(tmp_pa
     loaded = JsonlSessionStore(tmp_path).load(session.session_id)
     assert loaded.messages == [UserMessage("hello"), AssistantMessage([TextBlock("partial became final")])]
     assert session.persisted_message_count == len(agent.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_execution_closes_the_durable_tool_call_tail(tmp_path):
+    tool_started = asyncio.Event()
+
+    async def blocking_execute(_tool_call_id, _params):
+        tool_started.set()
+        await asyncio.Event().wait()
+        return AgentToolResult([TextBlock("unreachable")])
+
+    async def stream(_model, context, _options):
+        if not any(isinstance(message, ToolResultMessage) for message in context.messages):
+            yield StreamDone(AssistantMessage([ToolCall("wait-1", "wait", {})], stop_reason="tool_calls"))
+            return
+        yield StreamDone(AssistantMessage([TextBlock("recovered")]))
+
+    agent = Agent(Model("mock"), "", [AgentTool(Tool("wait", "wait", {}), blocking_execute)], stream)
+    session = AgentSession.create(agent, session_root=tmp_path)
+    cancelled_prompt = asyncio.create_task(session.prompt("start work"))
+    await tool_started.wait()
+
+    cancelled_prompt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_prompt
+
+    result = await session.prompt("continue")
+
+    assert result[-1].text == "recovered"
+    cancellation_result = next(message for message in agent.messages if isinstance(message, ToolResultMessage))
+    assert cancellation_result.is_error is True
+    assert cancellation_result.metadata["outcome"] == "cancelled"
 
 
 @pytest.mark.asyncio

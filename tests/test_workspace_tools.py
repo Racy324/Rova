@@ -192,6 +192,15 @@ async def test_shell_tool_uses_workspace_captures_output_and_nonzero_exit(worksp
     }
 
 
+def test_shell_tool_describes_workspace_as_cwd_not_filesystem_sandbox(workspace_root: Path):
+    tool = create_shell_tool(Workspace(workspace_root))
+
+    assert tool.tool.description == (
+        "Run a local host shell command with the workspace as its working directory. "
+        "Shell commands require approval and are not filesystem sandboxed."
+    )
+
+
 @pytest.mark.asyncio
 async def test_shell_tool_times_out_without_interactive_stdin(workspace_root: Path):
     tool = create_shell_tool(Workspace(workspace_root))
@@ -205,6 +214,30 @@ async def test_shell_tool_times_out_without_interactive_stdin(workspace_root: Pa
         "timed_out": True,
         "outcome": "command_timeout",
     }
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_cancellation_terminates_a_started_command(workspace_root: Path):
+    tool = create_shell_tool(Workspace(workspace_root))
+    started = workspace_root / "started.txt"
+    completed = workspace_root / "completed.txt"
+    command = (
+        f'"{sys.executable}" -c "from pathlib import Path; import time; '
+        "Path('started.txt').write_text('started'); time.sleep(0.5); Path('completed.txt').write_text('completed'); time.sleep(1)\""
+    )
+    task = asyncio.create_task(tool.execute("shell-cancel", {"command": command, "timeout_seconds": 40}))
+    for _ in range(100):
+        if started.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert started.exists()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.75)
+
+    assert not completed.exists()
 
 
 @pytest.mark.asyncio

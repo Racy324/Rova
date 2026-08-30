@@ -39,8 +39,6 @@ class GatewayApprovalHandler:
         self._emit_event("approval.request", _approval_payload(request_id, request))
         try:
             return await future
-        except asyncio.CancelledError:
-            return ApprovalDecision.DENY
         finally:
             self._pending.pop(request_id, None)
 
@@ -133,6 +131,11 @@ class TuiGateway:
                 raise _GatewayRequestError(-32000, "a prompt is already active")
             self._prompt_task = asyncio.create_task(self._run_prompt(text))
             return {"accepted": True}
+        if method == "prompt.cancel":
+            if self._prompt_task is None or self._prompt_task.done():
+                raise _GatewayRequestError(-32000, "no prompt is active")
+            self._prompt_task.cancel()
+            return {"cancelled": True}
         if method == "session.list":
             limit = params.get("limit")
             if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
@@ -171,6 +174,8 @@ class TuiGateway:
     async def _run_prompt(self, text: str) -> None:
         try:
             await self._runtime().prompt(text)
+        except asyncio.CancelledError:
+            self._emit_event("run.cancelled", {"message": "Turn cancelled by user."})
         except Exception as error:
             self._emit_event("error", {"error_type": type(error).__name__, "message": _safe_error_message(error)})
 

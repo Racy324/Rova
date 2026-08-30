@@ -77,6 +77,38 @@ def test_unified_cli_accepts_tui_without_changing_standard_options() -> None:
     assert args.web is True
 
 
+def test_tui_terminal_support_requires_real_input_and_output_ttys(monkeypatch) -> None:
+    class Stream:
+        def __init__(self, is_tty: bool) -> None:
+            self._is_tty = is_tty
+
+        def isatty(self) -> bool:
+            return self._is_tty
+
+    monkeypatch.setattr(cli.sys, "stdin", Stream(True))
+    monkeypatch.setattr(cli.sys, "stdout", Stream(False))
+
+    assert cli._supports_tui_terminal() is False
+
+
+def test_cli_main_falls_back_to_scrolling_repl_without_a_real_tty(monkeypatch, capsys) -> None:
+    args = parse_rova_cli_args(["--tui"])
+    seen: list[object] = []
+
+    async def run_repl(*, args):
+        seen.append(args)
+
+    monkeypatch.setattr(cli, "_configure_console_encoding", lambda: None)
+    monkeypatch.setattr(cli, "parse_rova_cli_args", lambda: args)
+    monkeypatch.setattr(cli, "_supports_tui_terminal", lambda: False)
+    monkeypatch.setattr(cli, "run_rova_cli", run_repl)
+
+    cli.main()
+
+    assert seen == [args]
+    assert "using the scrolling CLI transcript" in capsys.readouterr().out
+
+
 def test_tui_launcher_uses_node_with_an_absolute_python_and_json_argument_list(monkeypatch, tmp_path: Path) -> None:
     entry = tmp_path / "ui-tui" / "dist" / "entry.js"
     entry.parent.mkdir(parents=True)

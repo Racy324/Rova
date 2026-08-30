@@ -23,6 +23,7 @@ from .web.settings import WebSettings
 from .web.sources import ResearchSourceStore
 from .runtime import DEFAULT_MAX_TURNS, MAX_PRODUCT_TURNS, build_rova_runtime
 from .settings import AppSettings
+from .vision import OpenAICompatibleVisionClient, VisionSettings
 
 
 _REPL_EXIT_COMMANDS = frozenset({"exit", "quit", "/q"})
@@ -148,6 +149,11 @@ def _build_runtime_from_args(
     webpage_fetcher = None
     if args.web:
         web_search_backend, webpage_fetcher = create_web_backends(WebSettings.from_env())
+    vision_client = None
+    if args.workspace is not None:
+        vision_settings = VisionSettings.from_env()
+        if vision_settings.is_configured:
+            vision_client = OpenAICompatibleVisionClient(vision_settings)
     data_paths = app_settings.data_paths(args.data_dir)
     session_root = data_paths.sessions
     artifact_root = data_paths.artifacts if args.data_dir is not None else app_settings.artifact_root or data_paths.artifacts
@@ -177,6 +183,7 @@ def _build_runtime_from_args(
         memory_update_interval=getattr(app_settings, "memory_update_interval", 3),
         memory_max_chars=getattr(app_settings, "memory_max_chars", 6_000),
         memory_consolidation_threshold=getattr(app_settings, "memory_consolidation_threshold", 4_800),
+        vision_client=vision_client,
     )
     return runtime
 
@@ -349,6 +356,18 @@ def _configure_tui_console_encoding() -> None:
         return
 
 
+def _supports_tui_terminal() -> bool:
+    """Ink needs both streams attached to a real ANSI-capable terminal."""
+    for stream in (sys.stdin, sys.stdout):
+        isatty = getattr(stream, "isatty", None)
+        try:
+            if not callable(isatty) or not isatty():
+                return False
+        except (OSError, ValueError):
+            return False
+    return True
+
+
 def _tui_gateway_argv(args: argparse.Namespace) -> list[str]:
     argv: list[str] = []
     if args.workspace is not None:
@@ -367,6 +386,10 @@ def main() -> None:
     _configure_console_encoding()
     args = parse_rova_cli_args()
     if args.tui:
-        _launch_tui(args)
+        if _supports_tui_terminal():
+            _launch_tui(args)
+        else:
+            _console_print("TUI requires an interactive terminal; using the scrolling CLI transcript instead.")
+            asyncio.run(run_rova_cli(args=args))
         return
     asyncio.run(run_rova_cli(args=args))

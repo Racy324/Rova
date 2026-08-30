@@ -19,6 +19,7 @@ from .paths import RovaDataPaths
 
 _SKILL_NAME: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SKILL_FILENAME: Final[str] = "SKILL.md"
+_SKILL_DIRECTORY_TEMPLATE: Final[str] = "${ROVA_SKILL_DIR}"
 
 
 class SkillStoreError(RuntimeError):
@@ -66,7 +67,11 @@ class FileSkillStore:
     def read(self, name: str, path: str | None = None) -> str:
         skill_directory = self._skill_directory(name)
         target = self._resolve_skill_file(skill_directory, path)
-        return _read_utf8(target)
+        return _substitute_skill_directory(_read_utf8(target), skill_directory)
+
+    def resolved_directory(self, name: str) -> Path:
+        """Return the installed package directory for an explicitly loaded Skill."""
+        return self._skill_directory(name).resolve()
 
     def create(self, name: str, content: str) -> None:
         _validate_skill_name(name)
@@ -167,10 +172,11 @@ def create_skill_tools(store: FileSkillStore) -> list[AgentTool]:
         path = params.get("path")
         try:
             content = store.read(name, path)
+            skill_directory = store.resolved_directory(name)
         except SkillStoreError as error:
             raise ToolExecutionError(str(error), metadata={"outcome": "tool_input_error"}) from error
         label = path or _SKILL_FILENAME
-        return AgentToolResult([TextBlock(f"Skill: {name}\nPath: {label}\n\n{content}")])
+        return AgentToolResult([TextBlock(f"Skill: {name}\nPath: {label}\nSkill directory: {skill_directory}\n\n{content}")])
 
     async def manage(_tool_call_id: str, params: dict) -> AgentToolResult:
         action = params["action"]
@@ -260,6 +266,10 @@ def _read_utf8(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
         raise SkillStoreError(f"could not read Skill file: {path.name}") from error
+
+
+def _substitute_skill_directory(content: str, directory: Path) -> str:
+    return content.replace(_SKILL_DIRECTORY_TEMPLATE, str(directory.resolve()))
 
 
 def _write_utf8_atomically(path: Path, content: str) -> None:

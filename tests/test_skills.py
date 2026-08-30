@@ -60,6 +60,19 @@ def test_store_reads_main_file_and_skill_relative_attachments(tmp_path: Path) ->
     assert store.read("code-review", "references/cpp-guidelines.md") == "Check error paths."
 
 
+def test_store_expands_resolved_skill_directory_for_loaded_skill_content(tmp_path: Path) -> None:
+    store = FileSkillStore(tmp_path / "skills")
+    store.create(
+        "code-review",
+        _skill_markdown("code-review", "Review code.", "Run `${ROVA_SKILL_DIR}/scripts/check.py`."),
+    )
+
+    content = store.read("code-review")
+
+    assert "${ROVA_SKILL_DIR}" not in content
+    assert f"{(store.root / 'code-review').resolve()}/scripts/check.py" in content
+
+
 @pytest.mark.parametrize("action", ["create", "edit", "delete"])
 def test_skill_mutation_waits_for_another_process_holding_the_store_lock(tmp_path: Path, action: str) -> None:
     store = FileSkillStore(tmp_path / "skills")
@@ -162,6 +175,7 @@ async def test_skill_view_returns_a_normal_tool_result(tmp_path: Path) -> None:
     assert result.is_error is False
     assert result.tool_name == "skill_view"
     assert "Skill: code-review" in result.text
+    assert f"Skill directory: {(store.root / 'code-review').resolve()}" in result.text
     assert "# code-review" in result.text
 
 

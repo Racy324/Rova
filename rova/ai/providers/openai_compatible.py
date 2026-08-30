@@ -93,7 +93,15 @@ class OpenAICompatibleProvider:
 
 
 def to_provider_request(model: Model, context: Context) -> dict:
-    payload = {"model": model.model, "messages": to_provider_messages(context.system_prompt, context.messages), "stream": True}
+    payload = {
+        "model": model.model,
+        "messages": to_provider_messages(context.system_prompt, context.messages),
+        "stream": True,
+        # OpenAI-compatible streaming APIs otherwise commonly omit the final
+        # usage-only chunk. Providers that do not implement this extension can
+        # still respond normally; usage remains optional in Rova's contract.
+        "stream_options": {"include_usage": True},
+    }
     tools = to_provider_tools(context.tools)
     if tools:
         payload["tools"] = tools

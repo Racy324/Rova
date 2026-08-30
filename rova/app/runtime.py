@@ -36,6 +36,7 @@ from .memory import (
 from .memory_maintenance import MemoryMaintenanceError, consolidate_memory, extract_memory_update
 from .paths import RovaDataPaths
 from .skills import FileSkillStore, SkillCatalogSnapshot, SkillStoreError, create_skill_tools
+from .vision import VisionClient, create_vision_analyze_tool
 
 
 DEFAULT_MAX_TURNS = 16
@@ -168,6 +169,7 @@ def build_rova_runtime(
     memory_update_interval: int = DEFAULT_MEMORY_UPDATE_INTERVAL,
     memory_max_chars: int = DEFAULT_MEMORY_MAX_CHARS,
     memory_consolidation_threshold: int = DEFAULT_MEMORY_CONSOLIDATION_THRESHOLD,
+    vision_client: VisionClient | None = None,
 ) -> RovaRuntime:
     if (web_search_backend is None) != (webpage_fetcher is None):
         raise ValueError("web_search_backend and webpage_fetcher must be provided together")
@@ -185,6 +187,8 @@ def build_rova_runtime(
         or not 0 < memory_consolidation_threshold <= memory_max_chars
     ):
         raise ValueError("memory_consolidation_threshold must be between 1 and memory_max_chars")
+    if vision_client is not None and workspace_root is None:
+        raise ValueError("vision_client requires workspace_root")
 
     workspace = Workspace(workspace_root) if workspace_root is not None else None
     workspace_context = WorkspaceContext(workspace) if workspace is not None else None
@@ -206,6 +210,8 @@ def build_rova_runtime(
         effective_policy = DefaultCodingToolPolicy() if policy is None else policy
         effective_approval_handler = approval_handler or _approval_handler_for_mode(permission_mode)
         tools.extend(build_controlled_coding_tools(workspace, effective_policy, effective_approval_handler, workspace_context))
+        if vision_client is not None:
+            tools.append(create_vision_analyze_tool(workspace, vision_client))
     if source_store is not None:
         assert web_search_backend is not None
         assert webpage_fetcher is not None

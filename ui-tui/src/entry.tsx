@@ -2,10 +2,10 @@ import React, {useEffect, useMemo, useState} from 'react';
 import {Box, render, Text, useApp, useInput} from 'ink';
 
 import {GatewayClient, type GatewayEvent, type RuntimeStatus, type SessionSummary, type TranscriptItem} from './gatewayClient.js';
+import {applyCurrentTurnToolEvent, beginCurrentTurn, type ToolActivity} from './current_turn_tools.js';
 import {Markdown} from './markdown.js';
 import {TUI_RENDER_OPTIONS} from './tui_render_options.js';
 
-type ToolActivity = {id: string; toolName: string; summary: string; status: 'running' | 'success' | 'error' | 'called'};
 type Approval = {requestId: string; toolName: string; summary: string; policyReason: string; command?: string; path?: string; cwd?: string};
 
 function value(payload: Record<string, unknown>, key: string): string {
@@ -23,6 +23,7 @@ function App(): React.ReactNode {
 	const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
 	const [notice, setNotice] = useState('');
 	const [busy, setBusy] = useState(false);
+	const [cancelling, setCancelling] = useState(false);
 
 	useEffect(() => {
 		const unsubscribe = client.onEvent(event => handleEvent(event));
@@ -52,13 +53,15 @@ function App(): React.ReactNode {
 			}
 			case 'tool.start': {
 				const id = value(payload, 'tool_call_id');
-				setTools(current => [...current, {id, toolName: value(payload, 'tool_name'), summary: value(payload, 'summary'), status: 'running'}]);
+				setTools(current => applyCurrentTurnToolEvent(current, {
+					type: 'tool.start', id, toolName: value(payload, 'tool_name'), summary: value(payload, 'summary'),
+				}));
 				break;
 			}
 			case 'tool.end': {
 				const id = value(payload, 'tool_call_id');
 				const nextStatus = value(payload, 'status') === 'error' ? 'error' : 'success';
-				setTools(current => current.map(tool => tool.id === id ? {...tool, status: nextStatus} : tool));
+				setTools(current => applyCurrentTurnToolEvent(current, {type: 'tool.end', id, status: nextStatus}));
 				break;
 			}
 			case 'approval.request':
@@ -74,9 +77,19 @@ function App(): React.ReactNode {
 				break;
 			case 'run.finished':
 				setBusy(false);
+				setCancelling(false);
+				break;
+			case 'run.cancelled':
+				setBusy(false);
+				setCancelling(false);
+				setApproval(null);
+				setStreaming('');
+				setTools(beginCurrentTurn());
+				setNotice(value(payload, 'message') || 'Turn cancelled by user.');
 				break;
 			case 'error':
 				setBusy(false);
+				setCancelling(false);
 				setNotice(`${value(payload, 'error_type') || 'Error'}: ${value(payload, 'message')}`);
 				break;
 		}
@@ -85,11 +98,24 @@ function App(): React.ReactNode {
 	async function submit(text: string): Promise<void> {
 		if (busy || !text.trim()) return;
 		try {
+			setTools(beginCurrentTurn());
+			setStreaming('');
 			await client.request<{accepted: boolean}>('prompt.submit', {text});
 			setTranscript(current => [...current, {role: 'user', text}]);
 			setBusy(true);
 			setNotice('');
 		} catch (error) {
+			setNotice(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	async function cancelCurrentTurn(): Promise<void> {
+		if (!busy || cancelling) return;
+		setCancelling(true);
+		try {
+			await client.request<{cancelled: boolean}>('prompt.cancel');
+		} catch (error) {
+			setCancelling(false);
 			setNotice(error instanceof Error ? error.message : String(error));
 		}
 	}
@@ -119,12 +145,7 @@ function App(): React.ReactNode {
 			const result = await client.request<{status: RuntimeStatus; transcript: TranscriptItem[]}>('session.resume', {session_id: sessionId});
 			setStatus(result.status);
 			setTranscript(result.transcript);
-			setTools(result.transcript.filter(item => item.role === 'tool').map((item, index) => ({
-				id: `restored-${index}`,
-				toolName: item.tool_name ?? 'tool',
-				summary: item.summary ?? '',
-				status: item.status === 'error' ? 'error' : item.status === 'called' ? 'called' : 'success',
-			})));
+			setTools(beginCurrentTurn());
 			setSessions(null);
 		} catch (error) {
 			setNotice(error instanceof Error ? error.message : String(error));
@@ -136,7 +157,7 @@ function App(): React.ReactNode {
 		try {
 			setStatus(await client.request<RuntimeStatus>('session.new'));
 			setTranscript([]);
-			setTools([]);
+			setTools(beginCurrentTurn());
 			setStreaming('');
 			setNotice('New session created.');
 		} catch (error) {
@@ -154,7 +175,15 @@ function App(): React.ReactNode {
 	}
 
 	useInput((input, key) => {
+		if (busy && key.ctrl && input === 'c') {
+			void cancelCurrentTurn();
+			return;
+		}
 		if (approval || sessions) return;
+		if (busy && key.escape) {
+			void cancelCurrentTurn();
+			return;
+		}
 		if (key.ctrl && input === 'n') void newSession();
 		else if (key.ctrl && input === 'r') void openSessions();
 		else if (key.ctrl && input === 'c') void close();
@@ -166,12 +195,12 @@ function App(): React.ReactNode {
 			{transcript.filter(item => item.role !== 'tool').map((item, index) => <Message key={index} item={item}/>)}
 			{tools.map(tool => <ToolLine key={tool.id} tool={tool}/>) }
 			{streaming ? <Box flexDirection="column"><Text bold color="green">Rova</Text><Markdown text={streaming}/></Box> : null}
-			{busy ? <Text color="yellow">working…</Text> : null}
+			{busy ? <Text color="yellow">{cancelling ? 'cancelling…' : 'working…'}</Text> : null}
 			{notice ? <Text color="yellow">{notice}</Text> : null}
 		</Box>
 		<Composer busy={busy} onSubmit={submit}/>
-		<Text dimColor>Ctrl+N new session · Ctrl+R sessions · Ctrl+C exit when idle</Text>
-		{approval ? <ApprovalModal approval={approval} onDecision={chooseApproval}/> : null}
+		<Text dimColor>{busy ? 'Esc / Ctrl+C cancel current turn' : 'Ctrl+N new session · Ctrl+R sessions · Ctrl+C exit when idle'}</Text>
+		{approval ? <ApprovalModal approval={approval} onDecision={chooseApproval} onCancel={cancelCurrentTurn}/> : null}
 		{sessions ? <SessionPicker sessions={sessions} onResume={resume} onClose={() => setSessions(null)}/> : null}
 	</Box>;
 }
@@ -220,10 +249,11 @@ function Composer({busy, onSubmit}: {busy: boolean; onSubmit: (value: string) =>
 	return <Box borderStyle="round" paddingX={1}><Text color="blue">&gt; </Text><Text>{value || (busy ? 'busy - wait for the current run to finish' : '')}</Text></Box>;
 }
 
-function ApprovalModal({approval, onDecision}: {approval: Approval; onDecision: (decision: 'allow' | 'deny') => Promise<void>}): React.ReactNode {
+function ApprovalModal({approval, onDecision, onCancel}: {approval: Approval; onDecision: (decision: 'allow' | 'deny') => Promise<void>; onCancel: () => Promise<void>}): React.ReactNode {
 	useInput((input, key) => {
 		if (input.toLowerCase() === 'y') void onDecision('allow');
-		else if (input.toLowerCase() === 'n' || key.escape) void onDecision('deny');
+		else if (input.toLowerCase() === 'n') void onDecision('deny');
+		else if (key.escape) void onCancel();
 	});
 	return <Box borderStyle="double" borderColor="yellow" flexDirection="column" paddingX={1} marginTop={1}>
 		<Text bold color="yellow">Approval required</Text>
@@ -233,7 +263,7 @@ function ApprovalModal({approval, onDecision}: {approval: Approval; onDecision: 
 		{approval.cwd ? <Text>cwd: {approval.cwd}</Text> : null}
 		<Text>Reason: {approval.policyReason}</Text>
 		{approval.toolName === 'shell' ? <Text color="yellow">Shell commands are not sandboxed and may access external resources.</Text> : null}
-		<Text>[Y] Allow  [N/Esc] Deny</Text>
+		<Text>[Y] Allow  [N] Deny  [Esc] Cancel turn</Text>
 	</Box>;
 }
 

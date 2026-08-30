@@ -8,6 +8,7 @@ docs/
 
 # Rova runtime data
 .rova/
+.rova-skill-adapt/
 rova-data/
 sessions/
 memory/

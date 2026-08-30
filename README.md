@@ -28,7 +28,7 @@ python -m rova --workspace . --web
   支持目录浏览、文件读取、搜索、写入、编辑与 Shell 执行，可直接用于代码仓库和本地项目。
 
 - 🔒 **Workspace 安全控制**  
-  文件操作限制在指定 Workspace 内，写入、编辑和命令执行经过 Policy 与 Approval 控制。
+  文件操作限制在指定 Workspace 内；Shell 在 Workspace 中启动（作为 cwd），但属于需审批的本机宿主命令，不是文件系统 sandbox。写入、编辑和命令执行经过 Policy 与 Approval 控制。
 
 - 🌐 **联网搜索与网页获取**  
   支持 Web Search 与页面抓取，并保留来源身份与引用关系。
@@ -120,6 +120,18 @@ OPENAI_API_KEY=<api-key>
 
 更多配置项可参考项目中的 `.env.example`。
 
+### 可选：辅助 Vision
+
+配置独立的 Vision 模型后，Rova 会在指定 Workspace 中提供 `vision_analyze`，按需将本地 PNG、JPG/JPEG 或 WebP 图片交给辅助模型观察；主 Agent 仍保持文本推理与工具调用。
+
+```dotenv
+ROVA_VISION_MODEL=qwen3-vl-flash
+ROVA_VISION_BASE_URL=<vision-provider-base-url>
+ROVA_VISION_API_KEY=<vision-api-key>
+```
+
+启动 `python -m rova --workspace .` 后，可请求 Agent 分析 Workspace 内的图片，例如 `./test-data/architecture.png`。未配置 Vision 时不会注册该工具。
+
 ### 4. 启动 Rova
 
 进入交互模式：
@@ -202,6 +214,8 @@ TUI 支持：
 - Session 新建、查看与恢复
 - Markdown / Code 显示
 - Runtime 状态展示
+
+运行中的当前 Turn 可通过 `Esc` 或 `Ctrl+C` 取消；空闲时 `Ctrl+C` 退出 TUI。审批框中 `Y` 仅允许当前调用、`N` 仅拒绝当前调用，`Esc` 取消整个当前 Turn。
 
 CLI 与 TUI 共用同一个 Python Runtime，不维护第二套 Agent、Session、Tool 或 Policy 实现。
 
