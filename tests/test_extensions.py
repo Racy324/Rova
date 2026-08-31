@@ -15,6 +15,12 @@ from rova.app.extensions import ContextContribution, ExtensionAPI
 from rova.app.runtime import ROVA_SYSTEM_PROMPT, build_rova_runtime
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_rova_data_dir(monkeypatch, tmp_path: Path) -> None:
+    """Default-on review state must not leak from one extension test into another."""
+    monkeypatch.setenv("ROVA_DATA_DIR", str(tmp_path / "rova-data"))
+
+
 def _write_extension(root: Path, name: str, source: str) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{name}.py"
@@ -357,7 +363,7 @@ async def test_context_contributors_are_ordered_dynamic_and_recomputed_per_provi
     assert "alpha-2" in second.system_prompt and "beta-2" in second.system_prompt
     assert runtime.agent.system_prompt == ROVA_SYSTEM_PROMPT
     assert [message.content for message in runtime.agent.messages if message.role == "user"] == ["first", "second"]
-    assert [tool.name for tool in runtime.agent.registry.schemas] == ["skill_view", "skill_manage"]
+    assert [tool.name for tool in runtime.agent.registry.schemas] == ["skill_view", "skill_manage", "memory_manage"]
 
 
 @pytest.mark.asyncio
@@ -471,7 +477,7 @@ async def test_no_extensions_preserves_existing_tool_set_and_context(tmp_path: P
     )
 
     assert (await runtime.prompt("hello"))[-1].text == "done"
-    assert [tool.name for tool in runtime.agent.registry.schemas] == ["skill_view", "skill_manage"]
+    assert [tool.name for tool in runtime.agent.registry.schemas] == ["skill_view", "skill_manage", "memory_manage"]
     assert "Extension context:" not in received_prompts[0]
     assert runtime.extension_load_report.loaded == ()
     assert runtime.extension_load_report.issues == ()

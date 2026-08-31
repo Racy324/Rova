@@ -37,7 +37,9 @@ python -m rova --workspace . --web
   使用 JSONL 保存会话，支持恢复、分支与上下文压缩。
 
 - 🧠 **长期 Memory**  
-  使用本地 Markdown 文件保存长期用户信息，并周期性提炼、更新与整理。
+  使用本地 Markdown 文件保存长期用户信息；Agent 可通过 `memory_manage` 显式保存稳定事实或偏好。
+- 🔄 **Experience Review**
+  默认在正常完成任务后累计最小证据，并在任务数或合格 Tool 调用数达到阈值时审查可沉淀的 Memory/Skill 改进。Reviewer 只读 Skill，写入由 Runtime 服务验证后执行；当前会话的冻结上下文不会被审查结果中途刷新。
 
 - 🧩 **Skills**  
   通过 Skill Catalog 发现能力，需要时按需读取完整 `SKILL.md`，避免一次性加载全部内容。
@@ -267,6 +269,16 @@ ROVA_DATA_DIR
 - `memory/`：`USER.md` 与 `MEMORY.md`
 - `skills/`：本地 Skills
 - `extensions/`：用户安装的本地 Extension
+- `experience/`：待审任务证据、计数器和脱敏审查日志
+
+Experience Review 默认开启；如需完全关闭自动审查，同时保留显式 `memory_manage`，可在 `.env` 中设置：
+
+```dotenv
+ROVA_EXPERIENCE_REVIEW_ENABLED=false
+# 默认值：Tool=10，已完成任务=5；任一阈值达到即审查。
+# ROVA_EXPERIENCE_REVIEW_TOOL_THRESHOLD=10
+# ROVA_EXPERIENCE_REVIEW_TASK_THRESHOLD=5
+```
 
 ---
 

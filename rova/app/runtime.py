@@ -29,12 +29,12 @@ from .workspace.policy import DefaultCodingToolPolicy, ToolPolicy
 from .workspace.workspace import Workspace
 from .memory import (
     FileMemoryStore,
-    MemoryApplyResult,
     MemorySnapshot,
     MemoryStore,
     MemoryStoreError,
+    create_memory_tools,
 )
-from .memory_maintenance import MemoryMaintenanceError, consolidate_memory, extract_memory_update
+from .experience_review import ExperienceReviewService, ExperienceReviewer, FileExperienceReviewStore
 from .paths import RovaDataPaths
 from .skills import FileSkillStore, SkillCatalogSnapshot, SkillStoreError, create_skill_tools
 from .vision import VisionClient, create_vision_analyze_tool
@@ -42,9 +42,9 @@ from .vision import VisionClient, create_vision_analyze_tool
 
 DEFAULT_MAX_TURNS = 16
 MAX_PRODUCT_TURNS = 32
-DEFAULT_MEMORY_UPDATE_INTERVAL = 3
 DEFAULT_MEMORY_MAX_CHARS = 6_000
-DEFAULT_MEMORY_CONSOLIDATION_THRESHOLD = 4_800
+DEFAULT_EXPERIENCE_REVIEW_TOOL_THRESHOLD = 10
+DEFAULT_EXPERIENCE_REVIEW_TASK_THRESHOLD = 5
 
 
 ROVA_SYSTEM_PROMPT = """You are Rova, a local single-user general agent.
@@ -71,16 +71,12 @@ class RovaRuntime:
     workspace_instruction_snapshot: WorkspaceInstructionSnapshot
     skill_store: FileSkillStore
     skill_catalog_snapshot: SkillCatalogSnapshot
-    memory_model: Model
-    memory_stream_fn: StreamFn
-    memory_update_interval: int
     memory_max_chars: int
-    memory_consolidation_threshold: int
+    experience_review_service: ExperienceReviewService | None
     extension_api: ExtensionAPI
     extension_load_report: ExtensionLoadReport
 
     def __post_init__(self) -> None:
-        self._user_turn_count = 0
         self._memory_listeners: list[Callable[[MemoryObservation], None]] = []
         self._local_context_attached = False
 
@@ -98,47 +94,35 @@ class RovaRuntime:
         return self.extension_api.runtime_issues
 
     async def prompt(self, text: str):
-        first_message_index = len(self.agent.messages)
+        if self.experience_review_service is not None:
+            self.experience_review_service.begin_run(text)
         request_text = text
         if not self._local_context_attached and self.local_context is not None:
             attachment = self.local_context.render_user_attachment()
             if attachment:
                 request_text = f"{text}\n\n{attachment}"
                 self._local_context_attached = True
-        responses = await self.session.prompt(request_text)
-        self._user_turn_count += 1
-        if self._user_turn_count % self.memory_update_interval == 0:
-            await self._maintain_memory(self.agent.messages[first_message_index:])
+        try:
+            responses = await self.session.prompt(request_text)
+        except BaseException:
+            if self.experience_review_service is not None:
+                self.experience_review_service.discard_run()
+            raise
+        if self.experience_review_service is not None:
+            final = responses[-1] if responses else None
+            if final is None or final.stop_reason != "stop" or final.tool_calls:
+                self.experience_review_service.discard_run()
+            else:
+                try:
+                    state = self.experience_review_service.commit_completed_task(
+                        session_id=self.session.session_id,
+                        final_response=final.text,
+                    )
+                    await self.experience_review_service.review_if_due(state)
+                except Exception:
+                    # Experience maintenance must not replace an already completed user response.
+                    pass
         return responses
-
-    async def _maintain_memory(self, recent_messages) -> None:
-        self._emit_memory(MemoryObservation("extraction", "triggered"))
-        try:
-            extraction = await self.memory_store.update(
-                lambda latest: extract_memory_update(self.memory_model, self.memory_stream_fn, latest, recent_messages),
-                max_chars=self.memory_max_chars,
-            )
-        except (MemoryMaintenanceError, MemoryStoreError) as error:
-            self._emit_memory(MemoryObservation("extraction", "failed", error_message=str(error)))
-            return
-        self._emit_memory(_memory_observation("extraction", extraction))
-        if not _needs_consolidation(extraction.snapshot, self.memory_consolidation_threshold):
-            return
-        self._emit_memory(MemoryObservation("consolidation", "triggered"))
-        try:
-            consolidation = await self.memory_store.update(
-                lambda latest: consolidate_memory(
-                    self.memory_model,
-                    self.memory_stream_fn,
-                    latest,
-                    max_chars=self.memory_max_chars,
-                ),
-                max_chars=self.memory_max_chars,
-            )
-        except (MemoryMaintenanceError, MemoryStoreError) as error:
-            self._emit_memory(MemoryObservation("consolidation", "failed", error_message=str(error)))
-            return
-        self._emit_memory(_memory_observation("consolidation", consolidation))
 
     def _emit_memory(self, event: "MemoryObservation") -> None:
         for listener in list(self._memory_listeners):
@@ -173,9 +157,11 @@ def build_rova_runtime(
     memory_root: Path | None = None,
     skill_root: Path | None = None,
     memory_model: Model | None = None,
-    memory_update_interval: int = DEFAULT_MEMORY_UPDATE_INTERVAL,
     memory_max_chars: int = DEFAULT_MEMORY_MAX_CHARS,
-    memory_consolidation_threshold: int = DEFAULT_MEMORY_CONSOLIDATION_THRESHOLD,
+    experience_review_enabled: bool = True,
+    experience_review_tool_threshold: int = DEFAULT_EXPERIENCE_REVIEW_TOOL_THRESHOLD,
+    experience_review_task_threshold: int = DEFAULT_EXPERIENCE_REVIEW_TASK_THRESHOLD,
+    experience_root: Path | None = None,
     vision_client: VisionClient | None = None,
     extension_roots: Sequence[Path] | None = None,
 ) -> RovaRuntime:
@@ -185,16 +171,16 @@ def build_rova_runtime(
         raise ValueError(f"max_turns must be an integer between 1 and {MAX_PRODUCT_TURNS}")
     if permission_mode not in {"ask", "full"}:
         raise ValueError("permission_mode must be 'ask' or 'full'")
-    if not isinstance(memory_update_interval, int) or isinstance(memory_update_interval, bool) or memory_update_interval <= 0:
-        raise ValueError("memory_update_interval must be a positive integer")
     if not isinstance(memory_max_chars, int) or isinstance(memory_max_chars, bool) or memory_max_chars <= 0:
         raise ValueError("memory_max_chars must be a positive integer")
-    if (
-        not isinstance(memory_consolidation_threshold, int)
-        or isinstance(memory_consolidation_threshold, bool)
-        or not 0 < memory_consolidation_threshold <= memory_max_chars
+    if not isinstance(experience_review_enabled, bool):
+        raise ValueError("experience_review_enabled must be a boolean")
+    for name, value in (
+        ("experience_review_tool_threshold", experience_review_tool_threshold),
+        ("experience_review_task_threshold", experience_review_task_threshold),
     ):
-        raise ValueError("memory_consolidation_threshold must be between 1 and memory_max_chars")
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
     if vision_client is not None and workspace_root is None:
         raise ValueError("vision_client requires workspace_root")
 
@@ -213,7 +199,7 @@ def build_rova_runtime(
         warnings.warn(f"Skill catalog unavailable: {error}", RuntimeWarning, stacklevel=2)
         skill_catalog_snapshot = SkillCatalogSnapshot()
     source_store = ResearchSourceStore() if web_search_backend is not None else None
-    tools = create_skill_tools(effective_skill_store)
+    tools = [*create_skill_tools(effective_skill_store), *create_memory_tools(effective_memory_store, max_chars=memory_max_chars)]
     if workspace is not None:
         effective_policy = DefaultCodingToolPolicy() if policy is None else policy
         effective_approval_handler = approval_handler or _approval_handler_for_mode(permission_mode)
@@ -255,6 +241,22 @@ def build_rova_runtime(
         tool_output_processor=ToolOutputProcessor(artifact_store),
     )
     extension_api.bind_event_hooks(agent)
+    experience_review_service = None
+    if experience_review_enabled:
+        experience_review_service = ExperienceReviewService(
+            FileExperienceReviewStore(experience_root),
+            reviewer=ExperienceReviewer(
+                model=memory_model or model,
+                stream_fn=stream_fn,
+                skill_store=effective_skill_store,
+            ),
+            memory_store=effective_memory_store,
+            skill_store=effective_skill_store,
+            memory_max_chars=memory_max_chars,
+            tool_threshold=experience_review_tool_threshold,
+            task_threshold=experience_review_task_threshold,
+        )
+        agent.subscribe(_isolated_experience_event_handler(experience_review_service))
     return RovaRuntime(
         agent=agent,
         session=(
@@ -272,11 +274,8 @@ def build_rova_runtime(
         workspace_instruction_snapshot=workspace_instruction_snapshot,
         skill_store=effective_skill_store,
         skill_catalog_snapshot=skill_catalog_snapshot,
-        memory_model=memory_model or model,
-        memory_stream_fn=stream_fn,
-        memory_update_interval=memory_update_interval,
         memory_max_chars=memory_max_chars,
-        memory_consolidation_threshold=memory_consolidation_threshold,
+        experience_review_service=experience_review_service,
         extension_api=extension_api,
         extension_load_report=extension_load_report,
     )
@@ -415,13 +414,13 @@ def _shell_executor() -> str:
     return "/bin/sh"
 
 
-def _memory_observation(kind: str, result: MemoryApplyResult) -> MemoryObservation:
-    return MemoryObservation(
-        kind,
-        "updated" if result.changed_documents else "noop",
-        changed_documents=result.changed_documents,
-    )
+def _isolated_experience_event_handler(service: ExperienceReviewService):
+    def handle(event) -> None:
+        try:
+            service.on_agent_event(event)
+        except Exception:
+            # This subscriber is product maintenance; it must not change the
+            # exception semantics of other Agent subscribers.
+            return
 
-
-def _needs_consolidation(snapshot: MemorySnapshot, threshold: int) -> bool:
-    return any(len(document) >= threshold for document in (snapshot.user_markdown, snapshot.memory_markdown))
+    return handle

@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
+from rova.ai.messages import TextBlock
+from rova.ai.tools import Tool
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError
+
 from .file_lock import FileLock, FileLockError
 from .paths import RovaDataPaths
 
@@ -193,3 +197,68 @@ def _write_temporary(path: Path, content: str) -> None:
         handle.write(content + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def create_memory_tools(store: MemoryStore, *, max_chars: int) -> list[AgentTool]:
+    """Build the explicit, user-directed durable memory update tool."""
+
+    async def manage(_tool_call_id: str, params: dict) -> AgentToolResult:
+        try:
+            update = _memory_update_from_params(params)
+            result = await store.update(lambda _snapshot: _return_update(update), max_chars=max_chars)
+        except (ValueError, MemoryStoreError) as error:
+            raise ToolExecutionError(str(error), metadata={"outcome": "tool_execution_error"}) from error
+        if result.changed_documents:
+            return AgentToolResult([TextBlock(f"Updated memory: {', '.join(result.changed_documents)}")])
+        return AgentToolResult([TextBlock("Memory unchanged")])
+
+    return [
+        AgentTool(
+            Tool(
+                "memory_manage",
+                "Persist an explicit durable Memory update. Use only for stable user preferences or durable facts; never save transient task output.",
+                {
+                    "user_action": str,
+                    "user_markdown": str,
+                    "memory_action": str,
+                    "memory_markdown": str,
+                },
+                required=("user_action", "memory_action"),
+            ),
+            manage,
+        )
+    ]
+
+
+def _memory_update_from_params(params: dict) -> MemoryUpdate:
+    return MemoryUpdate(
+        user=MemoryDocumentUpdate(
+            _memory_action(params["user_action"]),
+            _memory_markdown(params.get("user_markdown")),
+        ),
+        memory=MemoryDocumentUpdate(
+            _memory_action(params["memory_action"]),
+            _memory_markdown(params.get("memory_markdown")),
+        ),
+    )
+
+
+def _memory_action(value: object) -> MemoryDocumentAction:
+    if not isinstance(value, str):
+        raise ValueError("memory action must be a string")
+    try:
+        return MemoryDocumentAction(value)
+    except ValueError as error:
+        raise ValueError(f"unsupported memory action: {value}") from error
+
+
+def _memory_markdown(value: object) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("memory Markdown must be a string")
+    return value
+
+
+async def _return_update(update: MemoryUpdate) -> MemoryUpdate:
+    return update

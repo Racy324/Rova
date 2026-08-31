@@ -159,6 +159,7 @@ def _build_runtime_from_args(
     artifact_root = data_paths.artifacts if args.data_dir is not None else app_settings.artifact_root or data_paths.artifacts
     memory_root = data_paths.memory if args.data_dir is not None else getattr(app_settings, "memory_root", None) or data_paths.memory
     skill_root = data_paths.skills
+    experience_root = data_paths.experience
     runtime = build_rova_runtime(
         model=app_settings.to_model(),
         stream_fn=stream_simple,
@@ -180,9 +181,11 @@ def _build_runtime_from_args(
             if hasattr(app_settings, "to_memory_model")
             else app_settings.to_model()
         ),
-        memory_update_interval=getattr(app_settings, "memory_update_interval", 3),
         memory_max_chars=getattr(app_settings, "memory_max_chars", 6_000),
-        memory_consolidation_threshold=getattr(app_settings, "memory_consolidation_threshold", 4_800),
+        experience_review_enabled=getattr(app_settings, "experience_review_enabled", True),
+        experience_review_tool_threshold=getattr(app_settings, "experience_review_tool_threshold", 10),
+        experience_review_task_threshold=getattr(app_settings, "experience_review_task_threshold", 5),
+        experience_root=experience_root,
         vision_client=vision_client,
     )
     return runtime

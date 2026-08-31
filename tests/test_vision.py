@@ -18,6 +18,11 @@ from rova.app.vision.tool import MAX_IMAGE_BYTES, create_vision_analyze_tool
 from rova.app.workspace import Workspace
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_rova_data_dir(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("ROVA_DATA_DIR", str(tmp_path / "rova-data"))
+
+
 class FakeVisionClient:
     def __init__(self, observation: str = "The visible diagram has two boxes.") -> None:
         self.observation = observation

@@ -14,6 +14,11 @@ from rova.app.runtime import build_rova_runtime
 from rova.app.workspace import AlwaysApprove, AlwaysDeny, DefaultCodingToolPolicy, Workspace, build_controlled_coding_tools
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_rova_data_dir(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("ROVA_DATA_DIR", str(tmp_path / "rova-data"))
+
+
 @pytest.fixture
 def workspace_root(tmp_path: Path) -> Path:
     root = tmp_path / "workspace"

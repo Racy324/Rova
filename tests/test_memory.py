@@ -11,7 +11,10 @@ from rova.app.memory import (
     MemoryDocumentUpdate,
     MemorySnapshot,
     MemoryUpdate,
+    create_memory_tools,
 )
+from rova.ai.messages import ToolCall
+from rova.agent_core.tools import ToolRegistry
 from rova.app.workspace.instructions import load_workspace_instruction
 
 
@@ -128,6 +131,60 @@ async def test_memory_store_applies_update_and_delete_to_independent_documents(t
     assert store.load_snapshot().user_markdown == "## Preferences\n\n- Rust"
     assert store.load_snapshot().memory_markdown == ""
     assert not (store.root / "MEMORY.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_memory_manage_immediately_applies_a_complete_explicit_update(tmp_path: Path) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    registry = ToolRegistry(create_memory_tools(store, max_chars=200))
+
+    result = await registry.execute(
+        ToolCall(
+            "memory-1",
+            "memory_manage",
+            {
+                "user_action": "ADD",
+                "user_markdown": "- Prefer concise reports",
+                "memory_action": "ADD",
+                "memory_markdown": "- Baseline uses seed 0",
+            },
+        )
+    )
+
+    assert not result.is_error
+    assert result.text == "Updated memory: USER.md, MEMORY.md"
+    assert store.load_snapshot() == MemorySnapshot(
+        user_markdown="- Prefer concise reports",
+        memory_markdown="- Baseline uses seed 0",
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_manage_rejects_invalid_action_without_partial_write(tmp_path: Path) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    await store.update(
+        lambda _snapshot: _immediate(_update(user=(MemoryDocumentAction.ADD, "- Existing preference"))),
+        max_chars=200,
+    )
+    registry = ToolRegistry(create_memory_tools(store, max_chars=200))
+
+    result = await registry.execute(
+        ToolCall(
+            "memory-2",
+            "memory_manage",
+            {
+                "user_action": "UPDATE",
+                "user_markdown": "- This must not persist",
+                "memory_action": "BAD",
+                "memory_markdown": "- invalid",
+            },
+        )
+    )
+
+    assert result.is_error
+    assert result.metadata["outcome"] == "tool_execution_error"
+    assert store.load_snapshot().user_markdown == "- Existing preference"
+    assert store.load_snapshot().memory_markdown == ""
 
 
 async def _immediate(value: MemoryUpdate) -> MemoryUpdate:

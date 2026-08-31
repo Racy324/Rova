@@ -28,6 +28,12 @@ class FakeFetcher:
         return FetchedPage("Example", "content")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_rova_data_dir(monkeypatch, tmp_path: Path) -> None:
+    """Default-on review state must not leak from one runtime test into another."""
+    monkeypatch.setenv("ROVA_DATA_DIR", str(tmp_path / "rova-data"))
+
+
 def test_stable_system_prompt_contains_only_identity_and_general_behavior() -> None:
     assert "local single-user general agent" in ROVA_SYSTEM_PROMPT
     assert "Treat tool results as observations from actual execution" in ROVA_SYSTEM_PROMPT
@@ -56,7 +62,7 @@ def test_unified_runtime_without_optional_inputs_creates_one_tool_free_agent(tmp
     )
 
     assert runtime.agent.system_prompt == ROVA_SYSTEM_PROMPT
-    assert [tool.name for tool in runtime.agent.registry.schemas] == ["skill_view", "skill_manage"]
+    assert [tool.name for tool in runtime.agent.registry.schemas] == ["skill_view", "skill_manage", "memory_manage"]
     assert runtime.workspace is None
     assert runtime.workspace_context is None
     assert runtime.source_store is None
@@ -229,7 +235,7 @@ async def test_unified_runtime_adds_workspace_tools_and_workspace_context(tmp_pa
     await runtime.session.prompt("Inspect the workspace.")
 
     assert [tool.name for tool in runtime.agent.registry.schemas] == [
-        "skill_view", "skill_manage", "read", "list_dir", "search", "write", "edit", "shell",
+        "skill_view", "skill_manage", "memory_manage", "read", "list_dir", "search", "write", "edit", "shell",
     ]
     assert runtime.workspace is not None
     assert runtime.workspace_context is not None
@@ -354,7 +360,7 @@ async def test_unified_runtime_adds_web_tools_and_keeps_source_store_run_local(t
     result = await runtime.agent.registry.execute(ToolCall("call-1", "web_search", {"query": "Rova"}))
 
     assert [tool.name for tool in runtime.agent.registry.schemas] == [
-        "skill_view", "skill_manage", "web_search", "fetch_webpage",
+        "skill_view", "skill_manage", "memory_manage", "web_search", "fetch_webpage",
     ]
     assert result.is_error is False
     assert runtime.source_store is not None
@@ -379,7 +385,7 @@ def test_unified_runtime_combines_workspace_and_web_tools_in_one_agent(tmp_path:
     )
 
     assert [tool.name for tool in runtime.agent.registry.schemas] == [
-        "skill_view", "skill_manage", "read", "list_dir", "search", "write", "edit", "shell",
+        "skill_view", "skill_manage", "memory_manage", "read", "list_dir", "search", "write", "edit", "shell",
         "web_search", "fetch_webpage",
     ]
     assert runtime.workspace is not None
@@ -412,7 +418,7 @@ async def test_unified_runtime_attaches_local_research_context_to_the_current_us
     assert received_contexts[0].messages[-1].content.startswith("Summarize my local notes.")
     assert "[L1] notes.md" in received_contexts[0].messages[-1].content
     assert "Local notes." in received_contexts[0].messages[-1].content
-    assert [tool.name for tool in runtime.agent.registry.schemas] == ["skill_view", "skill_manage"]
+    assert [tool.name for tool in runtime.agent.registry.schemas] == ["skill_view", "skill_manage", "memory_manage"]
     assert runtime.source_store is None
 
 
@@ -587,7 +593,7 @@ async def test_unified_runtime_freezes_skill_catalog_and_only_injects_metadata(t
     await runtime.prompt("first")
     await runtime.prompt("second")
 
-    assert [tool.name for tool in runtime.agent.registry.schemas] == ["skill_view", "skill_manage"]
+    assert [tool.name for tool in runtime.agent.registry.schemas] == ["skill_view", "skill_manage", "memory_manage"]
     assert "Available Skills:" in received_system_prompts[0]
     assert "code-review: Review changes." in received_system_prompts[0]
     assert "Full procedure." not in received_system_prompts[0]

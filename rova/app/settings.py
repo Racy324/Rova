@@ -24,9 +24,10 @@ class AppSettings:
     memory_model: str | None = None
     memory_base_url: str | None = None
     memory_context_window: int | None = None
-    memory_update_interval: int = 3
     memory_max_chars: int = 6_000
-    memory_consolidation_threshold: int = 4_800
+    experience_review_enabled: bool = True
+    experience_review_tool_threshold: int = 10
+    experience_review_task_threshold: int = 5
     data_dir: Path | None = None
 
     @classmethod
@@ -43,9 +44,10 @@ class AppSettings:
         artifact_root = source.get("ROVA_ARTIFACT_ROOT")
         memory_root = source.get("ROVA_MEMORY_ROOT")
         memory_context_window = source.get("ROVA_MEMORY_CONTEXT_WINDOW")
-        memory_update_interval = source.get("ROVA_MEMORY_UPDATE_INTERVAL")
         memory_max_chars = source.get("ROVA_MEMORY_MAX_CHARS")
-        memory_consolidation_threshold = source.get("ROVA_MEMORY_CONSOLIDATION_THRESHOLD")
+        experience_review_enabled = source.get("ROVA_EXPERIENCE_REVIEW_ENABLED")
+        experience_review_tool_threshold = source.get("ROVA_EXPERIENCE_REVIEW_TOOL_THRESHOLD")
+        experience_review_task_threshold = source.get("ROVA_EXPERIENCE_REVIEW_TASK_THRESHOLD")
         data_dir = source.get("ROVA_DATA_DIR")
         return cls(
             provider=source.get("ROVA_PROVIDER", "mock"),
@@ -60,10 +62,13 @@ class AppSettings:
             memory_model=source.get("ROVA_MEMORY_MODEL") or None,
             memory_base_url=source.get("ROVA_MEMORY_BASE_URL") or None,
             memory_context_window=int(memory_context_window) if memory_context_window else None,
-            memory_update_interval=int(memory_update_interval) if memory_update_interval else 3,
             memory_max_chars=int(memory_max_chars) if memory_max_chars else 6_000,
-            memory_consolidation_threshold=(
-                int(memory_consolidation_threshold) if memory_consolidation_threshold else 4_800
+            experience_review_enabled=_parse_bool(experience_review_enabled, default=True),
+            experience_review_tool_threshold=(
+                int(experience_review_tool_threshold) if experience_review_tool_threshold else 10
+            ),
+            experience_review_task_threshold=(
+                int(experience_review_task_threshold) if experience_review_task_threshold else 5
             ),
             data_dir=Path(data_dir).expanduser() if data_dir else None,
         )
@@ -97,3 +102,14 @@ class AppSettings:
         if self.compaction_reserve_tokens is None or self.compaction_keep_recent_tokens is None:
             raise ValueError("both compaction reserve and keep-recent settings are required")
         return CompactionPolicy(self.compaction_reserve_tokens, self.compaction_keep_recent_tokens)
+
+
+def _parse_bool(value: str | None, *, default: bool) -> bool:
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("ROVA_EXPERIENCE_REVIEW_ENABLED must be a boolean")

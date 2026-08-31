@@ -38,3 +38,7 @@ class RovaDataPaths:
     @property
     def extensions(self) -> Path:
         return self.root / "extensions"
+
+    @property
+    def experience(self) -> Path:
+        return self.root / "experience"

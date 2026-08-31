@@ -89,23 +89,24 @@ def test_project_api_key_is_not_exposed_by_settings_or_trace_serialization(tmp_p
     assert secret not in json.dumps(run_trace_to_dict(trace))
 
 
-def test_memory_settings_reuse_main_model_when_memory_model_is_not_configured(tmp_path):
+def test_experience_review_settings_are_enabled_by_default_and_accept_explicit_override(tmp_path):
     settings = AppSettings.from_env(
         {
             "ROVA_PROVIDER": "openai_compatible",
             "ROVA_MODEL": "main-model",
             "ROVA_BASE_URL": "https://provider.example/v1",
-            "ROVA_MEMORY_UPDATE_INTERVAL": "4",
-            "ROVA_MEMORY_MAX_CHARS": "7000",
-            "ROVA_MEMORY_CONSOLIDATION_THRESHOLD": "6000",
+            "ROVA_EXPERIENCE_REVIEW_ENABLED": "false",
+            "ROVA_EXPERIENCE_REVIEW_TOOL_THRESHOLD": "12",
+            "ROVA_EXPERIENCE_REVIEW_TASK_THRESHOLD": "6",
         },
         dotenv_path=tmp_path / ".env",
     )
 
     assert settings.to_memory_model() == settings.to_model()
-    assert settings.memory_update_interval == 4
-    assert settings.memory_max_chars == 7000
-    assert settings.memory_consolidation_threshold == 6000
+    assert not settings.experience_review_enabled
+    assert settings.experience_review_tool_threshold == 12
+    assert settings.experience_review_task_threshold == 6
+    assert AppSettings.from_env({}, dotenv_path=tmp_path / ".env").experience_review_enabled
 
 
 def test_memory_model_can_override_only_its_model_identity(tmp_path):

@@ -19,6 +19,11 @@ from rova.app.web.sources import ResearchSourceStore, SearchHit
 from rova.artifacts import FileArtifactStore
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_rova_data_dir(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("ROVA_DATA_DIR", str(tmp_path / "rova-data"))
+
+
 class _LegacyGbkStream:
     encoding = "gbk"
 
