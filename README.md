@@ -42,6 +42,9 @@ python -m rova --workspace . --web
 - 🧩 **Skills**  
   通过 Skill Catalog 发现能力，需要时按需读取完整 `SKILL.md`，避免一次性加载全部内容。
 
+- 🧱 **本地 Extensions**
+  可从用户或 Workspace 目录加载受信任的本地 Python 扩展，以注册工具、订阅 Agent 生命周期事件或提供小型动态上下文。
+
 - 📦 **Artifacts 与 Trace**  
   支持保存运行产物，并记录 Agent、Tool 与 Session 的执行过程，方便调试和回溯。
 
@@ -181,6 +184,19 @@ python -m rova --workspace . --web "调研相关实现，并结合当前项目�
 
 ---
 
+## 🔌 本地 Extensions
+
+Rova 在启动时按以下顺序加载顶层 Python 文件；后加载的扩展不能注册同名工具：
+
+```text
+~/.rova/extensions/
+<workspace>/.rova/extensions/
+```
+
+扩展的 `setup(api)` 可调用 `register_tool(...)`、`on(event_type, handler)` 和 `register_context_provider(...)`。示例见 [minimal_extension.py](examples/extensions/minimal_extension.py)。Extension 是用户主动安装的受信任本地代码；当前不提供依赖隔离、热重载或沙箱。
+
+---
+
 ## 💻 Terminal UI
 
 Rova 提供基于 TypeScript、React 与 Ink 构建的 Terminal UI。
@@ -230,7 +246,8 @@ Rova 默认将本地运行数据保存在：
 ├── sessions/
 ├── artifacts/
 ├── memory/
-└── skills/
+├── skills/
+└── extensions/
 ```
 
 数据根目录优先级：
@@ -249,6 +266,7 @@ ROVA_DATA_DIR
 - `artifacts/`：运行时产物
 - `memory/`：`USER.md` 与 `MEMORY.md`
 - `skills/`：本地 Skills
+- `extensions/`：用户安装的本地 Extension
 
 ---
 

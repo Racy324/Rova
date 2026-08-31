@@ -34,3 +34,7 @@ class RovaDataPaths:
     @property
     def skills(self) -> Path:
         return self.root / "skills"
+
+    @property
+    def extensions(self) -> Path:
+        return self.root / "extensions"

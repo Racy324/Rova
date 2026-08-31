@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 import os
@@ -18,6 +18,7 @@ from rova.agent_session.compaction import CompactionPolicy
 from rova.artifacts import FileArtifactStore
 
 from .context.local import LocalResearchContext
+from .extensions import ExtensionAPI, ExtensionLoadReport, ExtensionLoader
 from .web.sources import ResearchSourceStore
 from .web.tools import WebFetchBackend, WebSearchBackend, create_fetch_webpage_tool, create_web_search_tool
 from .workspace.approval import AlwaysApprove, ApprovalHandler, ConsoleApprovalHandler
@@ -75,6 +76,8 @@ class RovaRuntime:
     memory_update_interval: int
     memory_max_chars: int
     memory_consolidation_threshold: int
+    extension_api: ExtensionAPI
+    extension_load_report: ExtensionLoadReport
 
     def __post_init__(self) -> None:
         self._user_turn_count = 0
@@ -89,6 +92,10 @@ class RovaRuntime:
                 self._memory_listeners.remove(listener)
 
         return unsubscribe
+
+    @property
+    def extension_runtime_issues(self):
+        return self.extension_api.runtime_issues
 
     async def prompt(self, text: str):
         first_message_index = len(self.agent.messages)
@@ -170,6 +177,7 @@ def build_rova_runtime(
     memory_max_chars: int = DEFAULT_MEMORY_MAX_CHARS,
     memory_consolidation_threshold: int = DEFAULT_MEMORY_CONSOLIDATION_THRESHOLD,
     vision_client: VisionClient | None = None,
+    extension_roots: Sequence[Path] | None = None,
 ) -> RovaRuntime:
     if (web_search_backend is None) != (webpage_fetcher is None):
         raise ValueError("web_search_backend and webpage_fetcher must be provided together")
@@ -219,6 +227,14 @@ def build_rova_runtime(
             create_web_search_tool(source_store, web_search_backend),
             create_fetch_webpage_tool(source_store, webpage_fetcher),
         ])
+    extension_api = ExtensionAPI([tool.tool.name for tool in tools])
+    extension_loader = ExtensionLoader(
+        ExtensionLoader.default_roots(workspace.root if workspace is not None else None)
+        if extension_roots is None
+        else extension_roots
+    )
+    extension_load_report = extension_loader.load(extension_api)
+    tools.extend(extension_api.tools)
 
     store_root = artifact_root or RovaDataPaths.resolve().artifacts
     artifact_store = FileArtifactStore(store_root)
@@ -232,11 +248,13 @@ def build_rova_runtime(
             memory_snapshot,
             workspace_instruction_snapshot,
             skill_catalog_snapshot,
+            extension_api,
             web_enabled=web_search_backend is not None,
         ),
         max_turns=max_turns,
         tool_output_processor=ToolOutputProcessor(artifact_store),
     )
+    extension_api.bind_event_hooks(agent)
     return RovaRuntime(
         agent=agent,
         session=(
@@ -259,6 +277,8 @@ def build_rova_runtime(
         memory_update_interval=memory_update_interval,
         memory_max_chars=memory_max_chars,
         memory_consolidation_threshold=memory_consolidation_threshold,
+        extension_api=extension_api,
+        extension_load_report=extension_load_report,
     )
 
 
@@ -276,6 +296,7 @@ def _with_runtime_context(
     memory_snapshot: MemorySnapshot,
     workspace_instruction_snapshot: WorkspaceInstructionSnapshot,
     skill_catalog_snapshot: SkillCatalogSnapshot,
+    extension_api: ExtensionAPI,
     *,
     web_enabled: bool,
 ) -> StreamFn:
@@ -287,6 +308,7 @@ def _with_runtime_context(
                 skill_catalog_snapshot,
             ),
             *_dynamic_runtime_context_sections(workspace, web_enabled=web_enabled),
+            *extension_api.render_context_sections(),
         ]
         rendered_sections = "\n\n".join(sections)
         provider_context = context if not sections else Context(

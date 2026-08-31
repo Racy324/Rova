@@ -5,6 +5,8 @@
 
 # Private development docs
 docs/
+AGENTS.md
+ARCHITECTURE.md
 
 # Rova runtime data
 .rova/
