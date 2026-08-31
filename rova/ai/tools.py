@@ -37,6 +37,13 @@ def validate_tool_arguments(tool: Tool, raw_args: dict) -> dict:
         try:
             jsonschema.validate(raw_args, tool.input_schema)
         except jsonschema.ValidationError as error:
+            if error.validator == "enum" and error.path:
+                field = str(error.path[-1])
+                allowed = error.validator_value
+                if isinstance(allowed, list) and all(isinstance(item, str) for item in allowed):
+                    raise ValueError(
+                        f"Invalid {field}: {error.instance!r}. Expected one of: {', '.join(allowed)}."
+                    ) from error
             raise ValueError(f"tool argument validation failed: {error.message}") from error
         return dict(raw_args)
     validated: dict = {}

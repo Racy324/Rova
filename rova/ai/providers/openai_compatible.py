@@ -24,6 +24,9 @@ class StreamingHttpClient(Protocol):
 
 
 class HttpxStreamingHttpClient:
+    def __init__(self, *, timeout_seconds: float = 60.0) -> None:
+        self._timeout_seconds = timeout_seconds
+
     def stream_lines(self, url: str, headers: dict[str, str], payload: dict) -> AsyncIterator[str]:
         return self._stream_lines(url, headers, payload)
 
@@ -33,7 +36,7 @@ class HttpxStreamingHttpClient:
         except (TypeError, ValueError, OverflowError) as error:
             raise ProviderRequestError(f"Provider request serialization failed: {error}") from error
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
                 async with client.stream("POST", url, content=body, headers=headers) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
@@ -45,9 +48,15 @@ class HttpxStreamingHttpClient:
 class OpenAICompatibleProvider:
     """Translate Rova's internal AI contract to streaming Chat Completions SSE."""
 
-    def __init__(self, api_key: str, http_client: StreamingHttpClient | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        http_client: StreamingHttpClient | None = None,
+        *,
+        timeout_seconds: float = 60.0,
+    ) -> None:
         self._api_key = api_key
-        self._http_client = http_client or HttpxStreamingHttpClient()
+        self._http_client = http_client or HttpxStreamingHttpClient(timeout_seconds=timeout_seconds)
 
     async def stream(self, model: Model, context: Context, options: object | None = None) -> AsyncIterator[AssistantMessageEvent]:
         try:

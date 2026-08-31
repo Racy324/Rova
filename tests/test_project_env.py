@@ -125,3 +125,25 @@ def test_memory_model_can_override_only_its_model_identity(tmp_path):
     assert memory_model.model == "memory-model"
     assert memory_model.provider == "openai_compatible"
     assert memory_model.base_url == "https://provider.example/v1"
+
+
+def test_provider_timeout_defaults_to_60_and_is_carried_by_models(tmp_path):
+    settings = AppSettings.from_env({}, dotenv_path=tmp_path / ".env")
+
+    assert settings.provider_timeout == 60.0
+    assert settings.to_model().provider_timeout == 60.0
+    assert settings.to_memory_model().provider_timeout == 60.0
+
+
+def test_provider_timeout_accepts_integer_and_float_values(tmp_path):
+    integer = AppSettings.from_env({"ROVA_PROVIDER_TIMEOUT": "120"}, dotenv_path=tmp_path / ".env")
+    decimal = AppSettings.from_env({"ROVA_PROVIDER_TIMEOUT": "12.5"}, dotenv_path=tmp_path / ".env")
+
+    assert integer.provider_timeout == 120.0
+    assert decimal.provider_timeout == 12.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
+def test_provider_timeout_rejects_non_positive_or_invalid_values(tmp_path, value):
+    with pytest.raises(ValueError, match="ROVA_PROVIDER_TIMEOUT"):
+        AppSettings.from_env({"ROVA_PROVIDER_TIMEOUT": value}, dotenv_path=tmp_path / ".env")

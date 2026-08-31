@@ -32,6 +32,7 @@ class AppSettings:
     terminal_backend: str | None = None
     docker_image: str | None = None
     mcp_config_path: Path | None = None
+    provider_timeout: float = 60.0
 
     @classmethod
     def from_env(
@@ -55,6 +56,7 @@ class AppSettings:
         terminal_backend = source.get("ROVA_TERMINAL_BACKEND", "").strip().lower() or None
         if terminal_backend not in {None, "local", "docker"}:
             raise ValueError("ROVA_TERMINAL_BACKEND must be 'local' or 'docker'")
+        provider_timeout = _parse_positive_float(source.get("ROVA_PROVIDER_TIMEOUT"), "ROVA_PROVIDER_TIMEOUT", default=60.0)
         return cls(
             provider=source.get("ROVA_PROVIDER", "mock"),
             model=source.get("ROVA_MODEL", "mock"),
@@ -80,6 +82,7 @@ class AppSettings:
             terminal_backend=terminal_backend,
             docker_image=source.get("ROVA_DOCKER_IMAGE") or None,
             mcp_config_path=(Path(source["ROVA_MCP_CONFIG"]).expanduser() if source.get("ROVA_MCP_CONFIG") else None),
+            provider_timeout=provider_timeout,
         )
 
     def to_model(self) -> Model:
@@ -88,6 +91,7 @@ class AppSettings:
             model=self.model,
             base_url=self.base_url,
             context_window=self.context_window,
+            provider_timeout=self.provider_timeout,
         )
 
     def to_memory_model(self) -> Model:
@@ -100,6 +104,7 @@ class AppSettings:
                 if self.memory_context_window is not None
                 else self.context_window
             ),
+            provider_timeout=self.provider_timeout,
         )
 
     def data_paths(self, explicit_data_dir: Path | None = None) -> RovaDataPaths:
@@ -122,3 +127,15 @@ def _parse_bool(value: str | None, *, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError("ROVA_EXPERIENCE_REVIEW_ENABLED must be a boolean")
+
+
+def _parse_positive_float(value: str | None, name: str, *, default: float) -> float:
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive number") from error
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return parsed

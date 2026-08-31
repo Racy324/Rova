@@ -24,6 +24,9 @@ class MemoryDocumentAction(Enum):
     NOOP = "NOOP"
 
 
+MEMORY_DOCUMENT_ACTION_VALUES = tuple(action.value for action in MemoryDocumentAction)
+
+
 class MemoryStoreError(RuntimeError):
     """Expected local-memory storage failure; callers may degrade without stopping a run."""
 
@@ -217,13 +220,31 @@ def create_memory_tools(store: MemoryStore, *, max_chars: int) -> list[AgentTool
             Tool(
                 "memory_manage",
                 "Persist an explicit durable Memory update. Use only for stable user preferences or durable facts; never save transient task output.",
-                {
-                    "user_action": str,
-                    "user_markdown": str,
-                    "memory_action": str,
-                    "memory_markdown": str,
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "user_action": {
+                            "type": "string",
+                            "enum": list(MEMORY_DOCUMENT_ACTION_VALUES),
+                            "description": "Operation for stable user information in USER.md, such as identity, preferences, long-term goals, or durable background.",
+                        },
+                        "user_markdown": {
+                            "type": "string",
+                            "description": "Complete USER.md Markdown after ADD or UPDATE; omit for DELETE or NOOP.",
+                        },
+                        "memory_action": {
+                            "type": "string",
+                            "enum": list(MEMORY_DOCUMENT_ACTION_VALUES),
+                            "description": "Operation for reusable cross-task facts or experience in MEMORY.md, such as durable constraints and reusable knowledge.",
+                        },
+                        "memory_markdown": {
+                            "type": "string",
+                            "description": "Complete MEMORY.md Markdown after ADD or UPDATE; omit for DELETE or NOOP.",
+                        },
+                    },
+                    "required": ["user_action", "memory_action"],
+                    "additionalProperties": False,
                 },
-                required=("user_action", "memory_action"),
             ),
             manage,
         )
@@ -233,23 +254,23 @@ def create_memory_tools(store: MemoryStore, *, max_chars: int) -> list[AgentTool
 def _memory_update_from_params(params: dict) -> MemoryUpdate:
     return MemoryUpdate(
         user=MemoryDocumentUpdate(
-            _memory_action(params["user_action"]),
+            _memory_action(params["user_action"], "user_action"),
             _memory_markdown(params.get("user_markdown")),
         ),
         memory=MemoryDocumentUpdate(
-            _memory_action(params["memory_action"]),
+            _memory_action(params["memory_action"], "memory_action"),
             _memory_markdown(params.get("memory_markdown")),
         ),
     )
 
 
-def _memory_action(value: object) -> MemoryDocumentAction:
+def _memory_action(value: object, field: str) -> MemoryDocumentAction:
     if not isinstance(value, str):
-        raise ValueError("memory action must be a string")
+        raise ValueError(f"Invalid {field}: {value!r}. Expected one of: {', '.join(MEMORY_DOCUMENT_ACTION_VALUES)}.")
     try:
         return MemoryDocumentAction(value)
     except ValueError as error:
-        raise ValueError(f"unsupported memory action: {value}") from error
+        raise ValueError(f"Invalid {field}: {value!r}. Expected one of: {', '.join(MEMORY_DOCUMENT_ACTION_VALUES)}.") from error
 
 
 def _memory_markdown(value: object) -> str:

@@ -8,7 +8,7 @@ from rova.ai._env import resolve_api_key
 from rova.ai.events import StreamDone, StreamError
 from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage, UserMessage
 from rova.ai.models import Model
-from rova.ai.providers.openai_compatible import OpenAICompatibleProvider, ProviderRequestError, from_provider_response, to_provider_messages, to_provider_tools
+from rova.ai.providers.openai_compatible import HttpxStreamingHttpClient, OpenAICompatibleProvider, ProviderRequestError, from_provider_response, to_provider_messages, to_provider_tools
 from rova.ai.stream import stream_simple
 from rova.ai.tools import Tool, validate_tool_arguments
 from rova.agent_core.agent import Agent
@@ -74,8 +74,9 @@ async def test_stream_simple_routes_openai_compatible_model(monkeypatch):
     seen = {}
 
     class StubProvider:
-        def __init__(self, api_key):
+        def __init__(self, api_key, *, timeout_seconds):
             seen["api_key"] = api_key
+            seen["timeout_seconds"] = timeout_seconds
 
         async def stream(self, model, context, options):
             seen["model"] = model
@@ -86,7 +87,66 @@ async def test_stream_simple_routes_openai_compatible_model(monkeypatch):
     model = Model(provider="openai_compatible", model="test-model", base_url="https://example.test/v1")
     events = [event async for event in stream_simple(model, make_context(), None)]
     assert events[-1].message.text == "translated"
-    assert seen == {"api_key": "test-key", "model": model}
+    assert seen == {"api_key": "test-key", "timeout_seconds": 60.0, "model": model}
+
+
+@pytest.mark.asyncio
+async def test_stream_simple_passes_model_provider_timeout_to_provider(monkeypatch):
+    seen = {}
+
+    class StubProvider:
+        def __init__(self, api_key, *, timeout_seconds):
+            seen["api_key"] = api_key
+            seen["timeout_seconds"] = timeout_seconds
+
+        async def stream(self, model, context, options):
+            yield StreamDone(AssistantMessage(content=[TextBlock("translated")]))
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("rova.ai.stream.OpenAICompatibleProvider", StubProvider)
+    model = Model(provider="openai_compatible", model="test-model", provider_timeout=120.0)
+
+    events = [event async for event in stream_simple(model, make_context(), None)]
+
+    assert events[-1].message.text == "translated"
+    assert seen == {"api_key": "test-key", "timeout_seconds": 120.0}
+
+
+@pytest.mark.asyncio
+async def test_http_client_uses_configured_timeout(monkeypatch):
+    seen = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def aiter_lines(self):
+            yield "data: [DONE]"
+
+    class Client:
+        def __init__(self, *, timeout):
+            seen["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def stream(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr("rova.ai.providers.openai_compatible.httpx.AsyncClient", Client)
+    lines = [line async for line in HttpxStreamingHttpClient(timeout_seconds=12.5).stream_lines("https://example.test", {}, {})]
+
+    assert lines == ["data: [DONE]"]
+    assert seen["timeout"] == 12.5
 
 
 @pytest.mark.asyncio

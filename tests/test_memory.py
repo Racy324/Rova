@@ -14,6 +14,7 @@ from rova.app.memory import (
     create_memory_tools,
 )
 from rova.ai.messages import ToolCall
+from rova.ai.providers.openai_compatible import to_provider_tools
 from rova.agent_core.tools import ToolRegistry
 from rova.app.workspace.instructions import load_workspace_instruction
 
@@ -182,9 +183,54 @@ async def test_memory_manage_rejects_invalid_action_without_partial_write(tmp_pa
     )
 
     assert result.is_error
-    assert result.metadata["outcome"] == "tool_execution_error"
+    assert result.metadata["outcome"] == "tool_input_error"
     assert store.load_snapshot().user_markdown == "- Existing preference"
     assert store.load_snapshot().memory_markdown == ""
+
+
+def test_memory_manage_provider_schema_uses_runtime_action_enum() -> None:
+    tool = create_memory_tools(FileMemoryStore(), max_chars=200)[0].tool
+    provider_schema = to_provider_tools([tool])[0]["function"]["parameters"]
+    expected = [action.value for action in MemoryDocumentAction]
+
+    assert provider_schema["properties"]["user_action"]["enum"] == expected
+    assert provider_schema["properties"]["memory_action"]["enum"] == expected
+    assert "USER.md" in provider_schema["properties"]["user_action"]["description"]
+    assert "MEMORY.md" in provider_schema["properties"]["memory_action"]["description"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [action.value for action in MemoryDocumentAction])
+async def test_memory_manage_accepts_every_declared_action(tmp_path: Path, action: str) -> None:
+    registry = ToolRegistry(create_memory_tools(FileMemoryStore(tmp_path / "memory"), max_chars=200))
+    arguments = {
+        "user_action": action,
+        "memory_action": "NOOP",
+    }
+    if action in {"ADD", "UPDATE"}:
+        arguments["user_markdown"] = "- Stable user information"
+
+    result = await registry.execute(ToolCall("memory-valid", "memory_manage", arguments))
+
+    assert not result.is_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field, invalid", [("user_action", "remember"), ("memory_action", "save"), ("memory_action", "UNKNOWN")])
+async def test_memory_manage_reports_invalid_action_with_allowed_values(tmp_path: Path, field: str, invalid: str) -> None:
+    registry = ToolRegistry(create_memory_tools(FileMemoryStore(tmp_path / "memory"), max_chars=200))
+    arguments = {
+        "user_action": "NOOP",
+        "memory_action": "NOOP",
+    }
+    arguments[field] = invalid
+
+    result = await registry.execute(ToolCall("memory-invalid", "memory_manage", arguments))
+
+    assert result.is_error
+    assert field in result.text
+    assert invalid in result.text
+    assert "ADD, UPDATE, DELETE, NOOP" in result.text
 
 
 async def _immediate(value: MemoryUpdate) -> MemoryUpdate:

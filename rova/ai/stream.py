@@ -22,7 +22,7 @@ async def stream_simple(model: Model, context: Context, options: object | None =
         except ValueError as error:
             yield _stream_error(str(error))
             return
-        async for event in OpenAICompatibleProvider(api_key).stream(model, context, options):
+        async for event in OpenAICompatibleProvider(api_key, timeout_seconds=model.provider_timeout).stream(model, context, options):
             yield event
         return
     yield _stream_error(f"Unsupported provider: {model.provider}")
