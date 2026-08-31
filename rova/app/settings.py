@@ -29,6 +29,8 @@ class AppSettings:
     experience_review_tool_threshold: int = 10
     experience_review_task_threshold: int = 5
     data_dir: Path | None = None
+    terminal_backend: str | None = None
+    docker_image: str | None = None
 
     @classmethod
     def from_env(
@@ -49,6 +51,9 @@ class AppSettings:
         experience_review_tool_threshold = source.get("ROVA_EXPERIENCE_REVIEW_TOOL_THRESHOLD")
         experience_review_task_threshold = source.get("ROVA_EXPERIENCE_REVIEW_TASK_THRESHOLD")
         data_dir = source.get("ROVA_DATA_DIR")
+        terminal_backend = source.get("ROVA_TERMINAL_BACKEND", "").strip().lower() or None
+        if terminal_backend not in {None, "local", "docker"}:
+            raise ValueError("ROVA_TERMINAL_BACKEND must be 'local' or 'docker'")
         return cls(
             provider=source.get("ROVA_PROVIDER", "mock"),
             model=source.get("ROVA_MODEL", "mock"),
@@ -71,6 +76,8 @@ class AppSettings:
                 int(experience_review_task_threshold) if experience_review_task_threshold else 5
             ),
             data_dir=Path(data_dir).expanduser() if data_dir else None,
+            terminal_backend=terminal_backend,
+            docker_image=source.get("ROVA_DOCKER_IMAGE") or None,
         )
 
     def to_model(self) -> Model:

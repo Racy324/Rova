@@ -14,8 +14,10 @@ from rova.app.workspace.controlled_tool import ControlledTool
 from rova.app.workspace.policy import ToolExecutionRequest, ToolPolicyDecision, ToolPolicyResult
 from rova.app.context.local import LocalContextItem, LocalResearchContext
 from rova.app.web.sources import FetchedPage, SearchHit
+from rova.app import runtime as runtime_module
 from rova.app.runtime import ROVA_SYSTEM_PROMPT, build_rova_runtime
 from rova.app.skills import FileSkillStore
+from rova.app.workspace.terminal import DockerTerminalBackend, LocalTerminalBackend, TerminalEnvironment
 
 
 class FakeSearch:
@@ -111,6 +113,126 @@ def test_unified_runtime_selects_approval_handler_from_permission_mode(tmp_path:
     full_tools = [full_runtime.agent.registry._tools[name] for name in ("write", "edit", "shell")]
     assert all(isinstance(tool, ControlledTool) and isinstance(tool.approval_handler, ConsoleApprovalHandler) for tool in ask_tools)
     assert all(isinstance(tool, ControlledTool) and isinstance(tool.approval_handler, AlwaysApprove) for tool in full_tools)
+
+
+def test_unified_runtime_selects_terminal_backend_from_startup_configuration(tmp_path: Path):
+    async def stream(_model, _context, _options):
+        yield StreamDone(AssistantMessage([TextBlock("done")]))
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    local_runtime = build_rova_runtime(
+        model=Model(provider="mock"),
+        stream_fn=stream,
+        workspace_root=workspace_root,
+        session_root=tmp_path / "local-sessions",
+        artifact_root=tmp_path / "local-artifacts",
+    )
+    docker_runtime = build_rova_runtime(
+        model=Model(provider="mock"),
+        stream_fn=stream,
+        workspace_root=workspace_root,
+        terminal_backend="docker",
+        docker_image="rova-test:latest",
+        session_root=tmp_path / "docker-sessions",
+        artifact_root=tmp_path / "docker-artifacts",
+    )
+
+    assert isinstance(local_runtime.terminal_backend, LocalTerminalBackend)
+    assert isinstance(docker_runtime.terminal_backend, DockerTerminalBackend)
+    assert docker_runtime.terminal_backend.environment.cwd == "/workspace"
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_owns_terminal_backend_lifecycle(monkeypatch, tmp_path: Path) -> None:
+    class RecordingBackend:
+        instances: list["RecordingBackend"] = []
+
+        def __init__(self, workspace) -> None:
+            self.workspace = workspace
+            self.close_calls = 0
+            self.environment = TerminalEnvironment("local", "test-shell", str(workspace.root), False)
+            self.instances.append(self)
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+        def render_skill_directory(self, directory: Path) -> str:
+            return str(directory)
+
+    async def stream(_model, _context, _options):
+        yield StreamDone(AssistantMessage([TextBlock("done")]))
+
+    monkeypatch.setattr(runtime_module, "LocalTerminalBackend", RecordingBackend)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    runtime = build_rova_runtime(
+        model=Model(provider="mock"),
+        stream_fn=stream,
+        workspace_root=workspace_root,
+        session_root=tmp_path / "sessions",
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    await runtime.close()
+    await runtime.close()
+
+    assert RecordingBackend.instances[0].close_calls == 1
+
+
+def test_unified_runtime_rejects_invalid_docker_terminal_configuration(tmp_path: Path):
+    async def stream(_model, _context, _options):
+        yield StreamDone(AssistantMessage([TextBlock("done")]))
+
+    with pytest.raises(ValueError, match="docker_image"):
+        build_rova_runtime(
+            model=Model(provider="mock"),
+            stream_fn=stream,
+            workspace_root=tmp_path,
+            terminal_backend="docker",
+            session_root=tmp_path / "sessions",
+            artifact_root=tmp_path / "artifacts",
+        )
+    with pytest.raises(ValueError, match="requires workspace_root"):
+        build_rova_runtime(
+            model=Model(provider="mock"),
+            stream_fn=stream,
+            terminal_backend="docker",
+            docker_image="rova-test:latest",
+            session_root=tmp_path / "sessions-2",
+            artifact_root=tmp_path / "artifacts-2",
+        )
+
+
+@pytest.mark.asyncio
+async def test_unified_runtime_renders_loaded_skill_paths_for_docker_terminal(tmp_path: Path):
+    async def stream(_model, _context, _options):
+        yield StreamDone(AssistantMessage([TextBlock("done")]))
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    skill_root = tmp_path / "skills"
+    store = FileSkillStore(skill_root)
+    store.create(
+        "paper-card",
+        "---\nname: paper-card\ndescription: Build a paper card.\n---\n\nRun `${ROVA_SKILL_DIR}/scripts/prepare.py`.\n",
+    )
+    runtime = build_rova_runtime(
+        model=Model(provider="mock"),
+        stream_fn=stream,
+        workspace_root=workspace_root,
+        terminal_backend="docker",
+        docker_image="rova-test:latest",
+        skill_root=skill_root,
+        session_root=tmp_path / "sessions",
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    result = await runtime.agent.registry.execute(ToolCall("view", "skill_view", {"name": "paper-card"}))
+
+    assert result.is_error is False
+    assert "Skill directory: /opt/rova/skills/paper-card" in result.text
+    assert "/opt/rova/skills/paper-card/scripts/prepare.py" in result.text
 
 
 def test_unified_runtime_rejects_unknown_permission_mode(tmp_path: Path):

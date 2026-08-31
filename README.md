@@ -30,6 +30,9 @@ python -m rova --workspace . --web
 - 🔒 **Workspace 安全控制**  
   文件操作限制在指定 Workspace 内；Shell 在 Workspace 中启动（作为 cwd），但属于需审批的本机宿主命令，不是文件系统 sandbox。写入、编辑和命令执行经过 Policy 与 Approval 控制。
 
+- 🐳 **可配置 Terminal Backend**
+  默认使用 Local Terminal；也可显式选择 Docker，在 bind mount 的 `/workspace` 中执行命令。Docker 不替代 Policy/Approval，且对 Workspace 的写入会直接反映到宿主项目。
+
 - 🌐 **联网搜索与网页获取**  
   支持 Web Search 与页面抓取，并保留来源身份与引用关系。
 
@@ -176,6 +179,8 @@ python -m rova --workspace . --web "调研相关实现，并结合当前项目�
 | 参数                     | 作用                             |
 | ------------------------ | -------------------------------- |
 | `--workspace PATH`       | 指定 Agent 可操作的 Workspace    |
+| `--terminal-backend local\|docker` | 选择 Shell 执行后端，默认 `local` |
+| `--docker-image IMAGE`   | Docker 后端必填的 Linux image     |
 | `--web`                  | 开启 Web Search 与页面抓取       |
 | `--context-path FILE`    | 加入 UTF-8 本地资料，可重复指定  |
 | `--save`                 | 将最终结果保存为 Artifact        |
@@ -183,6 +188,30 @@ python -m rova --workspace . --web "调研相关实现，并结合当前项目�
 | `--permission ask\|full` | 设置需要 Approval 的操作如何处理 |
 | `--max-turns N`          | 设置单次任务最大 Agent Loop 轮数 |
 | `--tui`                  | 启动 Terminal UI                 |
+
+### Terminal Backend
+
+默认 Local 后端直接以 Workspace 为 cwd 在宿主机执行已批准的命令，不是 OS 级文件系统 sandbox。
+
+Docker 后端必须同时显式指定 Workspace 和 Linux image：
+
+```bash
+python -m rova --workspace . \
+  --terminal-backend docker \
+  --docker-image rova-python:latest \
+  "运行测试并分析失败原因"
+```
+
+Docker 后端在首次 Shell Tool Call 时使用 `docker run -d --rm` 创建一个由当前 Rova Runtime 独占的容器；同一 Runtime 后续调用使用 `docker exec` 复用它。Host Workspace 被读写挂载为容器 `/workspace`，因此 Host 文件工具与容器命令观察同一份文件，写入也会影响宿主项目。容器内文件系统状态（例如安装的依赖）可跨 ToolCall 保留；`cd`、`export` 等 shell process state 不保证保留。已安装 Skill 的根目录只读挂载在 `/opt/rova/skills`；Memory、Session、完整 `~/.rova` 和 Provider 凭据不会被挂载。timeout、取消和 Runtime 正常关闭会移除该容器。容器内命令使用 `/bin/sh -lc`，不支持 Windows `cmd.exe`/PowerShell 特有语法；不包含 SSH、Copy-in、GPU、网络开关或远程 Workspace。
+
+也可在现有 `.env` 持久配置中设置默认值（CLI 仅覆盖当前启动，不会写回配置）：
+
+```dotenv
+ROVA_TERMINAL_BACKEND=docker
+ROVA_DOCKER_IMAGE=python:3.12-slim
+```
+
+优先级为：显式 CLI > `.env` 配置 > `local` 程序默认值。若最终选择 Docker 但没有 image，启动会明确失败。
 
 ---
 

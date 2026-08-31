@@ -20,6 +20,7 @@ from rova.app.workspace import (
     create_shell_tool,
     create_write_tool,
 )
+from rova.app.workspace.terminal import LocalTerminalBackend
 
 
 @pytest.fixture
@@ -175,7 +176,7 @@ async def test_edit_tool_rejects_no_or_ambiguous_matches_and_supports_replace_al
 
 @pytest.mark.asyncio
 async def test_shell_tool_uses_workspace_captures_output_and_nonzero_exit(workspace_root: Path):
-    tool = create_shell_tool(Workspace(workspace_root))
+    tool = create_shell_tool(LocalTerminalBackend(Workspace(workspace_root)))
     command = f'"{sys.executable}" -c "import os, sys; print(os.getcwd()); print(\'stderr\', file=sys.stderr); raise SystemExit(3)"'
     result = await tool.execute("shell-1", {"command": command, "timeout_seconds": 5})
     text = result.content[0].text.replace("\\", "/")
@@ -193,7 +194,7 @@ async def test_shell_tool_uses_workspace_captures_output_and_nonzero_exit(worksp
 
 
 def test_shell_tool_describes_workspace_as_cwd_not_filesystem_sandbox(workspace_root: Path):
-    tool = create_shell_tool(Workspace(workspace_root))
+    tool = create_shell_tool(LocalTerminalBackend(Workspace(workspace_root)))
 
     assert tool.tool.description == (
         "Run a local host shell command with the workspace as its working directory. "
@@ -203,7 +204,7 @@ def test_shell_tool_describes_workspace_as_cwd_not_filesystem_sandbox(workspace_
 
 @pytest.mark.asyncio
 async def test_shell_tool_times_out_without_interactive_stdin(workspace_root: Path):
-    tool = create_shell_tool(Workspace(workspace_root))
+    tool = create_shell_tool(LocalTerminalBackend(Workspace(workspace_root)))
     command = f'"{sys.executable}" -c "import time; time.sleep(2)"'
     result = await tool.execute("shell-timeout", {"command": command, "timeout_seconds": 1})
     assert "exit_code: null" in result.content[0].text
@@ -218,7 +219,7 @@ async def test_shell_tool_times_out_without_interactive_stdin(workspace_root: Pa
 
 @pytest.mark.asyncio
 async def test_shell_tool_cancellation_terminates_a_started_command(workspace_root: Path):
-    tool = create_shell_tool(Workspace(workspace_root))
+    tool = create_shell_tool(LocalTerminalBackend(Workspace(workspace_root)))
     started = workspace_root / "started.txt"
     completed = workspace_root / "completed.txt"
     command = (
@@ -242,7 +243,7 @@ async def test_shell_tool_cancellation_terminates_a_started_command(workspace_ro
 
 @pytest.mark.asyncio
 async def test_shell_tool_does_not_block_on_standard_input(workspace_root: Path):
-    tool = create_shell_tool(Workspace(workspace_root))
+    tool = create_shell_tool(LocalTerminalBackend(Workspace(workspace_root)))
     command = f'"{sys.executable}" -c "import sys; print(repr(sys.stdin.read()))"'
     result = await tool.execute("shell-stdin", {"command": command})
     assert "exit_code: 0" in result.content[0].text
@@ -262,7 +263,7 @@ async def test_shell_tool_strips_provider_keys_from_injected_child_environment_a
         "ANTHROPIC_API_KEY": blocked_values[2],
         **runtime_variables,
     }
-    tool = create_shell_tool(Workspace(workspace_root), environment=environment)
+    tool = create_shell_tool(LocalTerminalBackend(Workspace(workspace_root), environment=environment))
     command = (
         f'"{sys.executable}" -c "import os; '
         "print(repr(os.getenv('OPENAI_API_KEY'))); "

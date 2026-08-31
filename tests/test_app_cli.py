@@ -12,11 +12,12 @@ from rova.ai.messages import AssistantMessage, TextBlock
 from rova.ai.models import Model
 from rova.agent_core.events import AgentEvent
 from rova.app import cli
-from rova.app.cli import _subscribe_console_renderer, parse_rova_cli_args, run_rova_cli
+from rova.app.cli import _resolve_terminal_settings, _subscribe_console_renderer, _tool_display_lines, parse_rova_cli_args, run_rova_cli
 from rova.app.paths import RovaDataPaths
 from rova.app.context.local import LocalContextItem, LocalResearchContext
 from rova.app.web.sources import ResearchSourceStore, SearchHit
 from rova.artifacts import FileArtifactStore
+from rova.app.workspace.terminal import TerminalEnvironment
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +73,56 @@ def test_unified_cli_parses_explicit_tools_context_and_prompt() -> None:
 def test_unified_cli_defaults_permission_to_ask() -> None:
     assert parse_rova_cli_args([]).permission == "ask"
     assert parse_rova_cli_args([]).data_dir is None
+
+
+def test_unified_cli_accepts_explicit_docker_terminal_backend_and_forwards_it_to_tui() -> None:
+    args = parse_rova_cli_args([
+        "--tui",
+        "--workspace", "project",
+        "--terminal-backend", "docker",
+        "--docker-image", "rova-test:latest",
+    ])
+
+    assert args.terminal_backend == "docker"
+    assert args.docker_image == "rova-test:latest"
+    assert cli._tui_gateway_argv(args) == [
+        "--workspace", "project",
+        "--terminal-backend", "docker",
+        "--docker-image", "rova-test:latest",
+        "--permission", "ask", "--max-turns", "16",
+    ]
+
+
+def test_terminal_settings_resolve_cli_then_persistent_config_then_default() -> None:
+    settings = SimpleNamespace(terminal_backend="docker", docker_image="config:image")
+    assert _resolve_terminal_settings(parse_rova_cli_args(["--workspace", "project"]), settings) == ("docker", "config:image")
+    assert _resolve_terminal_settings(parse_rova_cli_args(["--workspace", "project", "--terminal-backend", "local"]), settings) == ("local", None)
+    assert _resolve_terminal_settings(parse_rova_cli_args(["--workspace", "project", "--docker-image", "cli:image"]), settings) == ("docker", "cli:image")
+    assert _resolve_terminal_settings(parse_rova_cli_args(["--workspace", "project"]), SimpleNamespace(terminal_backend=None, docker_image=None)) == ("local", None)
+
+
+@pytest.mark.parametrize("argv", [
+    ["--terminal-backend", "docker", "--docker-image", "rova-test:latest"],
+    ["--workspace", "project", "--terminal-backend", "docker"],
+    ["--workspace", "project", "--docker-image", "rova-test:latest"],
+])
+def test_unified_cli_rejects_invalid_terminal_backend_combinations(argv: list[str]) -> None:
+    with pytest.raises(ValueError):
+        _resolve_terminal_settings(
+            parse_rova_cli_args(argv),
+            SimpleNamespace(terminal_backend=None, docker_image=None),
+        )
+
+
+def test_cli_shell_display_uses_the_actual_terminal_backend_cwd(tmp_path: Path) -> None:
+    lines = _tool_display_lines(
+        "shell",
+        {"command": "python task.py"},
+        tmp_path,
+        TerminalEnvironment("docker", "docker (/bin/sh)", "/workspace", True),
+    )
+
+    assert lines == ["Command:\npython task.py", "backend:\ndocker", "cwd:\n/workspace"]
 
 
 def test_unified_cli_accepts_tui_without_changing_standard_options() -> None:
@@ -315,6 +366,7 @@ async def test_console_encoding_configuration_failure_does_not_block_repl_close(
     await run_rova_cli([], input_fn=_repl_inputs(iter(["/q"])))
 
     assert runtime.session.close_calls == 1
+    assert runtime.close_calls == 1
 
 
 @pytest.mark.parametrize("mode", ["ask", "full"])
@@ -753,12 +805,19 @@ def _runtime(tmp_path: Path, *, response: str, source_store: ResearchSourceStore
         workspace=None,
         source_store=source_store,
         local_context=LocalResearchContext(()),
+        close_calls=0,
     )
 
     async def prompt(text: str):
         return await runtime.session.prompt(text)
 
     runtime.prompt = prompt
+
+    async def close() -> None:
+        runtime.close_calls += 1
+        runtime.session.close()
+
+    runtime.close = close
     return runtime
 
 

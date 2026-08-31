@@ -50,17 +50,30 @@ class FakeRuntime:
         self.agent = FakeAgent(messages)
         self.session = FakeSession(session_id)
         self.workspace = None
+        self.terminal_backend = type("Terminal", (), {
+            "environment": type("Environment", (), {
+                "kind": "local",
+                "executor": "cmd.exe",
+                "cwd": "C:/workspace",
+                "is_filesystem_sandboxed": False,
+            })(),
+        })()
         self.source_store = None
         self.skill_catalog_snapshot = type("Catalog", (), {"skills": ()})()
         self.prompt_calls = []
         self.prompt_started = asyncio.Event()
         self.prompt_release = asyncio.Event()
+        self.close_calls = 0
 
     async def prompt(self, text):
         self.prompt_calls.append(text)
         self.prompt_started.set()
         await self.prompt_release.wait()
         return [AssistantMessage([TextBlock("done")])]
+
+    async def close(self):
+        self.close_calls += 1
+        self.session.close()
 
 
 def _request(request_id, method, params=None):
@@ -83,7 +96,14 @@ async def test_gateway_reports_status_and_creates_a_new_runtime(tmp_path):
     await gateway.process_line(_request("new", "session.new"))
 
     assert created_ids == [None, None]
-    assert next(frame for frame in frames if frame.get("id") == "status")["result"]["session_id"] == "new-session"
+    status = next(frame for frame in frames if frame.get("id") == "status")["result"]
+    assert status["session_id"] == "new-session"
+    assert status["terminal_backend"] == {
+        "kind": "local",
+        "executor": "cmd.exe",
+        "cwd": "C:/workspace",
+        "is_filesystem_sandboxed": False,
+    }
     assert next(frame for frame in frames if frame.get("id") == "new")["result"]["session_id"] == "new-session"
     assert any(frame.get("params", {}).get("type") == "session.changed" for frame in frames)
 
@@ -242,6 +262,7 @@ async def test_gateway_close_denies_pending_approval_and_closes_the_idle_session
 
     assert await pending is ApprovalDecision.DENY
     assert runtime.session.closed is True
+    assert runtime.close_calls == 1
     assert frames[-1]["result"] == {"closed": True}
 
 

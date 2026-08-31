@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-import os
 from pathlib import Path
 import platform
 import warnings
@@ -26,6 +25,7 @@ from .workspace.context import WorkspaceContext
 from .workspace.controlled_tool import build_controlled_coding_tools
 from .workspace.instructions import WorkspaceInstructionSnapshot, load_workspace_instruction
 from .workspace.policy import DefaultCodingToolPolicy, ToolPolicy
+from .workspace.terminal import DockerTerminalBackend, LocalTerminalBackend, TerminalBackend
 from .workspace.workspace import Workspace
 from .memory import (
     FileMemoryStore,
@@ -63,6 +63,7 @@ class RovaRuntime:
     session: AgentSession
     artifact_store: FileArtifactStore
     workspace: Workspace | None
+    terminal_backend: TerminalBackend | None
     workspace_context: WorkspaceContext | None
     source_store: ResearchSourceStore | None
     local_context: LocalResearchContext | None
@@ -79,6 +80,7 @@ class RovaRuntime:
     def __post_init__(self) -> None:
         self._memory_listeners: list[Callable[[MemoryObservation], None]] = []
         self._local_context_attached = False
+        self._closed = False
 
     def subscribe_memory(self, listener: Callable[["MemoryObservation"], None]) -> Callable[[], None]:
         self._memory_listeners.append(listener)
@@ -92,6 +94,17 @@ class RovaRuntime:
     @property
     def extension_runtime_issues(self):
         return self.extension_api.runtime_issues
+
+    async def close(self) -> None:
+        """Release Runtime-owned resources without persisting backend state."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self.terminal_backend is not None:
+                await self.terminal_backend.close()
+        finally:
+            self.session.close()
 
     async def prompt(self, text: str):
         if self.experience_review_service is not None:
@@ -164,6 +177,8 @@ def build_rova_runtime(
     experience_root: Path | None = None,
     vision_client: VisionClient | None = None,
     extension_roots: Sequence[Path] | None = None,
+    terminal_backend: str = "local",
+    docker_image: str | None = None,
 ) -> RovaRuntime:
     if (web_search_backend is None) != (webpage_fetcher is None):
         raise ValueError("web_search_backend and webpage_fetcher must be provided together")
@@ -183,6 +198,14 @@ def build_rova_runtime(
             raise ValueError(f"{name} must be a positive integer")
     if vision_client is not None and workspace_root is None:
         raise ValueError("vision_client requires workspace_root")
+    if terminal_backend not in {"local", "docker"}:
+        raise ValueError("terminal_backend must be 'local' or 'docker'")
+    if terminal_backend == "docker" and workspace_root is None:
+        raise ValueError("terminal_backend='docker' requires workspace_root")
+    if terminal_backend == "docker" and not docker_image:
+        raise ValueError("docker_image is required when terminal_backend='docker'")
+    if terminal_backend == "local" and docker_image is not None:
+        raise ValueError("docker_image requires terminal_backend='docker'")
 
     workspace = Workspace(workspace_root) if workspace_root is not None else None
     workspace_context = WorkspaceContext(workspace) if workspace is not None else None
@@ -198,12 +221,36 @@ def build_rova_runtime(
     except SkillStoreError as error:
         warnings.warn(f"Skill catalog unavailable: {error}", RuntimeWarning, stacklevel=2)
         skill_catalog_snapshot = SkillCatalogSnapshot()
+    effective_terminal_backend: TerminalBackend | None = None
+    if workspace is not None:
+        effective_terminal_backend = (
+            LocalTerminalBackend(workspace)
+            if terminal_backend == "local"
+            else DockerTerminalBackend(workspace, image=docker_image or "", skill_root=effective_skill_store.root)
+        )
     source_store = ResearchSourceStore() if web_search_backend is not None else None
-    tools = [*create_skill_tools(effective_skill_store), *create_memory_tools(effective_memory_store, max_chars=memory_max_chars)]
+    tools = [
+        *create_skill_tools(
+            effective_skill_store,
+            skill_directory_renderer=(
+                effective_terminal_backend.render_skill_directory
+                if effective_terminal_backend is not None
+                else None
+            ),
+        ),
+        *create_memory_tools(effective_memory_store, max_chars=memory_max_chars),
+    ]
     if workspace is not None:
         effective_policy = DefaultCodingToolPolicy() if policy is None else policy
-        effective_approval_handler = approval_handler or _approval_handler_for_mode(permission_mode)
-        tools.extend(build_controlled_coding_tools(workspace, effective_policy, effective_approval_handler, workspace_context))
+        assert effective_terminal_backend is not None
+        effective_approval_handler = approval_handler or _approval_handler_for_mode(permission_mode, effective_terminal_backend)
+        tools.extend(build_controlled_coding_tools(
+            workspace,
+            effective_policy,
+            effective_approval_handler,
+            workspace_context,
+            terminal_backend=effective_terminal_backend,
+        ))
         if vision_client is not None:
             tools.append(create_vision_analyze_tool(workspace, vision_client))
     if source_store is not None:
@@ -231,6 +278,7 @@ def build_rova_runtime(
         _with_runtime_context(
             stream_fn,
             workspace,
+            effective_terminal_backend,
             memory_snapshot,
             workspace_instruction_snapshot,
             skill_catalog_snapshot,
@@ -266,6 +314,7 @@ def build_rova_runtime(
         ),
         artifact_store=artifact_store,
         workspace=workspace,
+        terminal_backend=effective_terminal_backend,
         workspace_context=workspace_context,
         source_store=source_store,
         local_context=local_context,
@@ -281,9 +330,9 @@ def build_rova_runtime(
     )
 
 
-def _approval_handler_for_mode(permission_mode: str) -> ApprovalHandler:
+def _approval_handler_for_mode(permission_mode: str, terminal_backend: TerminalBackend) -> ApprovalHandler:
     if permission_mode == "ask":
-        return ConsoleApprovalHandler(shell_executor=_shell_executor())
+        return ConsoleApprovalHandler(shell_executor=terminal_backend.environment.executor)
     if permission_mode == "full":
         return AlwaysApprove()
     raise ValueError("permission_mode must be 'ask' or 'full'")
@@ -292,6 +341,7 @@ def _approval_handler_for_mode(permission_mode: str) -> ApprovalHandler:
 def _with_runtime_context(
     stream_fn: StreamFn,
     workspace: Workspace | None,
+    terminal_backend: TerminalBackend | None,
     memory_snapshot: MemorySnapshot,
     workspace_instruction_snapshot: WorkspaceInstructionSnapshot,
     skill_catalog_snapshot: SkillCatalogSnapshot,
@@ -306,7 +356,7 @@ def _with_runtime_context(
                 workspace_instruction_snapshot,
                 skill_catalog_snapshot,
             ),
-            *_dynamic_runtime_context_sections(workspace, web_enabled=web_enabled),
+            *_dynamic_runtime_context_sections(workspace, terminal_backend, web_enabled=web_enabled),
             *extension_api.render_context_sections(),
         ]
         rendered_sections = "\n\n".join(sections)
@@ -339,10 +389,11 @@ def _frozen_system_context_sections(
 
 def _dynamic_runtime_context_sections(
     workspace: Workspace | None,
+    terminal_backend: TerminalBackend | None,
     *,
     web_enabled: bool,
 ) -> list[str]:
-    sections = [_runtime_facts_section(workspace)]
+    sections = [_runtime_facts_section(workspace, terminal_backend)]
     if web_enabled:
         sections.append(_web_tool_guidance_section())
     return sections
@@ -385,17 +436,20 @@ def _render_skill_catalog_section(snapshot: SkillCatalogSnapshot) -> str:
     return "\n".join(lines)
 
 
-def _runtime_facts_section(workspace: Workspace | None) -> str:
+def _runtime_facts_section(workspace: Workspace | None, terminal_backend: TerminalBackend | None) -> str:
     lines = [
         "Runtime facts:",
         f"- Current time: {datetime.now().astimezone().isoformat(timespec='seconds')}",
         f"- OS: {platform.system()}",
     ]
-    if workspace is not None:
+    if workspace is not None and terminal_backend is not None:
         lines.extend([
-            f"- Shell executor: {_shell_executor()}",
-            f"- Workspace shell cwd: {workspace.root}",
+            f"- Terminal backend: {terminal_backend.environment.kind}",
+            f"- Shell executor: {terminal_backend.environment.executor}",
+            f"- Workspace shell cwd: {terminal_backend.environment.cwd}",
         ])
+        if terminal_backend.environment.kind == "docker":
+            lines.append(f"- Workspace bind mount: {workspace.root} -> {terminal_backend.environment.cwd}")
     return "\n".join(lines)
 
 
@@ -406,12 +460,6 @@ def _web_tool_guidance_section() -> str:
         "- Only fetch_webpage results with status=fetched may support factual citations using their [S#] labels.",
         "- Distinguish sourced facts from your synthesis, and state uncertainty when fetched evidence is insufficient.",
     ])
-
-
-def _shell_executor() -> str:
-    if os.name == "nt":
-        return Path(os.environ.get("COMSPEC", "cmd.exe")).name
-    return "/bin/sh"
 
 
 def _isolated_experience_event_handler(service: ExperienceReviewService):

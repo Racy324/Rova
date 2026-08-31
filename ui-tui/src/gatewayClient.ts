@@ -8,6 +8,12 @@ export type RuntimeStatus = {
 	permission_mode: 'ask' | 'full';
 	session_id: string | null;
 	skill_count: number;
+	terminal_backend: {
+		kind: string;
+		executor: string;
+		cwd: string;
+		is_filesystem_sandboxed: boolean;
+	} | null;
 };
 
 export type SessionSummary = {

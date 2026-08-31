@@ -16,6 +16,7 @@ from .tools import (
     create_shell_tool,
     create_write_tool,
 )
+from .terminal import LocalTerminalBackend, TerminalBackend, TerminalEnvironment
 from .workspace import Workspace
 from .context import WorkspaceContext
 
@@ -33,6 +34,7 @@ class ControlledTool:
     approval_handler: ApprovalHandler | None = None
     workspace_root: Path | None = None
     workspace_context: WorkspaceContext | None = None
+    terminal_environment: TerminalEnvironment | None = None
 
     @property
     def tool(self):
@@ -119,8 +121,12 @@ class ControlledTool:
             replace_all = str(arguments.get("replace_all", False)).lower()
             return f"Edit file:\n{arguments.get('path', '')}\nreplace_all: {replace_all}"
         if self.tool.name == "shell":
-            cwd = str(self.workspace_root) if self.workspace_root is not None else "<workspace root>"
-            return f"Run command:\n{arguments.get('command', '')}\ncwd:\n{cwd}"
+            details = (
+                self.terminal_environment.approval_summary
+                if self.terminal_environment is not None
+                else f"cwd:\n{self.workspace_root if self.workspace_root is not None else '<workspace root>'}"
+            )
+            return f"Run command:\n{arguments.get('command', '')}\n{details}"
         return f"Approval required for tool: {self.tool.name}"
 
 
@@ -129,14 +135,26 @@ def build_controlled_coding_tools(
     policy: ToolPolicy,
     approval_handler: ApprovalHandler | None = None,
     workspace_context: WorkspaceContext | None = None,
+    terminal_backend: TerminalBackend | None = None,
 ) -> list[ControlledTool]:
     """Build the only six-tool composition entry point intended for a coding runtime."""
+    effective_terminal_backend = terminal_backend or LocalTerminalBackend(workspace)
     raw_tools = [
         create_read_tool(workspace),
         create_list_dir_tool(workspace),
         create_search_tool(workspace),
         create_write_tool(workspace),
         create_edit_tool(workspace),
-        create_shell_tool(workspace),
+        create_shell_tool(effective_terminal_backend),
     ]
-    return [ControlledTool(tool, policy, approval_handler, workspace.root, workspace_context) for tool in raw_tools]
+    return [
+        ControlledTool(
+            tool,
+            policy,
+            approval_handler,
+            workspace.root,
+            workspace_context,
+            effective_terminal_backend.environment if tool.tool.name == "shell" else None,
+        )
+        for tool in raw_tools
+    ]

@@ -117,7 +117,7 @@ class TuiGateway:
         self.approval_handler.deny_pending()
         if self._prompt_task is not None and not self._prompt_task.done():
             await self._prompt_task
-        self._close_runtime()
+        await self._close_runtime()
         self._closed = True
 
     async def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
@@ -166,7 +166,7 @@ class TuiGateway:
         if method == "runtime.close":
             self._ensure_idle()
             self.approval_handler.deny_pending()
-            self._close_runtime()
+            await self._close_runtime()
             self._closed = True
             return {"closed": True}
         raise _GatewayRequestError(-32601, "Method not found")
@@ -180,20 +180,21 @@ class TuiGateway:
             self._emit_event("error", {"error_type": type(error).__name__, "message": _safe_error_message(error)})
 
     async def _replace_runtime(self, session_id: str | None) -> None:
-        self._close_runtime()
+        await self._close_runtime()
         self.approval_handler = GatewayApprovalHandler(self._emit_event)
         approval_handler: ApprovalHandler | None = self.approval_handler if self._permission_mode == "ask" else None
         self.runtime = self._runtime_factory(session_id, approval_handler)
         self._unsubscribe_agent = self.runtime.agent.subscribe(self._on_agent_event)
         self._emit_event("session.changed", {"session_id": self.runtime.session.session_id})
 
-    def _close_runtime(self) -> None:
+    async def _close_runtime(self) -> None:
         if self._unsubscribe_agent is not None:
             self._unsubscribe_agent()
             self._unsubscribe_agent = None
         if self.runtime is not None:
-            self.runtime.session.close()
+            runtime = self.runtime
             self.runtime = None
+            await runtime.close()
 
     def _ensure_idle(self) -> None:
         if self._prompt_task is not None and not self._prompt_task.done():
@@ -206,6 +207,7 @@ class TuiGateway:
 
     def _status(self) -> dict[str, Any]:
         runtime = self._runtime()
+        terminal_backend = runtime.terminal_backend
         return {
             "model": runtime.agent.model.model,
             "workspace": str(runtime.workspace.root) if runtime.workspace is not None else None,
@@ -213,6 +215,16 @@ class TuiGateway:
             "permission_mode": self._permission_mode,
             "session_id": runtime.session.session_id,
             "skill_count": len(runtime.skill_catalog_snapshot.skills),
+            "terminal_backend": (
+                None
+                if terminal_backend is None
+                else {
+                    "kind": terminal_backend.environment.kind,
+                    "executor": terminal_backend.environment.executor,
+                    "cwd": terminal_backend.environment.cwd,
+                    "is_filesystem_sandboxed": terminal_backend.environment.is_filesystem_sandboxed,
+                }
+            ),
         }
 
     def _on_agent_event(self, event: AgentEvent) -> None:

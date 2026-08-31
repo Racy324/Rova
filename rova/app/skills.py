@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import shutil
-from typing import Final
+from typing import Callable, Final
 from uuid import uuid4
 import warnings
 
@@ -64,10 +64,17 @@ class FileSkillStore:
             skills.append(metadata)
         return SkillCatalogSnapshot(tuple(skills))
 
-    def read(self, name: str, path: str | None = None) -> str:
+    def read(
+        self,
+        name: str,
+        path: str | None = None,
+        *,
+        skill_directory_renderer: Callable[[Path], str] | None = None,
+    ) -> str:
         skill_directory = self._skill_directory(name)
         target = self._resolve_skill_file(skill_directory, path)
-        return _substitute_skill_directory(_read_utf8(target), skill_directory)
+        renderer = skill_directory_renderer or _host_skill_directory
+        return _substitute_skill_directory(_read_utf8(target), renderer(skill_directory))
 
     def resolved_directory(self, name: str) -> Path:
         """Return the installed package directory for an explicitly loaded Skill."""
@@ -166,17 +173,23 @@ class FileSkillStore:
         return target
 
 
-def create_skill_tools(store: FileSkillStore) -> list[AgentTool]:
+def create_skill_tools(
+    store: FileSkillStore,
+    *,
+    skill_directory_renderer: Callable[[Path], str] | None = None,
+) -> list[AgentTool]:
     async def view(_tool_call_id: str, params: dict) -> AgentToolResult:
         name = params["name"]
         path = params.get("path")
         try:
-            content = store.read(name, path)
             skill_directory = store.resolved_directory(name)
+            renderer = skill_directory_renderer or _host_skill_directory
+            rendered_directory = renderer(skill_directory)
+            content = store.read(name, path, skill_directory_renderer=renderer)
         except SkillStoreError as error:
             raise ToolExecutionError(str(error), metadata={"outcome": "tool_input_error"}) from error
         label = path or _SKILL_FILENAME
-        return AgentToolResult([TextBlock(f"Skill: {name}\nPath: {label}\nSkill directory: {skill_directory}\n\n{content}")])
+        return AgentToolResult([TextBlock(f"Skill: {name}\nPath: {label}\nSkill directory: {rendered_directory}\n\n{content}")])
 
     async def manage(_tool_call_id: str, params: dict) -> AgentToolResult:
         action = params["action"]
@@ -268,8 +281,12 @@ def _read_utf8(path: Path) -> str:
         raise SkillStoreError(f"could not read Skill file: {path.name}") from error
 
 
-def _substitute_skill_directory(content: str, directory: Path) -> str:
-    return content.replace(_SKILL_DIRECTORY_TEMPLATE, str(directory.resolve()))
+def _host_skill_directory(directory: Path) -> str:
+    return str(directory.resolve())
+
+
+def _substitute_skill_directory(content: str, rendered_directory: str) -> str:
+    return content.replace(_SKILL_DIRECTORY_TEMPLATE, rendered_directory)
 
 
 def _write_utf8_atomically(path: Path, content: str) -> None:

@@ -180,6 +180,28 @@ async def test_skill_view_returns_a_normal_tool_result(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_skill_view_uses_one_injected_directory_renderer_for_tool_result_and_content(tmp_path: Path) -> None:
+    store = FileSkillStore(tmp_path / "skills")
+    store.create(
+        "code-review",
+        _skill_markdown("code-review", "Review code.", "Run `${ROVA_SKILL_DIR}/scripts/check.py`."),
+    )
+    registry = ToolRegistry(
+        create_skill_tools(
+            store,
+            skill_directory_renderer=lambda directory: f"/opt/rova/skills/{directory.name}",
+        )
+    )
+
+    result = await registry.execute(ToolCall("view-1", "skill_view", {"name": "code-review"}))
+
+    assert result.is_error is False
+    assert "Skill directory: /opt/rova/skills/code-review" in result.text
+    assert "/opt/rova/skills/code-review/scripts/check.py" in result.text
+    assert str((store.root / "code-review").resolve()) not in result.text
+
+
+@pytest.mark.asyncio
 async def test_skill_manage_create_edit_and_delete_use_normal_tool_results(tmp_path: Path) -> None:
     store = FileSkillStore(tmp_path / "skills")
     registry = ToolRegistry(create_skill_tools(store))

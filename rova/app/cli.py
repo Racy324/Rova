@@ -24,6 +24,7 @@ from .web.sources import ResearchSourceStore
 from .runtime import DEFAULT_MAX_TURNS, MAX_PRODUCT_TURNS, build_rova_runtime
 from .settings import AppSettings
 from .vision import OpenAICompatibleVisionClient, VisionSettings
+from .workspace.terminal import TerminalEnvironment
 
 
 _REPL_EXIT_COMMANDS = frozenset({"exit", "quit", "/q"})
@@ -62,6 +63,16 @@ def _console_print(
 def parse_rova_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the local Rova agent")
     parser.add_argument("--workspace", type=Path, help="enable filesystem and shell tools within this workspace")
+    parser.add_argument(
+        "--terminal-backend",
+        choices=("local", "docker"),
+        default=None,
+        help="terminal execution backend override",
+    )
+    parser.add_argument(
+        "--docker-image",
+        help="required Linux image when --terminal-backend docker is selected",
+    )
     parser.add_argument("--web", action="store_true", help="enable public-web search and fetch tools")
     parser.add_argument("--tui", action="store_true", help="launch the local Ink terminal interface")
     parser.add_argument(
@@ -109,27 +120,34 @@ async def run_rova_cli(
     args = parse_rova_cli_args(argv) if args is None else args
     runtime = _build_runtime_from_args(args)
     _render_permission_mode(args.permission)
+    terminal_backend = getattr(runtime, "terminal_backend", None)
     _subscribe_console_renderer(
         runtime.agent,
         workspace_root=runtime.workspace.root if runtime.workspace is not None else None,
         source_store=runtime.source_store,
+        terminal_environment=(
+            terminal_backend.environment if terminal_backend is not None else None
+        ),
     )
     if args.prompt:
-        responses = await runtime.prompt(args.prompt)
-        if args.save:
-            reference = _save_final_response(runtime, args.prompt, responses[-1])
-            if reference is not None:
-                _console_print(f"[artifact] saved {reference.artifact_id}")
+        try:
+            responses = await runtime.prompt(args.prompt)
+            if args.save:
+                reference = _save_final_response(runtime, args.prompt, responses[-1])
+                if reference is not None:
+                    _console_print(f"[artifact] saved {reference.artifact_id}")
+        finally:
+            await runtime.close()
         return
     while True:
         try:
             prompt = await asyncio.to_thread(input_fn, "You> ")
         except (EOFError, KeyboardInterrupt):
-            _close_repl_session(runtime)
+            await _close_repl_session(runtime)
             return
         normalized_prompt = prompt.strip()
         if normalized_prompt in _REPL_EXIT_COMMANDS:
-            _close_repl_session(runtime)
+            await _close_repl_session(runtime)
             return
         if not normalized_prompt:
             continue
@@ -160,6 +178,7 @@ def _build_runtime_from_args(
     memory_root = data_paths.memory if args.data_dir is not None else getattr(app_settings, "memory_root", None) or data_paths.memory
     skill_root = data_paths.skills
     experience_root = data_paths.experience
+    resolved_terminal_backend, resolved_docker_image = _resolve_terminal_settings(args, app_settings)
     runtime = build_rova_runtime(
         model=app_settings.to_model(),
         stream_fn=stream_simple,
@@ -187,12 +206,28 @@ def _build_runtime_from_args(
         experience_review_task_threshold=getattr(app_settings, "experience_review_task_threshold", 5),
         experience_root=experience_root,
         vision_client=vision_client,
+        terminal_backend=resolved_terminal_backend,
+        docker_image=resolved_docker_image,
     )
     return runtime
 
 
-def _close_repl_session(runtime) -> None:
-    runtime.session.close()
+def _resolve_terminal_settings(args: argparse.Namespace, app_settings: AppSettings) -> tuple[str, str | None]:
+    backend = args.terminal_backend or getattr(app_settings, "terminal_backend", None) or "local"
+    image = args.docker_image or getattr(app_settings, "docker_image", None)
+    if backend == "docker":
+        if args.workspace is None:
+            raise ValueError("terminal backend 'docker' requires --workspace")
+        if not image:
+            raise ValueError("terminal backend 'docker' requires --docker-image or ROVA_DOCKER_IMAGE")
+        return backend, image
+    if args.docker_image is not None:
+        raise ValueError("--docker-image requires terminal backend 'docker'")
+    return backend, None
+
+
+async def _close_repl_session(runtime) -> None:
+    await runtime.close()
     _console_print(f"Session closed: {runtime.session.session_id}")
     _console_print("Goodbye.")
 
@@ -221,6 +256,7 @@ def _subscribe_console_renderer(
     *,
     workspace_root: Path | None = None,
     source_store: ResearchSourceStore | None = None,
+    terminal_environment: TerminalEnvironment | None = None,
 ) -> None:
     streamed_text = False
     tool_started_at: dict[str, float] = {}
@@ -231,7 +267,12 @@ def _subscribe_console_renderer(
             if event.tool_call_id is not None:
                 tool_started_at[event.tool_call_id] = monotonic()
             _console_print(f"[tool:start] {event.tool_name}")
-            for line in _tool_display_lines(event.tool_name, event.args or {}, workspace_root):
+            for line in _tool_display_lines(
+                event.tool_name,
+                event.args or {},
+                workspace_root,
+                terminal_environment,
+            ):
                 _console_print(line)
         elif event.type == "tool_execution_end":
             started_at = tool_started_at.pop(event.tool_call_id, None)
@@ -254,11 +295,19 @@ def _subscribe_console_renderer(
     agent.subscribe(render)
 
 
-def _tool_display_lines(tool_name: str | None, arguments: dict, workspace_root: Path | None) -> list[str]:
+def _tool_display_lines(
+    tool_name: str | None,
+    arguments: dict,
+    workspace_root: Path | None,
+    terminal_environment: TerminalEnvironment | None = None,
+) -> list[str]:
     if "command" in arguments:
         lines = [f"Command:\n{arguments['command']}"]
         if tool_name == "shell" and workspace_root is not None:
-            lines.append(f"cwd:\n{workspace_root}")
+            if terminal_environment is not None:
+                lines.extend([f"backend:\n{terminal_environment.kind}", f"cwd:\n{terminal_environment.cwd}"])
+            else:
+                lines.append(f"cwd:\n{workspace_root}")
         return lines
     if "path" in arguments:
         return [f"File:\n{arguments['path']}"]
@@ -375,6 +424,10 @@ def _tui_gateway_argv(args: argparse.Namespace) -> list[str]:
     argv: list[str] = []
     if args.workspace is not None:
         argv.extend(["--workspace", str(args.workspace)])
+    if args.terminal_backend is not None:
+        argv.extend(["--terminal-backend", args.terminal_backend])
+    if args.docker_image is not None:
+        argv.extend(["--docker-image", args.docker_image])
     if args.web:
         argv.append("--web")
     for context_path in args.context_paths:
