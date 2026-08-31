@@ -184,6 +184,9 @@ class TuiGateway:
         self.approval_handler = GatewayApprovalHandler(self._emit_event)
         approval_handler: ApprovalHandler | None = self.approval_handler if self._permission_mode == "ask" else None
         self.runtime = self._runtime_factory(session_id, approval_handler)
+        start_mcp_discovery = getattr(self.runtime, "start_mcp_discovery", None)
+        if callable(start_mcp_discovery):
+            start_mcp_discovery()
         self._unsubscribe_agent = self.runtime.agent.subscribe(self._on_agent_event)
         self._emit_event("session.changed", {"session_id": self.runtime.session.session_id})
 
@@ -208,6 +211,7 @@ class TuiGateway:
     def _status(self) -> dict[str, Any]:
         runtime = self._runtime()
         terminal_backend = runtime.terminal_backend
+        mcp_manager = getattr(runtime, "mcp_manager", None)
         return {
             "model": runtime.agent.model.model,
             "workspace": str(runtime.workspace.root) if runtime.workspace is not None else None,
@@ -223,6 +227,14 @@ class TuiGateway:
                     "executor": terminal_backend.environment.executor,
                     "cwd": terminal_backend.environment.cwd,
                     "is_filesystem_sandboxed": terminal_backend.environment.is_filesystem_sandboxed,
+                }
+            ),
+            "mcp": (
+                None
+                if mcp_manager is None
+                else {
+                    "server_states": dict(mcp_manager.server_states),
+                    "issue_count": len(mcp_manager.issues),
                 }
             ),
         }

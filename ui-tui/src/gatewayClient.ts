@@ -14,6 +14,10 @@ export type RuntimeStatus = {
 		cwd: string;
 		is_filesystem_sandboxed: boolean;
 	} | null;
+	mcp: {
+		server_states: Record<string, string>;
+		issue_count: number;
+	} | null;
 };
 
 export type SessionSummary = {

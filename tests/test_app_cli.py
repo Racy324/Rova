@@ -75,6 +75,13 @@ def test_unified_cli_defaults_permission_to_ask() -> None:
     assert parse_rova_cli_args([]).data_dir is None
 
 
+def test_unified_cli_accepts_mcp_config_and_forwards_it_to_tui() -> None:
+    args = parse_rova_cli_args(["--mcp-config", "configs/mcp.toml", "--tui"])
+
+    assert args.mcp_config == Path("configs/mcp.toml")
+    assert "--mcp-config" in cli._tui_gateway_argv(args)
+
+
 def test_unified_cli_accepts_explicit_docker_terminal_backend_and_forwards_it_to_tui() -> None:
     args = parse_rova_cli_args([
         "--tui",

@@ -1,16 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
+
+import jsonschema
 
 
 @dataclass(frozen=True)
 class Tool:
     name: str
     description: str
-    parameters: dict[str, type]
+    parameters: dict[str, type] = field(default_factory=dict)
     required: tuple[str, ...] | None = None
+    input_schema: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.input_schema is not None:
+            if self.parameters or self.required is not None:
+                raise ValueError("input_schema cannot be combined with legacy parameters")
+            if not isinstance(self.input_schema, dict) or self.input_schema.get("type") != "object":
+                raise ValueError("input_schema must be an object JSON Schema")
+            return
         if self.required is None:
             return
         if len(set(self.required)) != len(self.required):
@@ -23,6 +33,12 @@ class Tool:
 def validate_tool_arguments(tool: Tool, raw_args: dict) -> dict:
     if not isinstance(raw_args, dict):
         raise ValueError("tool arguments must be an object")
+    if tool.input_schema is not None:
+        try:
+            jsonschema.validate(raw_args, tool.input_schema)
+        except jsonschema.ValidationError as error:
+            raise ValueError(f"tool argument validation failed: {error.message}") from error
+        return dict(raw_args)
     validated: dict = {}
     required = tool.required if tool.required is not None else tuple(tool.parameters)
     for name in required:

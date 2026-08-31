@@ -128,6 +128,22 @@ def test_tool_defaults_to_all_parameters_required_for_backward_compatibility():
     assert to_provider_tools([tool])[0]["function"]["parameters"]["required"] == ["a", "b"]
 
 
+def test_tool_preserves_full_json_schema_without_legacy_conversion():
+    schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "minLength": 1},
+            "filters": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+
+    provider_tool = to_provider_tools([Tool("search", "Search", input_schema=schema)])[0]
+
+    assert provider_tool["function"]["parameters"] == schema
+
+
 def test_tool_required_field_allows_and_validates_optional_parameters():
     tool = Tool("pair", "Pair values", {"a": str, "b": int}, required=("a",))
     assert validate_tool_arguments(tool, {"a": "value"}) == {"a": "value"}

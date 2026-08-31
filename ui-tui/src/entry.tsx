@@ -213,6 +213,10 @@ function StatusBar({status}: {status: RuntimeStatus | null}): React.ReactNode {
 		if (status.terminal_backend) items.push(`terminal: ${status.terminal_backend.kind} (${status.terminal_backend.cwd})`);
 		if (status.web_enabled) items.push('web:on');
 		if (status.skill_count) items.push(`skills:${status.skill_count}`);
+		if (status.mcp) {
+			const states = Object.values(status.mcp.server_states);
+			items.push(`mcp:${states.filter(state => state === 'ready').length}/${states.length}`);
+		}
 	}
 	return <Box borderStyle="round" paddingX={1}><Text bold>{items.join(' | ')}</Text></Box>;
 }

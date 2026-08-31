@@ -151,7 +151,7 @@ def to_provider_tools(tools: Sequence[Tool]) -> list[dict]:
             "function": {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": {
+                "parameters": tool.input_schema if tool.input_schema is not None else {
                     "type": "object",
                     "properties": {
                         name: {"type": _json_schema_type(value_type)}

@@ -35,6 +35,7 @@ class AgentToolResult:
 class AgentTool:
     tool: Tool
     execute: Callable[[str, dict], Awaitable[AgentToolResult]]
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,16 @@ class ToolRegistry:
     @property
     def schemas(self) -> list[Tool]:
         return [agent_tool.tool for agent_tool in self._tools.values()]
+
+    def register_tools(self, tools: Sequence[AgentTool]) -> None:
+        batch = tuple(tools)
+        names = [tool.tool.name for tool in batch]
+        if len(set(names)) != len(names):
+            raise ValueError("duplicate tool name in registration batch")
+        duplicate = next((name for name in names if name in self._tools), None)
+        if duplicate is not None:
+            raise ValueError(f"duplicate tool name: {duplicate}")
+        self._tools = {**self._tools, **{tool.tool.name: tool for tool in batch}}
 
     async def execute(self, tool_call: ToolCall, *, scope: ToolOutputScope | None = None) -> ToolResultMessage:
         agent_tool = self._tools.get(tool_call.name)

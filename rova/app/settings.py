@@ -31,6 +31,7 @@ class AppSettings:
     data_dir: Path | None = None
     terminal_backend: str | None = None
     docker_image: str | None = None
+    mcp_config_path: Path | None = None
 
     @classmethod
     def from_env(
@@ -78,6 +79,7 @@ class AppSettings:
             data_dir=Path(data_dir).expanduser() if data_dir else None,
             terminal_backend=terminal_backend,
             docker_image=source.get("ROVA_DOCKER_IMAGE") or None,
+            mcp_config_path=(Path(source["ROVA_MCP_CONFIG"]).expanduser() if source.get("ROVA_MCP_CONFIG") else None),
         )
 
     def to_model(self) -> Model:

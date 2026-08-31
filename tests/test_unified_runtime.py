@@ -71,6 +71,21 @@ def test_unified_runtime_without_optional_inputs_creates_one_tool_free_agent(tmp
     assert runtime.session.session_id is not None
 
 
+def test_all_runtime_tool_sources_share_controlled_tool_governance(tmp_path: Path):
+    async def stream(_model, _context, _options):
+        yield StreamDone(AssistantMessage([TextBlock("done")]))
+
+    runtime = build_rova_runtime(
+        model=Model(provider="mock"),
+        stream_fn=stream,
+        permission_mode="full",
+        session_root=tmp_path / "sessions",
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    assert all(isinstance(tool, ControlledTool) for tool in runtime.agent.registry._tools.values())
+
+
 def test_unified_runtime_uses_explicit_product_max_turns(tmp_path: Path):
     async def stream(_model, _context, _options):
         yield StreamDone(AssistantMessage([TextBlock("done")]))

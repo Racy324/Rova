@@ -352,3 +352,18 @@ cd ui-tui
 pnpm typecheck
 pnpm build
 ```
+
+### MCP 工具
+
+MCP 仅在显式指定 `ROVA_MCP_CONFIG` 或 `--mcp-config PATH` 时启用。配置中的 `include_tools` 只决定哪些远端工具可被发现；每次执行仍会经过同一套 Policy 和 Approval。STDIO Server 在宿主机启动，并只获得安全基础环境加配置中显式引用的环境变量；不会默认继承 Provider 凭据或完整宿主环境。MCP discovery 在后台执行，不阻塞 CLI、TUI 或首个请求；新发现的工具从后续 Provider Turn 可见。
+
+```toml
+[mcp_servers.example]
+enabled = true
+transport = "stdio"
+command = "uvx"
+args = ["example-mcp"]
+include_tools = ["search"]
+```
+
+敏感 header/env 值只能写为 `${ENV_NAME}` 引用，例如 `env = { SERVICE_TOKEN = "${SERVICE_TOKEN}" }`。MCP 连接是受信任的本地/远端扩展连接，不是 sandbox；未实现自动重连、OAuth、热重载或 MCP 管理命令。

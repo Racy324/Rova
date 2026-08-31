@@ -175,6 +175,14 @@ def test_server_config_rejects_query_strings_so_secret_urls_cannot_be_retained()
         MCPServerConfig("tavily", "streamable_http", "https://mcp.example.test/mcp?tavilyApiKey=top-secret")
 
 
+def test_server_config_accepts_stdio_without_a_url():
+    config = MCPServerConfig("local", "stdio", command="python", args=("server.py",), environment={"SAFE": "1"})
+
+    assert config.url is None
+    assert config.command == "python"
+    assert config.args == ("server.py",)
+
+
 @pytest.mark.asyncio
 async def test_client_preserves_nested_mcp_input_schema_without_ai_tool_conversion():
     schema = {

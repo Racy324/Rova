@@ -28,17 +28,24 @@ class MCPProtocolError(RuntimeError):
 class MCPServerConfig:
     name: str
     transport: str
-    url: str
+    url: str | None = None
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+    command: str | None = None
+    args: tuple[str, ...] = ()
+    environment: Mapping[str, str] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
-        if self.transport != "streamable_http":
-            raise ValueError("only streamable_http transport is supported")
-        parsed = urlsplit(self.url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
-            raise ValueError("MCP server URL must be an http/https URL without credentials")
-        if parsed.query or parsed.fragment:
-            raise ValueError("MCP server URL must be without query or fragment")
+        if self.transport == "streamable_http":
+            if self.url is None:
+                raise ValueError("MCP server URL is required")
+            parsed = urlsplit(self.url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise ValueError("MCP server URL must be an http/https URL without credentials and without query or fragment")
+        elif self.transport == "stdio":
+            if not self.command:
+                raise ValueError("stdio MCP command is required")
+        else:
+            raise ValueError("unsupported MCP transport")
         object.__setattr__(self, "headers", dict(self.headers))
 
 
@@ -91,8 +98,13 @@ class MCPClient:
                 _raise_normalized_error(self.config, error)
 
     async def initialize(self) -> None:
-        """Confirm the SDK-managed handshake has already completed."""
+        """Open the transport lazily and confirm the SDK-managed handshake."""
+        if self._session is None:
+            await self.__aenter__()
         self._require_session()
+
+    async def close(self) -> None:
+        await self.__aexit__(None, None, None)
 
     async def list_tools(self) -> list[MCPToolDefinition]:
         try:
@@ -121,10 +133,23 @@ async def _sdk_session_factory(config: MCPServerConfig):
     from mcp.client import Client
     from mcp.client.streamable_http import streamable_http_client
 
+    if config.transport == "stdio":
+        from mcp.client.stdio import StdioServerParameters, stdio_client
+        parameters = StdioServerParameters(command=config.command, args=list(config.args), env=dict(config.environment))
+        async with Client(_stdio_transport(parameters, stdio_client)) as session:
+            yield session
+        return
+
     async with httpx.AsyncClient(headers=dict(config.headers)) as http_client:
-        transport = streamable_http_client(config.url, http_client=http_client)
+        transport = streamable_http_client(config.url or "", http_client=http_client)
         async with Client(transport) as session:
             yield session
+
+
+@asynccontextmanager
+async def _stdio_transport(parameters, factory):
+    async with factory(parameters) as transport:
+        yield transport
 
 
 def _safe_connection_message(config: MCPServerConfig, error: BaseException) -> str:

@@ -73,6 +73,7 @@ def parse_rova_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace
         "--docker-image",
         help="required Linux image when --terminal-backend docker is selected",
     )
+    parser.add_argument("--mcp-config", type=Path, default=None, help="explicit MCP server TOML configuration")
     parser.add_argument("--web", action="store_true", help="enable public-web search and fetch tools")
     parser.add_argument("--tui", action="store_true", help="launch the local Ink terminal interface")
     parser.add_argument(
@@ -119,6 +120,9 @@ async def run_rova_cli(
 ) -> None:
     args = parse_rova_cli_args(argv) if args is None else args
     runtime = _build_runtime_from_args(args)
+    start_mcp_discovery = getattr(runtime, "start_mcp_discovery", None)
+    if callable(start_mcp_discovery):
+        start_mcp_discovery()
     _render_permission_mode(args.permission)
     terminal_backend = getattr(runtime, "terminal_backend", None)
     _subscribe_console_renderer(
@@ -208,6 +212,11 @@ def _build_runtime_from_args(
         vision_client=vision_client,
         terminal_backend=resolved_terminal_backend,
         docker_image=resolved_docker_image,
+        mcp_config_path=(
+            getattr(args, "mcp_config", None)
+            if getattr(args, "mcp_config", None) is not None
+            else getattr(app_settings, "mcp_config_path", None)
+        ),
     )
     return runtime
 
@@ -428,6 +437,8 @@ def _tui_gateway_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--terminal-backend", args.terminal_backend])
     if args.docker_image is not None:
         argv.extend(["--docker-image", args.docker_image])
+    if getattr(args, "mcp_config", None) is not None:
+        argv.extend(["--mcp-config", str(args.mcp_config)])
     if args.web:
         argv.append("--web")
     for context_path in args.context_paths:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError
 
@@ -41,7 +41,7 @@ class ControlledTool:
         return self.inner.tool
 
     async def execute(self, tool_call_id: str, params: dict) -> AgentToolResult:
-        result = self.policy.evaluate(ToolExecutionRequest(self.tool.name, params))
+        result = self.policy.evaluate(ToolExecutionRequest(self.tool.name, params, self.inner.metadata))
         if result.decision is ToolPolicyDecision.ALLOW:
             return await self._execute_inner(tool_call_id, params, result, None, None)
         if result.decision is ToolPolicyDecision.DENY:
@@ -65,9 +65,9 @@ class ControlledTool:
             raise ToolExecutionDenied("Tool execution was not approved.", metadata={"outcome": "approval_denied", "policy_decision": "require_approval", "policy_reason": reason, "approval_required": True, "approval_decision": "deny"})
         return "approve"
 
-    @staticmethod
-    def _with_policy(result: AgentToolResult, policy_result, approval_required: bool | None, approval_decision: str | None) -> AgentToolResult:
+    def _with_policy(self, result: AgentToolResult, policy_result, approval_required: bool | None, approval_decision: str | None) -> AgentToolResult:
         metadata = {
+            **self.inner.metadata,
             **result.metadata,
             "policy_decision": policy_result.decision.value,
             "policy_reason": policy_result.reason,
@@ -84,6 +84,7 @@ class ControlledTool:
         except ToolExecutionError as error:
             metadata = {
                 "outcome": "tool_execution_error",
+                **self.inner.metadata,
                 **error.metadata,
                 "policy_decision": policy_result.decision.value,
                 "policy_reason": policy_result.reason,
@@ -127,6 +128,12 @@ class ControlledTool:
                 else f"cwd:\n{self.workspace_root if self.workspace_root is not None else '<workspace root>'}"
             )
             return f"Run command:\n{arguments.get('command', '')}\n{details}"
+        if self.inner.metadata.get("origin") == "mcp":
+            return "MCP tool:\n{0}\nserver:\n{1}\noperation:\n{2}".format(
+                self.inner.metadata.get("public_name", self.tool.name),
+                self.inner.metadata.get("server_id", "unknown"),
+                self.inner.metadata.get("raw_tool_name", "unknown"),
+            )
         return f"Approval required for tool: {self.tool.name}"
 
 
@@ -157,4 +164,16 @@ def build_controlled_coding_tools(
             effective_terminal_backend.environment if tool.tool.name == "shell" else None,
         )
         for tool in raw_tools
+    ]
+
+
+def wrap_controlled_tools(
+    tools: Sequence[AgentTool | ControlledTool],
+    policy: ToolPolicy,
+    approval_handler: ApprovalHandler | None,
+) -> list[ControlledTool]:
+    """Apply the product's single execution boundary without double wrapping Workspace tools."""
+    return [
+        tool if isinstance(tool, ControlledTool) else ControlledTool(tool, policy, approval_handler)
+        for tool in tools
     ]

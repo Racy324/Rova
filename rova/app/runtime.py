@@ -4,6 +4,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import os
 import platform
 import warnings
 
@@ -22,9 +23,9 @@ from .web.sources import ResearchSourceStore
 from .web.tools import WebFetchBackend, WebSearchBackend, create_fetch_webpage_tool, create_web_search_tool
 from .workspace.approval import AlwaysApprove, ApprovalHandler, ConsoleApprovalHandler
 from .workspace.context import WorkspaceContext
-from .workspace.controlled_tool import build_controlled_coding_tools
+from .workspace.controlled_tool import build_controlled_coding_tools, wrap_controlled_tools
 from .workspace.instructions import WorkspaceInstructionSnapshot, load_workspace_instruction
-from .workspace.policy import DefaultCodingToolPolicy, ToolPolicy
+from .workspace.policy import DefaultRovaToolPolicy, ToolPolicy
 from .workspace.terminal import DockerTerminalBackend, LocalTerminalBackend, TerminalBackend
 from .workspace.workspace import Workspace
 from .memory import (
@@ -38,6 +39,9 @@ from .experience_review import ExperienceReviewService, ExperienceReviewer, File
 from .paths import RovaDataPaths
 from .skills import FileSkillStore, SkillCatalogSnapshot, SkillStoreError, create_skill_tools
 from .vision import VisionClient, create_vision_analyze_tool
+from rova.mcp.client import MCPClient, MCPServerConfig
+from rova.mcp.config import MCPServerSettings, load_mcp_settings, safe_stdio_environment
+from rova.mcp.manager import MCPManager
 
 
 DEFAULT_MAX_TURNS = 16
@@ -76,6 +80,7 @@ class RovaRuntime:
     experience_review_service: ExperienceReviewService | None
     extension_api: ExtensionAPI
     extension_load_report: ExtensionLoadReport
+    mcp_manager: MCPManager | None
 
     def __post_init__(self) -> None:
         self._memory_listeners: list[Callable[[MemoryObservation], None]] = []
@@ -95,18 +100,31 @@ class RovaRuntime:
     def extension_runtime_issues(self):
         return self.extension_api.runtime_issues
 
+    @property
+    def mcp_runtime_issues(self):
+        return () if self.mcp_manager is None else tuple(self.mcp_manager.issues)
+
+    def start_mcp_discovery(self) -> None:
+        if self.mcp_manager is not None:
+            self.mcp_manager.start()
+
     async def close(self) -> None:
         """Release Runtime-owned resources without persisting backend state."""
         if self._closed:
             return
         self._closed = True
         try:
-            if self.terminal_backend is not None:
-                await self.terminal_backend.close()
+            if self.mcp_manager is not None:
+                await self.mcp_manager.close()
         finally:
-            self.session.close()
+            try:
+                if self.terminal_backend is not None:
+                    await self.terminal_backend.close()
+            finally:
+                self.session.close()
 
     async def prompt(self, text: str):
+        self.start_mcp_discovery()
         if self.experience_review_service is not None:
             self.experience_review_service.begin_run(text)
         request_text = text
@@ -179,6 +197,7 @@ def build_rova_runtime(
     extension_roots: Sequence[Path] | None = None,
     terminal_backend: str = "local",
     docker_image: str | None = None,
+    mcp_config_path: Path | None = None,
 ) -> RovaRuntime:
     if (web_search_backend is None) != (webpage_fetcher is None):
         raise ValueError("web_search_backend and webpage_fetcher must be provided together")
@@ -216,6 +235,7 @@ def build_rova_runtime(
         memory_snapshot = MemorySnapshot()
     workspace_instruction_snapshot = load_workspace_instruction(workspace.root if workspace is not None else None)
     effective_skill_store = FileSkillStore(skill_root)
+    mcp_servers = load_mcp_settings(mcp_config_path).servers if mcp_config_path is not None else ()
     try:
         skill_catalog_snapshot = effective_skill_store.discover_catalog()
     except SkillStoreError as error:
@@ -240,10 +260,15 @@ def build_rova_runtime(
         ),
         *create_memory_tools(effective_memory_store, max_chars=memory_max_chars),
     ]
+    effective_policy: ToolPolicy = DefaultRovaToolPolicy(policy)
+    effective_approval_handler: ApprovalHandler | None = approval_handler
+    if permission_mode == "full" and effective_approval_handler is None:
+        effective_approval_handler = AlwaysApprove()
     if workspace is not None:
-        effective_policy = DefaultCodingToolPolicy() if policy is None else policy
         assert effective_terminal_backend is not None
-        effective_approval_handler = approval_handler or _approval_handler_for_mode(permission_mode, effective_terminal_backend)
+        effective_approval_handler = effective_approval_handler or _approval_handler_for_mode(
+            permission_mode, effective_terminal_backend
+        )
         tools.extend(build_controlled_coding_tools(
             workspace,
             effective_policy,
@@ -268,6 +293,7 @@ def build_rova_runtime(
     )
     extension_load_report = extension_loader.load(extension_api)
     tools.extend(extension_api.tools)
+    tools = wrap_controlled_tools(tools, effective_policy, effective_approval_handler)
 
     store_root = artifact_root or RovaDataPaths.resolve().artifacts
     artifact_store = FileArtifactStore(store_root)
@@ -289,6 +315,17 @@ def build_rova_runtime(
         tool_output_processor=ToolOutputProcessor(artifact_store),
     )
     extension_api.bind_event_hooks(agent)
+    mcp_manager = (
+        MCPManager(
+            mcp_servers,
+            agent.registry,
+            effective_policy,
+            effective_approval_handler,
+            _create_mcp_client,
+        )
+        if mcp_servers
+        else None
+    )
     experience_review_service = None
     if experience_review_enabled:
         experience_review_service = ExperienceReviewService(
@@ -327,7 +364,20 @@ def build_rova_runtime(
         experience_review_service=experience_review_service,
         extension_api=extension_api,
         extension_load_report=extension_load_report,
+        mcp_manager=mcp_manager,
     )
+
+
+def _create_mcp_client(server: MCPServerSettings) -> MCPClient:
+    return MCPClient(MCPServerConfig(
+        server.server_id,
+        server.transport,
+        url=server.url,
+        headers=server.headers,
+        command=server.command,
+        args=server.args,
+        environment=(safe_stdio_environment(os.environ, server.environment) if server.transport == "stdio" else {}),
+    ))
 
 
 def _approval_handler_for_mode(permission_mode: str, terminal_backend: TerminalBackend) -> ApprovalHandler:
