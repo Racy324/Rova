@@ -6,6 +6,15 @@ from typing import Literal, Union
 from .messages import AssistantMessage
 
 
+@dataclass(frozen=True)
+class ProviderFailure:
+    """Sanitized, typed Provider failure facts available to the Runtime."""
+
+    classification: Literal["context_overflow"] | None = None
+    status_code: int | None = None
+    code: str | None = None
+
+
 @dataclass
 class Start:
     partial: AssistantMessage
@@ -39,6 +48,7 @@ class StreamDone:
 class StreamError:
     reason: Literal["error", "aborted"]
     error: AssistantMessage
+    failure: ProviderFailure | None = None
     type: Literal["error"] = "error"
 
 

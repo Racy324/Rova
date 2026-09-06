@@ -5,10 +5,10 @@ import httpx
 
 from rova.ai.context import Context
 from rova.ai._env import resolve_api_key
-from rova.ai.events import StreamDone, StreamError
+from rova.ai.events import ProviderFailure, StreamDone, StreamError
 from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage, UserMessage
 from rova.ai.models import Model
-from rova.ai.providers.openai_compatible import HttpxStreamingHttpClient, OpenAICompatibleProvider, ProviderRequestError, from_provider_response, to_provider_messages, to_provider_tools
+from rova.ai.providers.openai_compatible import ContextOverflowError, HttpxStreamingHttpClient, OpenAICompatibleProvider, ProviderRequestError, estimate_provider_input_tokens, from_provider_response, to_provider_messages, to_provider_tools
 from rova.ai.stream import stream_simple
 from rova.ai.tools import Tool, validate_tool_arguments
 from rova.agent_core.agent import Agent
@@ -47,6 +47,92 @@ class FakeHttpClient:
 
 def make_context(messages=None, tools=None):
     return Context("system instruction", messages or [UserMessage("hello")], tools or [])
+
+
+def test_provider_input_estimate_uses_the_canonical_serialized_messages_and_tools():
+    model = Model(provider="openai_compatible", model="test")
+    base = make_context(messages=[UserMessage("hello")])
+    with_tool = make_context(
+        messages=[UserMessage("hello")],
+        tools=[Tool("search", "Search documents", {"query": str})],
+    )
+    with_system_context = Context("system instruction\n\nMemory snapshot: x" * 10, list(base.messages), list(base.tools))
+
+    assert estimate_provider_input_tokens(model, with_tool) > estimate_provider_input_tokens(model, base)
+    assert estimate_provider_input_tokens(model, with_system_context) > estimate_provider_input_tokens(model, base)
+
+
+@pytest.mark.asyncio
+async def test_agent_applies_product_context_preparer_before_each_provider_step():
+    prepared_contexts = []
+
+    async def prepare(context):
+        return Context(f"{context.system_prompt}\nprepared", list(context.messages), list(context.tools))
+
+    async def stream(_model, context, _options):
+        prepared_contexts.append(context)
+        yield StreamDone(AssistantMessage([TextBlock("done")]))
+
+    agent = Agent(Model(), "base", [], stream, context_preparer=prepare)
+
+    await agent.run([UserMessage("hello")])
+
+    assert [context.system_prompt for context in prepared_contexts] == ["base\nprepared"]
+
+
+@pytest.mark.asyncio
+async def test_agent_retries_one_uncommitted_provider_step_after_typed_context_overflow():
+    attempts = 0
+    recovered_contexts = []
+
+    async def recover(context):
+        recovered_contexts.append(context)
+        return Context("compacted", list(context.messages), list(context.tools))
+
+    async def stream(_model, context, _options):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            yield StreamError(
+                "error",
+                AssistantMessage([TextBlock("overflow")], stop_reason="error"),
+                failure=ProviderFailure("context_overflow", 400, "context_length_exceeded"),
+            )
+            return
+        assert context.system_prompt == "compacted"
+        yield StreamDone(AssistantMessage([TextBlock("done")]))
+
+    agent = Agent(Model(), "base", [], stream, context_overflow_recovery=recover)
+
+    messages = await agent.run([UserMessage("hello")])
+
+    assert [message.text for message in messages] == ["done"]
+    assert attempts == 2
+    assert len(recovered_contexts) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_after_one_typed_context_overflow_retry():
+    attempts = 0
+
+    async def recover(context):
+        return context
+
+    async def stream(_model, _context, _options):
+        nonlocal attempts
+        attempts += 1
+        yield StreamError(
+            "error",
+            AssistantMessage([TextBlock("overflow")], stop_reason="error"),
+            failure=ProviderFailure("context_overflow", 400, "context_length_exceeded"),
+        )
+
+    agent = Agent(Model(), "base", [], stream, context_overflow_recovery=recover)
+    messages = await agent.run([UserMessage("hello")])
+
+    assert attempts == 2
+    assert messages[-1].stop_reason == "error"
+    assert agent.events[-1].termination_reason.value == "context_overflow"
 
 
 def test_app_settings_builds_model_without_api_key():
@@ -252,6 +338,21 @@ async def test_openai_translator_converts_http_failure_to_stream_error():
     events = [event async for event in OpenAICompatibleProvider("test-key", FakeHttpClient(error=ProviderRequestError("network unavailable"))).stream(Model(provider="openai_compatible", model="test", base_url="https://example.test/v1"), make_context(), None)]
     assert isinstance(events[-1], StreamError)
     assert "network unavailable" in events[-1].error.text
+
+
+@pytest.mark.asyncio
+async def test_openai_translator_marks_only_typed_context_overflow_as_recoverable():
+    events = [
+        event
+        async for event in OpenAICompatibleProvider(
+            "test-key",
+            FakeHttpClient(error=ContextOverflowError(status_code=400, code="context_length_exceeded")),
+        ).stream(Model(provider="openai_compatible", model="test"), make_context(), None)
+    ]
+
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].failure is not None
+    assert events[-1].failure.classification == "context_overflow"
 
 
 @pytest.mark.asyncio

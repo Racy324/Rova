@@ -308,6 +308,7 @@ class ToolRuntime:
         runtime_mode: ToolExecutionMode,
         scope: ToolOutputScope | None = None,
         on_execution_start: Callable[[PreparedToolCall], Awaitable[None]] | None = None,
+        on_executor_completed: Callable[[PreparedToolCall], Awaitable[None]] | None = None,
         on_execution_end: Callable[[PreparedToolCall, ToolResultMessage], Awaitable[None]] | None = None,
         on_execution_finished_uncommitted: Callable[[PreparedToolCall], Awaitable[None]] | None = None,
         on_result_committed: Callable[[ToolResultMessage], Awaitable[None]] | None = None,
@@ -325,6 +326,7 @@ class ToolRuntime:
                     else await self._execute_observed(
                         prepared,
                         on_execution_start,
+                        on_executor_completed,
                         on_execution_end,
                         on_execution_finished_uncommitted,
                     )
@@ -343,6 +345,7 @@ class ToolRuntime:
                 self._execute_observed(
                     prepared,
                     on_execution_start,
+                    on_executor_completed,
                     on_execution_end,
                     on_execution_finished_uncommitted,
                 )
@@ -372,13 +375,14 @@ class ToolRuntime:
         self,
         prepared: PreparedToolCall,
         on_execution_start: Callable[[PreparedToolCall], Awaitable[None]] | None,
+        on_executor_completed: Callable[[PreparedToolCall], Awaitable[None]] | None,
         on_execution_end: Callable[[PreparedToolCall, ToolResultMessage], Awaitable[None]] | None,
         on_execution_finished_uncommitted: Callable[[PreparedToolCall], Awaitable[None]] | None,
     ) -> ToolResultMessage:
         if on_execution_start is not None:
             await on_execution_start(prepared)
         try:
-            result = await self._execute_prepared(prepared)
+            result = await self._execute_prepared(prepared, on_executor_completed=on_executor_completed)
         except LifecycleHookError:
             # A post/failure hook may fail after the underlying executor has
             # ended but before a canonical ToolResult exists.  Preserve that
@@ -391,10 +395,17 @@ class ToolRuntime:
             await on_execution_end(prepared, result)
         return result
 
-    async def _execute_prepared(self, prepared: PreparedToolCall) -> ToolResultMessage:
+    async def _execute_prepared(
+        self,
+        prepared: PreparedToolCall,
+        *,
+        on_executor_completed: Callable[[PreparedToolCall], Awaitable[None]] | None = None,
+    ) -> ToolResultMessage:
         tool_call = prepared.tool_call
         try:
             result = await prepared.agent_tool.execute(tool_call.id, dict(prepared.arguments))
+            if on_executor_completed is not None:
+                await on_executor_completed(prepared)
             if self._governance is not None and prepared.governance is not None:
                 result = await self._governance.after_success(prepared, result)
             post_outcome = await self._hook_registry.dispatch_post_tool_use(PostToolUseContext(
@@ -421,7 +432,7 @@ class ToolRuntime:
                 error.metadata or {"outcome": "tool_execution_error"},
                 prepared.scope,
                 call_index=prepared.call_index,
-                stage="execution",
+                stage=_failure_stage(error.metadata or {}),
                 arguments=prepared.arguments,
             )
         for middleware in self._middlewares:
@@ -440,6 +451,7 @@ class ToolRuntime:
         arguments: Mapping[str, Any] | None = None,
     ) -> ToolResultMessage:
         current_metadata = dict(metadata)
+        current_metadata["failure_stage"] = stage
         outcome = str(current_metadata.get("outcome", "tool_execution_error"))
         failure_outcome = await self._hook_registry.dispatch_tool_failure(ToolFailureContext(
             stage=stage,
@@ -520,9 +532,9 @@ def _failure_stage(metadata: Mapping[str, Any]) -> str:
     outcome = metadata.get("outcome")
     if outcome == "policy_denied":
         return "policy"
-    if outcome in {"approval_denied", "approval_cancelled"}:
+    if outcome in {"approval_denied", "approval_cancelled", "approval_unavailable", "approval_error"}:
         return "approval"
-    return "policy"
+    return "execution"
 
 
 def _json_value(value: Any) -> bool:

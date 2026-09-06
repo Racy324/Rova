@@ -69,7 +69,14 @@ class ArtifactReference:
 @dataclass(frozen=True)
 class ToolOutputMetadata:
     schema_version: int
+    # `truncated` is retained for backward-compatible consumers.  It describes
+    # only the preview, not whether the raw result was durably retained.
     truncated: bool
+    externalized: bool
+    artifact_ref: str
+    original_size_chars: int
+    preview_truncated: bool
+    preview_size_chars: int
     strategy: ToolOutputStrategy
     original_line_count: int
     original_byte_count: int
@@ -84,6 +91,11 @@ class ToolOutputMetadata:
         return {
             "schema_version": self.schema_version,
             "truncated": self.truncated,
+            "externalized": self.externalized,
+            "artifact_ref": self.artifact_ref,
+            "original_size_chars": self.original_size_chars,
+            "preview_truncated": self.preview_truncated,
+            "preview_size_chars": self.preview_size_chars,
             "strategy": self.strategy.value,
             "original_line_count": self.original_line_count,
             "original_byte_count": self.original_byte_count,
@@ -156,6 +168,11 @@ class ToolOutputProcessor:
         metadata_value = ToolOutputMetadata(
             schema_version=1,
             truncated=truncated,
+            externalized=True,
+            artifact_ref=artifact.artifact_id,
+            original_size_chars=len(raw_text),
+            preview_truncated=truncated,
+            preview_size_chars=len(preview),
             strategy=strategy,
             original_line_count=raw_lines,
             original_byte_count=original_bytes,

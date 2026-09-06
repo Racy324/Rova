@@ -24,7 +24,7 @@ async def test_calc_tool_result_is_appended_and_used_by_next_provider_turn():
     assert messages[-1].text == "123 * 456 = 56088"
     assert any(isinstance(m, ToolResultMessage) and m.content[0].text == "56088" for m in agent.messages)
     assert any(isinstance(m, ToolResultMessage) and m.content[0].text == "56088" for m in agent.last_context.messages)
-    assert [event.type for event in agent.events] == ["agent_start", "turn_start", "message_start", "message_end", "tool_execution_start", "tool_execution_state", "tool_execution_end", "tool_execution_state", "message_end", "turn_end", "turn_start", "message_start", "message_end", "turn_end", "agent_end"]
+    assert [event.type for event in agent.events] == ["agent_start", "turn_start", "message_start", "message_end", "tool_execution_start", "tool_execution_state", "tool_execution_state", "tool_execution_end", "tool_execution_state", "message_end", "turn_end", "turn_start", "message_start", "message_end", "turn_end", "agent_end"]
 
 
 @pytest.mark.asyncio

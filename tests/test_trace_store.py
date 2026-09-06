@@ -13,9 +13,12 @@ from rova.trace import (
     JsonlTraceStore,
     RunStatus,
     RunTrace,
+    StepTrace,
+    StepUsageTrace,
     TerminationReason,
-    ToolExecutionTrace,
+    ToolCallTrace,
     ToolOutcome,
+    ToolResultTrace,
     TraceCorruptionError,
     TraceStoreError,
     run_trace_to_dict,
@@ -31,15 +34,28 @@ def make_trace(run_id: str = "run1") -> RunTrace:
         duration_ms=1.5,
         status=RunStatus.COMPLETED,
         termination_reason=TerminationReason.FINAL_RESPONSE,
-        usage=Usage(1, 2, 3),
-        final_message=AssistantMessage([TextBlock("你好")]),
-        tool_executions=[
-            ToolExecutionTrace(
-                "tool-1", "shell", {"command": "echo hi"}, 1, timestamp,
-                ended_at=timestamp, duration_ms=0.1, result="ok", is_error=False,
-                outcome=ToolOutcome.SUCCESS, metadata={"command": "echo hi", "nested": [1, "two"]},
+        input_message="hello",
+        steps=[
+            StepTrace(
+                1,
+                timestamp,
+                ended_at=timestamp,
+                duration_ms=1.5,
+                assistant_message=AssistantMessage([TextBlock("你好")]),
+                usage=StepUsageTrace(estimated_input_tokens=1, actual_usage=Usage(1, 2, 3)),
+                tool_calls=[
+                    ToolCallTrace(
+                        "tool-1", "shell", {"command": "echo hi"}, "batch-1", 0, "sequential", "sequential",
+                        executed=True, committed=True, started_at=timestamp, ended_at=timestamp, duration_ms=0.1,
+                        outcome=ToolOutcome.SUCCESS,
+                        result=ToolResultTrace("ok", True, "artifact-1", 2, False, 2),
+                        diagnostics={"command": "echo hi", "nested": [1, "two"]},
+                    )
+                ],
             )
         ],
+        actual_usage_complete=True,
+        actual_usage=Usage(1, 2, 3),
         compactions=[
             CompactionTrace(
                 timestamp, CompactionTrigger.MANUAL, "entry-1", ended_at=timestamp,
@@ -56,6 +72,41 @@ def test_jsonl_trace_store_round_trips_finalized_trace_and_rejects_duplicates(tm
     assert store.load_all() == [trace]
     with pytest.raises(TraceStoreError, match="duplicate"):
         store.append(trace)
+
+
+def test_jsonl_trace_store_writes_v3_step_schema_without_legacy_turn_fields(tmp_path):
+    timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    trace = RunTrace(
+        "v3",
+        timestamp,
+        ended_at=timestamp,
+        duration_ms=1,
+        status=RunStatus.COMPLETED,
+        termination_reason=TerminationReason.FINAL_RESPONSE,
+        input_message="hello",
+        steps=[
+            StepTrace(
+                1,
+                timestamp,
+                ended_at=timestamp,
+                duration_ms=1,
+                assistant_message=AssistantMessage([TextBlock("done")]),
+                usage=StepUsageTrace(estimated_input_tokens=7, actual_usage=Usage(7, 1, 8)),
+            )
+        ],
+        actual_usage_complete=True,
+        actual_usage=Usage(7, 1, 8),
+    )
+    store = JsonlTraceStore(tmp_path / "trace.jsonl")
+
+    store.append(trace)
+
+    record = json.loads(store.path.read_text(encoding="utf-8"))
+    assert record["schema_version"] == 3
+    assert set(record["trace"]) >= {"input_message", "steps", "actual_usage_complete", "actual_usage"}
+    assert "turns" not in record["trace"]
+    assert "tool_executions" not in record["trace"]
+    assert store.load_all()[0].steps[0].usage.estimated_input_tokens == 7
 
 
 def test_jsonl_trace_store_keeps_multiple_runs_in_append_order(tmp_path):
@@ -82,7 +133,14 @@ def test_jsonl_trace_store_rejects_an_unsupported_schema_version(tmp_path):
 
 
 def test_jsonl_trace_store_reads_v1_records_without_memory_events(tmp_path):
-    payload = run_trace_to_dict(make_trace())
+    from rova.trace.store import _legacy_trace_to_dict
+
+    timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    legacy = RunTrace(
+        "legacy", timestamp, ended_at=timestamp, duration_ms=1,
+        status=RunStatus.COMPLETED, termination_reason=TerminationReason.FINAL_RESPONSE,
+    )
+    payload = _legacy_trace_to_dict(legacy)
     payload.pop("memory_events")
     path = tmp_path / "trace.jsonl"
     path.write_text(json.dumps({"schema_version": 1, "trace": payload}) + "\n", encoding="utf-8")

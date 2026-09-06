@@ -88,7 +88,11 @@ async def test_pre_tool_block_is_distinct_failure_and_never_reaches_execution() 
     result = await runtime.execute(ToolCall("call", "sample", {"value": "ok"}))
 
     assert result.is_error is True
-    assert result.metadata == {"outcome": "hook_blocked", "hook_diagnostic": "recorded"}
+    assert result.metadata == {
+        "outcome": "hook_blocked",
+        "hook_diagnostic": "recorded",
+        "failure_stage": "pre_tool_use",
+    }
     assert observed_failures == [("pre_tool_use", "hook_blocked")]
 
 

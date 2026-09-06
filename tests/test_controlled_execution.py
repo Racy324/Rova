@@ -96,6 +96,7 @@ async def test_controlled_tool_policy_deny_does_not_call_inner_and_becomes_tool_
         "outcome": "policy_denied",
         "policy_decision": "deny",
         "policy_reason": "denied by test",
+        "failure_stage": "policy",
     }
     assert calls == []
 
@@ -169,6 +170,7 @@ async def test_controlled_inner_failure_preserves_policy_and_approval_metadata()
         "policy_reason": "approval needed",
         "approval_required": True,
         "approval_decision": "approve",
+        "failure_stage": "execution",
     }
 
 

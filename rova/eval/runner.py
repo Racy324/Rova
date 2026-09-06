@@ -115,7 +115,21 @@ def _runtime_failure_reason(reason: TerminationReason | None) -> FailureReason |
 
 
 def _empty_metrics() -> BehaviorMetrics:
-    return BehaviorMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None)
+    return BehaviorMetrics(
+        turn_count=0,
+        tool_call_count=0,
+        tool_error_count=0,
+        policy_denied_count=0,
+        approval_denied_count=0,
+        shell_nonzero_count=0,
+        shell_timeout_count=0,
+        compaction_count=0,
+        actual_usage_available=False,
+        input_tokens=None,
+        output_tokens=None,
+        total_tokens=None,
+        run_duration_ms=None,
+    )
 
 
 def _now() -> datetime:

@@ -9,7 +9,7 @@ from typing import Protocol
 import httpx
 
 from ..context import Context
-from ..events import AssistantMessageEvent, Start, StreamDone, StreamError, TextDelta, ToolCallDelta
+from ..events import AssistantMessageEvent, ProviderFailure, Start, StreamDone, StreamError, TextDelta, ToolCallDelta
 from ..messages import AssistantMessage, Message, TextBlock, ToolCall, ToolResultMessage, Usage, UserMessage
 from ..models import Model
 from ..tools import Tool
@@ -17,6 +17,15 @@ from ..tools import Tool
 
 class ProviderRequestError(Exception):
     """An external HTTP failure represented by the AI event contract."""
+
+
+class ContextOverflowError(ProviderRequestError):
+    """A Provider adapter verified a context-length rejection structurally."""
+
+    def __init__(self, *, status_code: int, code: str) -> None:
+        super().__init__(f"Provider rejected request context (HTTP {status_code}, code={code})")
+        self.status_code = status_code
+        self.code = code
 
 
 class StreamingHttpClient(Protocol):
@@ -41,6 +50,11 @@ class HttpxStreamingHttpClient:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
                         yield line
+        except httpx.HTTPStatusError as error:
+            code = _structured_context_overflow_code(error.response)
+            if code is not None:
+                raise ContextOverflowError(status_code=error.response.status_code, code=code) from error
+            raise ProviderRequestError(str(error)) from error
         except httpx.HTTPError as error:
             raise ProviderRequestError(str(error)) from error
 
@@ -92,7 +106,14 @@ class OpenAICompatibleProvider:
                     terminal_event = _stream_error(f"Invalid provider response: {error}")
                     break
         except (ProviderRequestError, httpx.HTTPError) as error:
-            terminal_event = _stream_error(_provider_error_summary(error, self._api_key))
+            terminal_event = _stream_error(
+                _provider_error_summary(error, self._api_key),
+                failure=(
+                    ProviderFailure("context_overflow", error.status_code, error.code)
+                    if isinstance(error, ContextOverflowError)
+                    else None
+                ),
+            )
         finally:
             await _close_if_supported(sse_stream)
 
@@ -119,6 +140,21 @@ def to_provider_request(model: Model, context: Context) -> dict:
     if model.max_tokens is not None:
         payload["max_tokens"] = model.max_tokens
     return payload
+
+
+def estimate_provider_input_tokens(model: Model, context: Context) -> int:
+    """Deterministically estimate provider input from its canonical request form.
+
+    This is deliberately an estimate, not a tokenizer claim or Provider usage
+    substitute. It serializes exactly the messages and tool schemas that this
+    adapter will send, including role and function-call framing.
+    """
+    payload = to_provider_request(model, context)
+    input_payload = {"messages": payload["messages"]}
+    if "tools" in payload:
+        input_payload["tools"] = payload["tools"]
+    encoded = json.dumps(input_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return max(1, (len(encoded) + 3) // 4)
 
 
 def to_provider_messages(system_prompt: str, messages: Sequence[Message]) -> list[dict]:
@@ -397,8 +433,27 @@ def _json_schema_type(value_type: type) -> str:
     return {str: "string", int: "integer", float: "number", bool: "boolean"}.get(value_type, "string")
 
 
-def _stream_error(text: str) -> StreamError:
-    return StreamError("error", AssistantMessage(content=[TextBlock(text)], stop_reason="error"))
+def _structured_context_overflow_code(response: httpx.Response) -> str | None:
+    """Recognize only documented structured codes, never free-form error text."""
+    if response.status_code not in {400, 413}:
+        return None
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    if code in {"context_length_exceeded", "context_window_exceeded"}:
+        return str(code)
+    return None
+
+
+def _stream_error(text: str, *, failure: ProviderFailure | None = None) -> StreamError:
+    return StreamError("error", AssistantMessage(content=[TextBlock(text)], stop_reason="error"), failure=failure)
 
 
 def _provider_error_summary(error: BaseException, api_key: str) -> str:

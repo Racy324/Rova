@@ -28,6 +28,10 @@ class RovaDataPaths:
         return self.root / "artifacts"
 
     @property
+    def traces(self) -> Path:
+        return self.root / "traces"
+
+    @property
     def memory(self) -> Path:
         return self.root / "memory"
 

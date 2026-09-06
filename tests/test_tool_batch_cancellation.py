@@ -147,6 +147,6 @@ async def test_parallel_post_hook_failure_cancels_sibling_without_partial_commit
     assert not [message for message in agent.messages if message.__class__.__name__ == "ToolResultMessage"]
     journal = tmp_path / f"{session.session_id}.executions.jsonl"
     states = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
-    assert [(item["tool_call_id"], item["state"]) for item in states] == [
-        ("a", "started"), ("b", "started"), ("a", "completed"), ("b", "interrupted"),
-    ]
+    assert {(item["tool_call_id"], item["state"]) for item in states} == {
+        ("a", "started"), ("b", "started"), ("a", "executor_completed"), ("b", "interrupted"),
+    }

@@ -258,7 +258,8 @@ async def test_automatic_compaction_runs_after_tool_loop_and_only_once_per_agent
     await session.prompt("calculate 1 + 1")
 
     assert len(summary_events) == 1
-    assert summary_events[0][0] == "agent_end"
+    event_types = [event.type for event in agent.events]
+    assert event_types.index("agent_end") < event_types.index("compaction_started")
     assert any(isinstance(message, ToolResultMessage) for message in session._durable_session.physical_messages)
 
 

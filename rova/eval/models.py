@@ -80,9 +80,10 @@ class BehaviorMetrics:
     shell_nonzero_count: int
     shell_timeout_count: int
     compaction_count: int
-    input_tokens: int
-    output_tokens: int
-    total_tokens: int
+    actual_usage_available: bool
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
     run_duration_ms: float | None
 
     def __post_init__(self) -> None:
@@ -95,24 +96,35 @@ class BehaviorMetrics:
             "shell_nonzero_count",
             "shell_timeout_count",
             "compaction_count",
-            "input_tokens",
-            "output_tokens",
-            "total_tokens",
         ):
             value = getattr(self, field_name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{field_name} must be a non-negative integer")
+        for field_name in ("input_tokens", "output_tokens", "total_tokens"):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+                raise ValueError(f"{field_name} must be a non-negative integer or None")
+        if self.actual_usage_available != (self.input_tokens is not None):
+            raise ValueError("actual usage availability must match token fields")
         if self.run_duration_ms is not None:
             _ensure_finite_number(self.run_duration_ms, "run_duration_ms")
 
     @classmethod
     def from_run_trace(cls, trace: RunTrace) -> BehaviorMetrics:
-        usage = trace.usage or _aggregate_turn_usage(trace)
-        tools = trace.tool_executions
+        if trace.steps:
+            usage = trace.actual_usage if trace.actual_usage_complete else None
+            tools = [tool for step in trace.steps for tool in step.tool_calls]
+            turn_count = len(trace.steps)
+            tool_error_count = sum(tool.outcome is not None and tool.outcome is not ToolOutcome.SUCCESS for tool in tools)
+        else:
+            usage = trace.usage or _aggregate_turn_usage(trace)
+            tools = trace.tool_executions
+            turn_count = len(trace.turns)
+            tool_error_count = sum(tool.is_error is True for tool in tools)
         return cls(
-            turn_count=len(trace.turns),
+            turn_count=turn_count,
             tool_call_count=len(tools),
-            tool_error_count=sum(tool.is_error is True for tool in tools),
+            tool_error_count=tool_error_count,
             policy_denied_count=sum(
                 tool.outcome is ToolOutcome.POLICY_DENIED for tool in tools
             ),
@@ -126,9 +138,10 @@ class BehaviorMetrics:
                 tool.outcome is ToolOutcome.COMMAND_TIMEOUT for tool in tools
             ),
             compaction_count=len(trace.compactions),
-            input_tokens=usage.input_tokens if usage else 0,
-            output_tokens=usage.output_tokens if usage else 0,
-            total_tokens=usage.total_tokens if usage else 0,
+            actual_usage_available=usage is not None,
+            input_tokens=usage.input_tokens if usage else None,
+            output_tokens=usage.output_tokens if usage else None,
+            total_tokens=usage.total_tokens if usage else None,
             run_duration_ms=trace.duration_ms,
         )
 
@@ -312,6 +325,7 @@ def _metrics_to_dict(metrics: BehaviorMetrics) -> dict[str, Any]:
         "shell_nonzero_count": metrics.shell_nonzero_count,
         "shell_timeout_count": metrics.shell_timeout_count,
         "compaction_count": metrics.compaction_count,
+        "actual_usage_available": metrics.actual_usage_available,
         "input_tokens": metrics.input_tokens,
         "output_tokens": metrics.output_tokens,
         "total_tokens": metrics.total_tokens,
@@ -329,15 +343,20 @@ def _metrics_from_dict(value: dict[str, Any]) -> BehaviorMetrics:
         "shell_nonzero_count",
         "shell_timeout_count",
         "compaction_count",
-        "input_tokens",
-        "output_tokens",
-        "total_tokens",
     )
     values = {field_name: _required_int(value, field_name) for field_name in int_fields}
+    actual_usage_available = _bool(value.get("actual_usage_available"), "actual_usage_available")
+    for field_name in ("input_tokens", "output_tokens", "total_tokens"):
+        token_value = value.get(field_name)
+        values[field_name] = None if token_value is None else _required_int(value, field_name)
     duration = value.get("run_duration_ms")
     if duration is not None:
         _ensure_finite_number(duration, "metrics.run_duration_ms")
-    return BehaviorMetrics(**values, run_duration_ms=float(duration) if duration is not None else None)
+    return BehaviorMetrics(
+        **values,
+        actual_usage_available=actual_usage_available,
+        run_duration_ms=float(duration) if duration is not None else None,
+    )
 
 
 def _trace_error_to_dict(error: TraceError | None) -> dict[str, str] | None:
@@ -382,6 +401,12 @@ def _required_int(value: dict[str, Any], name: str) -> int:
     if not isinstance(result, int) or isinstance(result, bool):
         raise ValueError(f"{name} must be an integer")
     return result
+
+
+def _bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a bool")
+    return value
 
 
 def _required_list(value: dict[str, Any], name: str) -> list[Any]:

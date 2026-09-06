@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from uuid import uuid4
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -19,6 +19,8 @@ from .types import StreamFn
 
 
 Listener = Callable[[AgentEvent], object]
+ContextPreparer = Callable[[Context], Awaitable[Context]]
+ContextOverflowRecovery = Callable[[Context], Awaitable[Context]]
 
 
 class Agent:
@@ -34,6 +36,8 @@ class Agent:
         tool_execution_mode: ToolExecutionMode = ToolExecutionMode.PARALLEL,
         tool_governance: ToolGovernance | None = None,
         hook_registry: HookRegistry | None = None,
+        context_preparer: ContextPreparer | None = None,
+        context_overflow_recovery: ContextOverflowRecovery | None = None,
     ) -> None:
         if not isinstance(tool_execution_mode, ToolExecutionMode):
             raise TypeError("tool_execution_mode must be a ToolExecutionMode")
@@ -54,6 +58,8 @@ class Agent:
         self.events: list[AgentEvent] = []
         self.listeners: list[Listener] = []
         self.last_context: Context | None = None
+        self._context_preparer = context_preparer
+        self._context_overflow_recovery = context_overflow_recovery
 
     def subscribe(self, listener: Listener) -> Callable[[], None]:
         self.listeners.append(listener)
@@ -61,6 +67,17 @@ class Agent:
 
     def create_context_snapshot(self) -> Context:
         return Context(self.system_prompt, list(self.messages), self.registry.schemas)
+
+    async def emit_runtime_event(self, event: AgentEvent) -> None:
+        """Publish a committed Runtime fact from a collaborating product layer."""
+        await self._emit(event)
+
+    def set_context_preparer(self, preparer: ContextPreparer | None) -> None:
+        """Set the product-owned provider-context preparation seam."""
+        self._context_preparer = preparer
+
+    def set_context_overflow_recovery(self, recovery: ContextOverflowRecovery | None) -> None:
+        self._context_overflow_recovery = recovery
 
     def current_tool_output_scope(self) -> ToolOutputScope:
         return self._tool_output_scope.get()
@@ -84,6 +101,8 @@ class Agent:
         for turn in range(1, self.max_turns + 1):
             await self._emit(AgentEvent("turn_start"))
             context = self.create_context_snapshot()
+            if self._context_preparer is not None:
+                context = await self._context_preparer(context)
             self.last_context = context
             assistant, started, termination_reason = await self._stream_assistant(context)
             assistant_messages.append(assistant)
@@ -102,6 +121,13 @@ class Agent:
             batch_id = uuid4().hex
             resolved_tools = [self.registry.get(tool_call.name) for tool_call in assistant.tool_calls]
             batch_mode = resolve_batch_mode(self.tool_execution_mode, resolved_tools)
+            call_facts = {
+                tool_call.id: (
+                    call_index,
+                    (agent_tool.execution_mode if agent_tool is not None and agent_tool.execution_mode is not None else ToolExecutionMode.PARALLEL).value,
+                )
+                for call_index, (tool_call, agent_tool) in enumerate(zip(assistant.tool_calls, resolved_tools))
+            }
             started: dict[str, PreparedToolCall] = {}
             completed: set[str] = set()
             finished_results: dict[str, ToolResultMessage] = {}
@@ -130,6 +156,10 @@ class Agent:
                     "tool_execution_start",
                     tool_call_id=prepared.tool_call.id,
                     tool_name=prepared.tool_call.name,
+                    batch_id=batch_id,
+                    call_index=prepared.call_index,
+                    batch_mode=batch_mode.value,
+                    execution_mode=prepared.execution_mode.value,
                     args=dict(prepared.arguments),
                 ))
                 await emit_execution_state(prepared, "started")
@@ -141,19 +171,40 @@ class Agent:
                     "tool_execution_end",
                     tool_call_id=prepared.tool_call.id,
                     tool_name=prepared.tool_call.name,
+                    batch_id=batch_id,
+                    call_index=prepared.call_index,
+                    batch_mode=batch_mode.value,
+                    execution_mode=prepared.execution_mode.value,
                     result=result.text,
                     is_error=result.is_error,
                     metadata=result.metadata,
                 ))
                 await emit_execution_state(prepared, "completed", outcome=result.metadata.get("outcome"))
 
-            async def on_execution_finished_uncommitted(prepared: PreparedToolCall) -> None:
+            async def on_executor_completed(prepared: PreparedToolCall) -> None:
                 completed.add(prepared.tool_call.id)
-                await emit_execution_state(prepared, "completed")
+                await emit_execution_state(prepared, "executor_completed")
+
+            async def on_execution_finished_uncommitted(prepared: PreparedToolCall) -> None:
+                # `executor_completed` is emitted immediately after the inner
+                # Tool function returns. A later lifecycle failure must not
+                # manufacture a canonical completion or ToolResult commit.
+                return
 
             async def on_result_committed(result: ToolResultMessage) -> None:
                 self.messages.append(result)
-                await self._emit(AgentEvent("message_end", message=result))
+                call_index, execution_mode = call_facts[result.tool_call_id]
+                await self._emit(AgentEvent(
+                    "message_end",
+                    message=result,
+                    tool_call_id=result.tool_call_id,
+                    tool_name=result.tool_name,
+                    batch_id=batch_id,
+                    call_index=call_index,
+                    batch_mode=batch_mode.value,
+                    execution_mode=execution_mode,
+                    metadata=result.metadata,
+                ))
 
             try:
                 await self.tool_runtime.execute_batch(
@@ -161,6 +212,7 @@ class Agent:
                     runtime_mode=self.tool_execution_mode,
                     scope=self.current_tool_output_scope(),
                     on_execution_start=on_execution_start,
+                    on_executor_completed=on_executor_completed,
                     on_execution_end=on_execution_end,
                     on_execution_finished_uncommitted=on_execution_finished_uncommitted,
                     on_result_committed=on_result_committed,
@@ -201,7 +253,12 @@ class Agent:
         await self._emit(AgentEvent("agent_end", message=failure, termination_reason=AgentTerminationReason.MAX_TURNS))
         return assistant_messages
 
-    async def _stream_assistant(self, context: Context) -> tuple[AssistantMessage, bool, AgentTerminationReason | None]:
+    async def _stream_assistant(
+        self,
+        context: Context,
+        *,
+        overflow_retried: bool = False,
+    ) -> tuple[AssistantMessage, bool, AgentTerminationReason | None]:
         started = False
         try:
             iterator = self.stream_fn(self.model, context, None).__aiter__()
@@ -231,10 +288,35 @@ class Agent:
                 event.message.partial = False
                 return event.message, started, None
             if isinstance(event, StreamError):
+                if (
+                    event.failure is not None
+                    and event.failure.classification == "context_overflow"
+                    and self._context_overflow_recovery is not None
+                    and not overflow_retried
+                ):
+                    try:
+                        recovered_context = await self._context_overflow_recovery(context)
+                    except Exception as error:
+                        failure = AssistantMessage(
+                            [TextBlock(f"Context overflow recovery failed: {error}")],
+                            stop_reason="error",
+                        )
+                        await self._emit(AgentEvent(
+                            "provider_error",
+                            message=failure,
+                            error_type=type(error).__name__,
+                            error_message=str(error),
+                        ))
+                        return failure, started, AgentTerminationReason.CONTEXT_OVERFLOW
+                    return await self._stream_assistant(recovered_context, overflow_retried=True)
                 event.error.stop_reason = event.reason
                 event.error.partial = False
                 await self._emit(AgentEvent("provider_error", message=event.error, error_type="StreamError", error_message=event.error.text))
-                return event.error, started, AgentTerminationReason.PROVIDER_ERROR if event.reason == "error" else AgentTerminationReason.ABORTED
+                if event.failure is not None and event.failure.classification == "context_overflow":
+                    reason = AgentTerminationReason.CONTEXT_OVERFLOW
+                else:
+                    reason = AgentTerminationReason.PROVIDER_ERROR if event.reason == "error" else AgentTerminationReason.ABORTED
+                return event.error, started, reason
         error = AssistantMessage(content=[TextBlock("Provider ended without a final message")], stop_reason="error")
         await self._emit(AgentEvent("provider_error", message=error, error_type="ProviderStreamEnded", error_message=error.text))
         return error, started, AgentTerminationReason.PROVIDER_ERROR

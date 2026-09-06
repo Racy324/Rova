@@ -12,6 +12,7 @@ class AgentTerminationReason(Enum):
     FINAL_RESPONSE = "final_response"
     MAX_TURNS = "max_turns"
     PROVIDER_ERROR = "provider_error"
+    CONTEXT_OVERFLOW = "context_overflow"
     ABORTED = "aborted"
 
 

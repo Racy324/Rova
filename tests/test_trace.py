@@ -11,6 +11,7 @@ from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMe
 from rova.ai.models import Model
 from rova.ai.tools import Tool
 from rova.agent_core.agent import Agent
+from rova.agent_core.hooks import HookRegistry, ToolHookPoint
 from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError
 from rova.agent_session.agent_session import AgentSession, SessionPersistenceError
 from rova.agent_session.compaction import CompactionPolicy
@@ -96,6 +97,33 @@ async def test_recorder_links_a_tool_result_to_its_finalized_tool_call_id():
 
 
 @pytest.mark.asyncio
+async def test_recorder_projects_each_tool_call_lifecycle_into_source_ordered_step_records():
+    async def stream(model, context, options):
+        if not any(isinstance(message, ToolResultMessage) for message in context.messages):
+            yield StreamDone(
+                AssistantMessage(
+                    [
+                        ToolCall("calc-1", "calc", {"expression": "2 * 3"}),
+                        ToolCall("unknown-1", "unknown", {}),
+                    ],
+                    stop_reason="tool_calls",
+                )
+            )
+            return
+        yield StreamDone(AssistantMessage([TextBlock("done")]))
+
+    agent = Agent(Model(provider="mock"), "", [make_test_calc_tool()], stream)
+    _, trace = await TraceRecorder().capture_run(agent, lambda: agent.run([UserMessage("calculate")]))
+
+    first_step = trace.steps[0]
+    assert [item.tool_call_id for item in first_step.tool_calls] == ["calc-1", "unknown-1"]
+    assert [item.executed for item in first_step.tool_calls] == [True, False]
+    assert [item.committed for item in first_step.tool_calls] == [True, True]
+    assert first_step.tool_calls[1].outcome is ToolOutcome.TOOL_INPUT_ERROR
+    assert first_step.tool_calls[1].failure_stage == "lookup"
+
+
+@pytest.mark.asyncio
 async def test_recorder_keeps_tool_error_distinct_from_harness_failure():
     async def execute(tool_call_id, params):
         raise ToolExecutionError("file not found")
@@ -126,6 +154,37 @@ async def test_recorder_keeps_tool_error_distinct_from_harness_failure():
     assert trace.tool_executions[0].is_error is True
     assert trace.tool_executions[0].result == "file not found"
     assert trace.tool_executions[0].outcome is ToolOutcome.TOOL_EXECUTION_ERROR
+
+
+@pytest.mark.asyncio
+async def test_recorder_keeps_executed_uncommitted_tool_call_after_post_hook_harness_failure():
+    hooks = HookRegistry()
+
+    async def execute(_tool_call_id, _params):
+        return AgentToolResult([TextBlock("raw")])
+
+    async def fail_post(_context):
+        raise RuntimeError("post hook failed")
+
+    hooks.register(ToolHookPoint.POST_TOOL_USE, fail_post, source="test.post")
+
+    async def stream(_model, _context, _options):
+        yield StreamDone(
+            AssistantMessage([ToolCall("calc-1", "calc", {"expression": "1"})], stop_reason="tool_calls")
+        )
+
+    agent = Agent(Model(provider="mock"), "", [AgentTool(make_test_calc_tool().tool, execute)], stream, hook_registry=hooks)
+    recorder = TraceRecorder()
+
+    with pytest.raises(RuntimeError, match="Lifecycle hook 'test.post' failed"):
+        await recorder.capture_run(agent, lambda: agent.run([UserMessage("calculate")]))
+
+    assert recorder.last_trace is not None
+    tool_call = recorder.last_trace.steps[0].tool_calls[0]
+    assert tool_call.executed is True
+    assert tool_call.committed is False
+    assert tool_call.result is None
+    assert tool_call.ended_at is not None
 
 
 @pytest.mark.asyncio
@@ -399,12 +458,12 @@ async def test_each_session_capture_contains_only_its_current_run(tmp_path):
     _, first = await recorder.capture_run(
         agent,
         lambda: session.prompt("one"),
-        session=session,
+        session_id=session.session_id,
     )
     _, second = await recorder.capture_run(
         agent,
         lambda: session.prompt("two"),
-        session=session,
+        session_id=session.session_id,
     )
 
     assert first.session_id == session.session_id == second.session_id
@@ -460,7 +519,7 @@ async def test_recorder_keeps_terminal_provider_error_as_structured_finalized_fa
 
 
 @pytest.mark.asyncio
-async def test_recorder_captures_automatic_compaction_as_structured_session_observation(tmp_path):
+async def test_recorder_captures_automatic_compaction_from_agent_events(tmp_path):
     class FixedEstimator:
         def estimate_messages(self, messages):
             return len(messages) * 10
@@ -479,7 +538,11 @@ async def test_recorder_captures_automatic_compaction_as_structured_session_obse
         token_estimator=FixedEstimator(),
         summary_fn=summarize,
     )
-    _, trace = await TraceRecorder().capture_run(agent, lambda: session.prompt("hello"), session=session)
+    _, trace = await TraceRecorder().capture_run(
+        agent,
+        lambda: session.prompt("hello"),
+        session_id=session.session_id,
+    )
 
     assert trace.session_id == session.session_id
     assert len(trace.compactions) == 1
@@ -512,7 +575,11 @@ async def test_recorder_captures_non_durable_compaction_failure_without_faulting
         token_estimator=FixedEstimator(),
         summary_fn=failing_summary,
     )
-    messages, trace = await TraceRecorder().capture_run(agent, lambda: session.prompt("hello"), session=session)
+    messages, trace = await TraceRecorder().capture_run(
+        agent,
+        lambda: session.prompt("hello"),
+        session_id=session.session_id,
+    )
 
     assert messages[-1].text == "done"
     assert session.faulted is False
@@ -553,7 +620,11 @@ async def test_session_persistence_failure_overrides_prior_final_response_termin
     recorder = TraceRecorder()
 
     with pytest.raises(SessionPersistenceError, match="compaction"):
-        await recorder.capture_run(agent, lambda: session.prompt("hello"), session=session)
+        await recorder.capture_run(
+            agent,
+            lambda: session.prompt("hello"),
+            session_id=session.session_id,
+        )
 
     trace = recorder.last_trace
     assert trace is not None

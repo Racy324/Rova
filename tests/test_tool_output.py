@@ -47,6 +47,11 @@ def test_output_at_limits_is_unchanged_and_persisted():
 
     assert processed.preview == [TextBlock("one\ntwo")]
     assert processed.metadata.truncated is False
+    assert processed.metadata.externalized is True
+    assert processed.metadata.preview_truncated is False
+    assert processed.metadata.artifact_ref == "artifact-1"
+    assert processed.metadata.original_size_chars == len("one\ntwo")
+    assert processed.metadata.preview_size_chars == len("one\ntwo")
     assert processed.metadata.original_byte_count == len("one\ntwo".encode("utf-8"))
     assert store.calls[0]["raw_text"] == "one\ntwo"
 
@@ -63,6 +68,8 @@ def test_named_strategies_emit_bounded_deterministic_preview():
     assert shell.metadata.strategy == "tail"
     assert search.metadata.strategy == "head_tail"
     assert all(item.metadata.truncated for item in (read, shell, search))
+    assert all(item.metadata.externalized is True for item in (read, shell, search))
+    assert all(item.metadata.preview_truncated is True for item in (read, shell, search))
     assert "one" in read.preview[0].text and "six" not in read.preview[0].text
     assert "six" in shell.preview[0].text and "one" not in shell.preview[0].text
     assert "one" in search.preview[0].text and "six" in search.preview[0].text
@@ -137,7 +144,11 @@ async def test_traced_durable_session_persists_preview_and_binds_artifact_identi
     processor = ToolOutputProcessor(FileArtifactStore(tmp_path / "artifacts"), ToolOutputLimits(max_lines=2, max_bytes=100))
     agent = Agent(Model("mock"), "", [AgentTool(Tool("read", "read", {}), execute)], stream, tool_output_processor=processor)
     session = AgentSession.create(agent, session_root=tmp_path / "sessions")
-    _, trace = await TraceRecorder().capture_run(agent, lambda: session.prompt("read"), session=session)
+    _, trace = await TraceRecorder().capture_run(
+        agent,
+        lambda: session.prompt("read"),
+        session_id=session.session_id,
+    )
 
     tool_message = next(message for message in agent.messages if isinstance(message, ToolResultMessage))
     assert "third" not in tool_message.text

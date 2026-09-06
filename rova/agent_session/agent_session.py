@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from rova.ai.messages import AssistantMessage, Message, ToolResultMessage, UserMessage
+from rova.ai.context import Context
 from rova.agent_core.agent import Agent
 from rova.agent_core.events import AgentEvent
 
@@ -16,6 +17,7 @@ from .compaction import (
     ContextPressure,
     TokenEstimator,
     estimate_compaction_summary_input,
+    build_compaction_summarization_request,
     estimate_message_tokens,
     find_compaction_plan,
     generate_compaction_summary,
@@ -29,7 +31,7 @@ from .context_builder import build_session_messages, build_session_projection
 from .events import SessionMaintenanceEvent
 from .execution_journal import ToolExecutionJournal
 from .session_store import CompactionEntry, DurableSession, JsonlSessionStore, SessionStoreError
-from .summarization import SummaryFn, summarize_with_stream
+from .summarization import SUMMARIZATION_SYSTEM_PROMPT, SummaryFn, summarize_with_stream
 
 
 class SessionPersistenceError(RuntimeError):
@@ -72,6 +74,7 @@ class AgentSession:
         compaction_policy: CompactionPolicy | None = None,
         token_estimator: TokenEstimator | None = None,
         summary_fn: SummaryFn | None = None,
+        provider_context_estimator: Callable[[Context], int] | None = None,
     ) -> None:
         self.agent = agent
         self._durable_session = durable_session
@@ -80,12 +83,14 @@ class AgentSession:
             validate_compaction_policy(agent.model, compaction_policy)
         self._token_estimator = token_estimator or ConservativeTokenEstimator()
         self._summary_fn = summary_fn or self._summarize_with_agent_stream
+        self._provider_context_estimator = provider_context_estimator
         self.persisted_message_count = len(agent.messages) if durable_session is not None else 0
         self._faulted = False
         self._incomplete_tail = False
         self._closed = False
         self._prompt_active = False
         self.last_maintenance_error: Exception | None = None
+        self.last_prompt_input_entry_id: str | None = None
         self._maintenance_listeners: list[Callable[[SessionMaintenanceEvent], None]] = []
         self._unsubscribe: Callable[[], None] | None = None
         self._execution_journal: ToolExecutionJournal | None = None
@@ -104,6 +109,7 @@ class AgentSession:
         compaction_policy: CompactionPolicy | None = None,
         token_estimator: TokenEstimator | None = None,
         summary_fn: SummaryFn | None = None,
+        provider_context_estimator: Callable[[Context], int] | None = None,
     ) -> AgentSession:
         if agent.messages:
             raise ValueError("a new durable session requires an empty Agent; use load() to restore history")
@@ -115,6 +121,7 @@ class AgentSession:
             compaction_policy=compaction_policy,
             token_estimator=token_estimator,
             summary_fn=summary_fn,
+            provider_context_estimator=provider_context_estimator,
         )
 
     @classmethod
@@ -128,6 +135,7 @@ class AgentSession:
         compaction_policy: CompactionPolicy | None = None,
         token_estimator: TokenEstimator | None = None,
         summary_fn: SummaryFn | None = None,
+        provider_context_estimator: Callable[[Context], int] | None = None,
     ) -> AgentSession:
         if agent.messages:
             raise ValueError("load requires a fresh Agent with no runtime history")
@@ -144,6 +152,7 @@ class AgentSession:
             compaction_policy=compaction_policy,
             token_estimator=token_estimator,
             summary_fn=summary_fn,
+            provider_context_estimator=provider_context_estimator,
         )
         session._incomplete_tail = _has_incomplete_tool_calls(agent.messages)
         return session
@@ -207,6 +216,7 @@ class AgentSession:
         if self._incomplete_tail:
             raise SessionIncompleteError("session has an incomplete tool-call tail and cannot start a new provider run")
         self.last_maintenance_error = None
+        self.last_prompt_input_entry_id = None
         self._prompt_active = True
         try:
             with self.agent.bind_tool_output_scope(session_id=self.session_id):
@@ -215,22 +225,98 @@ class AgentSession:
 
                 user_message = UserMessage(user_text)
                 self._persist_user_message(user_message)
-                self._ensure_pre_run_context_fits()
-                current_run_start_index = len(self.agent.messages)
+                if self._provider_context_estimator is None:
+                    self._ensure_pre_run_context_fits()
+                    current_run_start_index = len(self.agent.messages)
                 assistant_messages = await self.agent.run([])
-                await self._maybe_compact_after_run(current_run_start_index)
+                if self._provider_context_estimator is None:
+                    await self._maybe_compact_after_run(current_run_start_index)
                 return assistant_messages
         finally:
             self._prompt_active = False
 
+    async def prepare_provider_context(
+        self,
+        context: Context,
+        *,
+        rebuild_context: Callable[[], Context] | None = None,
+        force_compaction: bool = False,
+        trigger: Literal["proactive", "overflow_recovery"] = "proactive",
+    ) -> Context:
+        """Record the full provider-ready estimate before one model step.
+
+        Compaction policy is added at this same narrow seam; the estimate is
+        already based on the product's canonical Provider payload.
+        """
+        if self._provider_context_estimator is None:
+            return context
+        estimate = self._provider_context_estimator(context)
+        if not isinstance(estimate, int) or isinstance(estimate, bool) or estimate < 0:
+            raise ValueError("provider_context_estimator must return a non-negative integer")
+        await self.agent.emit_runtime_event(AgentEvent(
+            "provider_context_estimated",
+            metadata={"estimated_input_tokens": estimate, "source": "estimated"},
+        ))
+        if self._durable_session is None or self._compaction_policy is None or self.agent.model.context_window is None:
+            return context
+        target = self.agent.model.context_window - self._compaction_policy.reserve_tokens
+        fixed_context = Context(context.system_prompt, [], list(context.tools))
+        fixed_estimate = self._provider_context_estimator(fixed_context)
+        if fixed_estimate > target:
+            raise PreRunContextTooLarge(
+                "non-compactable provider context exceeds the context window reserve threshold"
+            )
+        if estimate <= target and not force_compaction:
+            return context
+        if rebuild_context is None:
+            raise CompactionError("proactive compaction requires a provider context rebuild callback")
+        summary_budget = self._summary_token_limit() or 0
+        retained_budget = min(
+            self._compaction_policy.keep_recent_tokens,
+            max(0, target - fixed_estimate - summary_budget),
+        )
+        if retained_budget <= 0:
+            raise PreRunContextTooLarge(
+                "no compactable conversation budget remains after fixed provider context and summary reserve"
+            )
+        projection = build_session_projection(self._durable_session.path_to_leaf())
+        plan = find_compaction_plan(
+            projection,
+            retained_token_budget=retained_budget,
+            token_estimator=self._token_estimator,
+        )
+        if plan is None:
+            raise PreRunContextTooLarge(
+                "provider context exceeds the threshold but conversation has no safe compactable boundary"
+            )
+        await self._execute_compaction_plan(
+            plan,
+            trigger=trigger,
+            pressure_before=estimate,
+            context_window=self.agent.model.context_window,
+            reserve_tokens=self._compaction_policy.reserve_tokens,
+        )
+        rebuilt = rebuild_context()
+        after_estimate = self._provider_context_estimator(rebuilt)
+        await self.agent.emit_runtime_event(AgentEvent(
+            "provider_context_estimated",
+            metadata={"estimated_input_tokens": after_estimate, "source": "estimated"},
+        ))
+        if after_estimate > target:
+            raise CompactionHeadroomWarning(
+                "compaction completed but full provider context still exceeds the context window reserve threshold"
+            )
+        return rebuilt
+
     def _persist_user_message(self, message: UserMessage) -> None:
         assert self._durable_session is not None
         try:
-            self._durable_session.append(message)
+            entry_id = self._durable_session.append(message)
         except SessionStoreError as error:
             self._fault(error)
         self.agent.messages.append(message)
         self.persisted_message_count += 1
+        self.last_prompt_input_entry_id = entry_id
 
     def _on_agent_event(self, event: AgentEvent) -> None:
         if event.type == "tool_execution_state":
@@ -299,7 +385,7 @@ class AgentSession:
                 trigger="automatic",
                 pressure_before=pressure.tokens,
             )
-            self._record_post_compaction_headroom_diagnostic(plan)
+            await self._record_post_compaction_headroom_diagnostic(plan)
         except SessionPersistenceError:
             raise
         except Exception as error:
@@ -309,16 +395,21 @@ class AgentSession:
         self,
         plan: CompactionPlan,
         *,
-        trigger: Literal["automatic", "manual"],
+        trigger: Literal["automatic", "proactive", "overflow_recovery", "manual"],
         pressure_before: int | None = None,
+        context_window: int | None = None,
+        reserve_tokens: int | None = None,
     ) -> CompactionEntry:
         assert self._durable_session is not None
-        self._emit_maintenance(
+        await self._emit_maintenance(
             SessionMaintenanceEvent(
                 "compaction_started",
                 trigger,
                 plan.first_kept_entry_id,
                 pressure_before=pressure_before,
+                context_window=context_window,
+                reserve_tokens=reserve_tokens,
+                kept_recent_estimated_tokens=plan.estimated_retained_tokens,
             )
         )
         try:
@@ -331,7 +422,7 @@ class AgentSession:
                 max_tokens=max_tokens,
             )
         except Exception as error:
-            self._emit_maintenance(
+            await self._emit_maintenance(
                 SessionMaintenanceEvent(
                     "compaction_failed",
                     trigger,
@@ -345,7 +436,7 @@ class AgentSession:
         try:
             entry = self._durable_session.append_compaction(summary, plan.first_kept_entry_id)
         except SessionStoreError as error:
-            self._emit_maintenance(
+            await self._emit_maintenance(
                 SessionMaintenanceEvent(
                     "compaction_failed",
                     trigger,
@@ -362,7 +453,7 @@ class AgentSession:
             self.persisted_message_count = len(messages)
             self._incomplete_tail = _has_incomplete_tool_calls(self.agent.messages)
         except Exception as error:
-            self._emit_maintenance(
+            await self._emit_maintenance(
                 SessionMaintenanceEvent(
                     "compaction_failed",
                     trigger,
@@ -373,12 +464,16 @@ class AgentSession:
                 )
             )
             self._fault_compaction(error)
-        self._emit_maintenance(
+        await self._emit_maintenance(
             SessionMaintenanceEvent(
                 "compaction_completed",
                 trigger,
                 plan.first_kept_entry_id,
                 pressure_before=pressure_before,
+                context_window=context_window,
+                reserve_tokens=reserve_tokens,
+                kept_recent_estimated_tokens=plan.estimated_retained_tokens,
+                summary_size_chars=len(summary),
             )
         )
         return entry
@@ -406,18 +501,30 @@ class AgentSession:
             raise CompactionInputTooLarge(
                 "compaction summary output budget is required when model context_window is configured"
             )
-        estimated_input = estimate_compaction_summary_input(
-            historical_messages=plan.messages_to_summarize,
-            turn_prefix_messages=plan.turn_prefix_messages,
-            max_tokens=max_tokens,
-            token_estimator=self._token_estimator,
-        )
+        if self._provider_context_estimator is not None:
+            request = build_compaction_summarization_request(
+                historical_messages=plan.messages_to_summarize,
+                turn_prefix_messages=plan.turn_prefix_messages,
+                max_tokens=max_tokens,
+            )
+            estimated_input = self._provider_context_estimator(Context(
+                system_prompt=SUMMARIZATION_SYSTEM_PROMPT,
+                messages=[UserMessage(f"{request.instruction}\n\n{request.content}")],
+                tools=[],
+            ))
+        else:
+            estimated_input = estimate_compaction_summary_input(
+                historical_messages=plan.messages_to_summarize,
+                turn_prefix_messages=plan.turn_prefix_messages,
+                max_tokens=max_tokens,
+                token_estimator=self._token_estimator,
+            )
         if estimated_input + max_tokens > context_window:
             raise CompactionInputTooLarge(
                 "compaction summary input and output budget do not fit the model context window"
             )
 
-    def _record_post_compaction_headroom_diagnostic(self, plan: CompactionPlan) -> None:
+    async def _record_post_compaction_headroom_diagnostic(self, plan: CompactionPlan) -> None:
         assert self._compaction_policy is not None
         estimated_pressure = estimate_message_tokens(self._token_estimator, self.agent.messages)
         if should_compact(
@@ -428,7 +535,7 @@ class AgentSession:
             self.last_maintenance_error = CompactionHeadroomWarning(
                 "compaction completed durably but rebuilt context remains at or above the automatic threshold"
             )
-            self._emit_maintenance(
+            await self._emit_maintenance(
                 SessionMaintenanceEvent(
                     "compaction_warning",
                     "automatic",
@@ -439,7 +546,22 @@ class AgentSession:
                 )
             )
 
-    def _emit_maintenance(self, event: SessionMaintenanceEvent) -> None:
+    async def _emit_maintenance(self, event: SessionMaintenanceEvent) -> None:
+        await self.agent.emit_runtime_event(AgentEvent(
+            event.type,
+            metadata={
+                "trigger": event.trigger,
+                "first_kept_entry_id": event.first_kept_entry_id,
+                "pressure_before": event.pressure_before,
+                "pressure_after": event.pressure_after,
+                "error_type": event.error_type,
+                "error_message": event.error_message,
+                "context_window": event.context_window,
+                "reserve_tokens": event.reserve_tokens,
+                "kept_recent_estimated_tokens": event.kept_recent_estimated_tokens,
+                "summary_size_chars": event.summary_size_chars,
+            },
+        ))
         for listener in tuple(self._maintenance_listeners):
             try:
                 listener(event)

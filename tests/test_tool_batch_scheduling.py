@@ -115,11 +115,26 @@ async def test_parallel_batch_keeps_completion_events_and_committed_messages_in_
     await run
 
     completed = [name for event_type, name in observed_events if event_type == "tool_execution_end"]
+    lifecycle_events = [
+        event
+        for event in agent.events
+        if event.type in {"tool_execution_start", "tool_execution_end"}
+    ]
+    committed_events = [
+        event
+        for event in agent.events
+        if event.type == "message_end" and isinstance(event.message, ToolResultMessage)
+    ]
     committed = [event.message.tool_name for event in agent.events if event.type == "message_end" and isinstance(event.message, ToolResultMessage)]
     results = [message.tool_name for message in agent.messages if isinstance(message, ToolResultMessage)]
     second_context_results = [message.tool_name for message in contexts[1].messages if isinstance(message, ToolResultMessage)]
 
     assert completed == ["b", "c", "a"]
+    assert len({event.batch_id for event in lifecycle_events + committed_events}) == 1
+    assert all(event.batch_id is not None for event in lifecycle_events + committed_events)
+    assert [event.call_index for event in committed_events] == [0, 1, 2]
+    assert {event.batch_mode for event in lifecycle_events + committed_events} == {"parallel"}
+    assert {event.execution_mode for event in lifecycle_events + committed_events} == {"parallel"}
     assert observed_hooks == [
         ("pre", "a"), ("pre", "b"), ("pre", "c"),
         ("post", "b"), ("post", "c"), ("post", "a"),

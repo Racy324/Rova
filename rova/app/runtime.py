@@ -10,6 +10,7 @@ import warnings
 
 from rova.ai.context import Context
 from rova.ai.models import Model
+from rova.ai.providers.openai_compatible import estimate_provider_input_tokens
 from rova.agent_core.agent import Agent
 from rova.agent_core.hooks import HookRegistry
 from rova.agent_core.tools import ToolExecutionMode
@@ -44,6 +45,7 @@ from .vision import VisionClient, create_vision_analyze_tool
 from rova.mcp.client import MCPClient, MCPServerConfig
 from rova.mcp.config import MCPServerSettings, load_mcp_settings, safe_stdio_environment
 from rova.mcp.manager import MCPManager
+from rova.trace import JsonlTraceStore, TraceRecorder, TraceStore, TraceStoreError
 
 
 DEFAULT_MAX_TURNS = 16
@@ -83,11 +85,13 @@ class RovaRuntime:
     extension_api: ExtensionAPI
     extension_load_report: ExtensionLoadReport
     mcp_manager: MCPManager | None
+    trace_store: TraceStore
 
     def __post_init__(self) -> None:
         self._memory_listeners: list[Callable[[MemoryObservation], None]] = []
         self._local_context_attached = False
         self._closed = False
+        self._trace_issues: list[str] = []
 
     def subscribe_memory(self, listener: Callable[["MemoryObservation"], None]) -> Callable[[], None]:
         self._memory_listeners.append(listener)
@@ -105,6 +109,10 @@ class RovaRuntime:
     @property
     def mcp_runtime_issues(self):
         return () if self.mcp_manager is None else tuple(self.mcp_manager.issues)
+
+    @property
+    def trace_runtime_issues(self) -> tuple[str, ...]:
+        return tuple(self._trace_issues)
 
     def start_mcp_discovery(self) -> None:
         if self.mcp_manager is not None:
@@ -136,11 +144,22 @@ class RovaRuntime:
                 request_text = f"{text}\n\n{attachment}"
                 self._local_context_attached = True
         try:
-            responses = await self.session.prompt(request_text)
+            recorder = TraceRecorder()
+            responses, trace = await recorder.capture_run(
+                self.agent,
+                lambda: self.session.prompt(request_text),
+                session_id=self.session.session_id,
+            )
         except BaseException:
             if self.experience_review_service is not None:
                 self.experience_review_service.discard_run()
             raise
+        trace.input_entry_id = self.session.last_prompt_input_entry_id
+        trace.input_message = request_text
+        try:
+            self.trace_store.append(trace)
+        except TraceStoreError as error:
+            self._trace_issues.append(str(error))
         if self.experience_review_service is not None:
             final = responses[-1] if responses else None
             if final is None or final.stop_reason != "stop" or final.tool_calls:
@@ -183,6 +202,7 @@ def build_rova_runtime(
     local_context: LocalResearchContext | None = None,
     session_root: Path | None = None,
     artifact_root: Path | None = None,
+    trace_root: Path | None = None,
     compaction_policy: CompactionPolicy | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     session_id: str | None = None,
@@ -301,20 +321,12 @@ def build_rova_runtime(
 
     store_root = artifact_root or RovaDataPaths.resolve().artifacts
     artifact_store = FileArtifactStore(store_root)
+    trace_store = JsonlTraceStore((trace_root or RovaDataPaths.resolve().traces) / "runs.jsonl")
     agent = Agent(
         model,
         ROVA_SYSTEM_PROMPT,
         tools,
-        _with_runtime_context(
-            stream_fn,
-            workspace,
-            effective_terminal_backend,
-            memory_snapshot,
-            workspace_instruction_snapshot,
-            skill_catalog_snapshot,
-            extension_api,
-            web_enabled=web_search_backend is not None,
-        ),
+        stream_fn,
         max_turns=max_turns,
         tool_output_processor=ToolOutputProcessor(artifact_store),
         tool_execution_mode=tool_execution_mode,
@@ -347,13 +359,75 @@ def build_rova_runtime(
             task_threshold=experience_review_task_threshold,
         )
         agent.subscribe(_isolated_experience_event_handler(experience_review_service))
+    provider_context_estimator = lambda context: estimate_provider_input_tokens(model, context)
+    session = (
+        AgentSession.load(
+            agent,
+            session_id,
+            session_root=session_root,
+            compaction_policy=compaction_policy,
+            provider_context_estimator=provider_context_estimator,
+        )
+        if session_id is not None
+        else AgentSession.create(
+            agent,
+            session_root=session_root,
+            compaction_policy=compaction_policy,
+            provider_context_estimator=provider_context_estimator,
+        )
+    )
+
+    async def prepare_runtime_context(base_context: Context) -> Context:
+        provider_context = _assemble_runtime_context(
+            base_context,
+            workspace,
+            effective_terminal_backend,
+            memory_snapshot,
+            workspace_instruction_snapshot,
+            skill_catalog_snapshot,
+            extension_api,
+            web_enabled=web_search_backend is not None,
+        )
+        return await session.prepare_provider_context(
+            provider_context,
+            rebuild_context=lambda: _assemble_runtime_context(
+                agent.create_context_snapshot(),
+                workspace,
+                effective_terminal_backend,
+                memory_snapshot,
+                workspace_instruction_snapshot,
+                skill_catalog_snapshot,
+                extension_api,
+                web_enabled=web_search_backend is not None,
+            ),
+        )
+
+    def rebuild_runtime_context() -> Context:
+        return _assemble_runtime_context(
+            agent.create_context_snapshot(),
+            workspace,
+            effective_terminal_backend,
+            memory_snapshot,
+            workspace_instruction_snapshot,
+            skill_catalog_snapshot,
+            extension_api,
+            web_enabled=web_search_backend is not None,
+        )
+
+    async def recover_context_overflow(provider_context: Context) -> Context:
+        return await session.prepare_provider_context(
+            provider_context,
+            rebuild_context=rebuild_runtime_context,
+            force_compaction=True,
+            trigger="overflow_recovery",
+        )
+
+    agent.set_context_preparer(prepare_runtime_context)
+    agent.set_context_overflow_recovery(recover_context_overflow)
+
     return RovaRuntime(
         agent=agent,
-        session=(
-            AgentSession.load(agent, session_id, session_root=session_root, compaction_policy=compaction_policy)
-            if session_id is not None
-            else AgentSession.create(agent, session_root=session_root, compaction_policy=compaction_policy)
-        ),
+        session=session,
         artifact_store=artifact_store,
         workspace=workspace,
         terminal_backend=effective_terminal_backend,
@@ -370,6 +444,7 @@ def build_rova_runtime(
         extension_api=extension_api,
         extension_load_report=extension_load_report,
         mcp_manager=mcp_manager,
+        trace_store=trace_store,
     )
 
 
@@ -405,25 +480,45 @@ def _with_runtime_context(
     web_enabled: bool,
 ) -> StreamFn:
     async def stream(model: Model, context: Context, options: object | None = None):
-        sections = [
-            *_frozen_system_context_sections(
-                memory_snapshot,
-                workspace_instruction_snapshot,
-                skill_catalog_snapshot,
-            ),
-            *_dynamic_runtime_context_sections(workspace, terminal_backend, web_enabled=web_enabled),
-            *extension_api.render_context_sections(),
-        ]
-        rendered_sections = "\n\n".join(sections)
-        provider_context = context if not sections else Context(
-            system_prompt=f"{context.system_prompt}\n\n{rendered_sections}",
-            messages=list(context.messages),
-            tools=list(context.tools),
+        provider_context = _assemble_runtime_context(
+            context,
+            workspace,
+            terminal_backend,
+            memory_snapshot,
+            workspace_instruction_snapshot,
+            skill_catalog_snapshot,
+            extension_api,
+            web_enabled=web_enabled,
         )
         async for event in stream_fn(model, provider_context, options):
             yield event
 
     return stream
+
+
+def _assemble_runtime_context(
+    context: Context,
+    workspace: Workspace | None,
+    terminal_backend: TerminalBackend | None,
+    memory_snapshot: MemorySnapshot,
+    workspace_instruction_snapshot: WorkspaceInstructionSnapshot,
+    skill_catalog_snapshot: SkillCatalogSnapshot,
+    extension_api: ExtensionAPI,
+    *,
+    web_enabled: bool,
+) -> Context:
+    sections = [
+        *_frozen_system_context_sections(memory_snapshot, workspace_instruction_snapshot, skill_catalog_snapshot),
+        *_dynamic_runtime_context_sections(workspace, terminal_backend, web_enabled=web_enabled),
+        *extension_api.render_context_sections(),
+    ]
+    if not sections:
+        return context
+    return Context(
+        system_prompt=f"{context.system_prompt}\n\n{'\n\n'.join(sections)}",
+        messages=list(context.messages),
+        tools=list(context.tools),
+    )
 
 
 def _frozen_system_context_sections(
