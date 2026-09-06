@@ -12,6 +12,16 @@ from typing import Any, Mapping, Protocol
 from rova.ai.messages import TextBlock, ToolCall, ToolResultMessage
 from rova.ai.tools import Tool, validate_tool_arguments
 
+from .hooks import (
+    HookRegistry,
+    LifecycleHookError,
+    PostToolUseContext,
+    PreToolUseBlock,
+    PreToolUseContext,
+    PreToolUseContinue,
+    ToolFailureContext,
+    ToolHookPoint,
+)
 from .tool_output import ToolOutputProcessor, ToolOutputScope
 
 
@@ -161,12 +171,19 @@ class ToolRuntime:
         tool_output_processor: ToolOutputProcessor | None = None,
         middlewares: Sequence[ToolMiddleware] = (),
         pre_tool_hooks: Sequence[PreToolUseHook] = (),
+        hook_registry: HookRegistry | None = None,
         governance: ToolGovernance | None = None,
     ) -> None:
         self._registry = registry
         self._tool_output_processor = tool_output_processor
         self._middlewares = tuple(middlewares)
-        self._pre_tool_hooks = tuple(pre_tool_hooks)
+        self._hook_registry = hook_registry or HookRegistry()
+        for index, hook in enumerate(pre_tool_hooks):
+            self._hook_registry.register(
+                ToolHookPoint.PRE_TOOL_USE,
+                self._legacy_pre_tool_hook(hook),
+                source=f"legacy_pre_tool_hook[{index}]",
+            )
         self._governance = governance
 
     async def preflight(
@@ -178,11 +195,25 @@ class ToolRuntime:
     ) -> PreparedToolCall | ToolResultMessage:
         agent_tool = self._registry.get(tool_call.name)
         if agent_tool is None:
-            return self._error(tool_call, f"Unknown tool: {tool_call.name}", {"outcome": "tool_input_error"}, scope)
+            return await self._failure(
+                tool_call,
+                f"Unknown tool: {tool_call.name}",
+                {"outcome": "tool_input_error"},
+                scope,
+                call_index=call_index,
+                stage="lookup",
+            )
         try:
             arguments = validate_tool_arguments(agent_tool.tool, tool_call.arguments)
         except ValueError as error:
-            return self._error(tool_call, str(error), {"outcome": "tool_input_error"}, scope)
+            return await self._failure(
+                tool_call,
+                str(error),
+                {"outcome": "tool_input_error"},
+                scope,
+                call_index=call_index,
+                stage="validation",
+            )
         context = ToolExecutionContext(
             tool_call_id=tool_call.id,
             tool_name=tool_call.name,
@@ -191,18 +222,40 @@ class ToolRuntime:
             session_id=scope.session_id if scope is not None else None,
         )
         try:
-            for hook in self._pre_tool_hooks:
-                modified_arguments = await hook.pre_tool_use(context)
-                if modified_arguments is None:
-                    continue
-                arguments = validate_tool_arguments(agent_tool.tool, dict(modified_arguments))
-                context = ToolExecutionContext(
-                    tool_call_id=tool_call.id,
-                    tool_name=tool_call.name,
+            pre_outcome = await self._hook_registry.dispatch_pre_tool_use(
+                arguments,
+                context=PreToolUseContext(
                     arguments=MappingProxyType(dict(arguments)),
-                    run_id=scope.run_id if scope is not None else None,
-                    session_id=scope.session_id if scope is not None else None,
+                    tool_name=tool_call.name,
+                    tool_call_id=tool_call.id,
+                    call_index=call_index,
+                    run_id=context.run_id,
+                    session_id=context.session_id,
+                ),
+                validate=lambda candidate: validate_tool_arguments(agent_tool.tool, dict(candidate)),
+            )
+            if isinstance(pre_outcome, PreToolUseBlock):
+                metadata: dict[str, Any] = {}
+                if pre_outcome.metadata is not None:
+                    metadata.update(pre_outcome.metadata)
+                metadata["outcome"] = "hook_blocked"
+                return await self._failure(
+                    tool_call,
+                    pre_outcome.message,
+                    metadata,
+                    scope,
+                    call_index=call_index,
+                    stage="pre_tool_use",
+                    arguments=arguments,
                 )
+            arguments = dict(pre_outcome.arguments or arguments)
+            context = ToolExecutionContext(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                arguments=MappingProxyType(dict(arguments)),
+                run_id=scope.run_id if scope is not None else None,
+                session_id=scope.session_id if scope is not None else None,
+            )
             for middleware in self._middlewares:
                 await middleware.before_tool_execute(context)
             governance = (
@@ -211,9 +264,26 @@ class ToolRuntime:
                 else None
             )
         except ValueError as error:
-            return self._error(tool_call, str(error), {"outcome": "tool_input_error"}, scope)
+            return await self._failure(
+                tool_call,
+                str(error),
+                {"outcome": "tool_input_error"},
+                scope,
+                call_index=call_index,
+                stage="validation",
+                arguments=arguments,
+            )
         except ToolExecutionError as error:
-            return self._error(tool_call, str(error), error.metadata or {"outcome": "tool_execution_error"}, scope)
+            metadata = error.metadata or {"outcome": "tool_execution_error"}
+            return await self._failure(
+                tool_call,
+                str(error),
+                metadata,
+                scope,
+                call_index=call_index,
+                stage=_failure_stage(metadata),
+                arguments=arguments,
+            )
         return PreparedToolCall(
             tool_call=tool_call,
             call_index=call_index,
@@ -239,6 +309,7 @@ class ToolRuntime:
         scope: ToolOutputScope | None = None,
         on_execution_start: Callable[[PreparedToolCall], Awaitable[None]] | None = None,
         on_execution_end: Callable[[PreparedToolCall, ToolResultMessage], Awaitable[None]] | None = None,
+        on_execution_finished_uncommitted: Callable[[PreparedToolCall], Awaitable[None]] | None = None,
         on_result_committed: Callable[[ToolResultMessage], Awaitable[None]] | None = None,
     ) -> list[ToolResultMessage]:
         """Execute one AssistantMessage ToolCall batch without reordering committed results."""
@@ -251,7 +322,12 @@ class ToolRuntime:
                 result = (
                     prepared
                     if isinstance(prepared, ToolResultMessage)
-                    else await self._execute_observed(prepared, on_execution_start, on_execution_end)
+                    else await self._execute_observed(
+                        prepared,
+                        on_execution_start,
+                        on_execution_end,
+                        on_execution_finished_uncommitted,
+                    )
                 )
                 results.append(result)
                 if on_result_committed is not None:
@@ -264,7 +340,12 @@ class ToolRuntime:
         ]
         tasks: dict[int, asyncio.Task[ToolResultMessage]] = {
             prepared.call_index: asyncio.create_task(
-                self._execute_observed(prepared, on_execution_start, on_execution_end)
+                self._execute_observed(
+                    prepared,
+                    on_execution_start,
+                    on_execution_end,
+                    on_execution_finished_uncommitted,
+                )
             )
             for prepared in preflight
             if isinstance(prepared, PreparedToolCall)
@@ -292,10 +373,20 @@ class ToolRuntime:
         prepared: PreparedToolCall,
         on_execution_start: Callable[[PreparedToolCall], Awaitable[None]] | None,
         on_execution_end: Callable[[PreparedToolCall, ToolResultMessage], Awaitable[None]] | None,
+        on_execution_finished_uncommitted: Callable[[PreparedToolCall], Awaitable[None]] | None,
     ) -> ToolResultMessage:
         if on_execution_start is not None:
             await on_execution_start(prepared)
-        result = await self._execute_prepared(prepared)
+        try:
+            result = await self._execute_prepared(prepared)
+        except LifecycleHookError:
+            # A post/failure hook may fail after the underlying executor has
+            # ended but before a canonical ToolResult exists.  Preserve that
+            # fact for the execution journal without emitting an end event or
+            # committing a partial conversation result.
+            if on_execution_finished_uncommitted is not None:
+                await on_execution_finished_uncommitted(prepared)
+            raise
         if on_execution_end is not None:
             await on_execution_end(prepared, result)
         return result
@@ -306,23 +397,85 @@ class ToolRuntime:
             result = await prepared.agent_tool.execute(tool_call.id, dict(prepared.arguments))
             if self._governance is not None and prepared.governance is not None:
                 result = await self._governance.after_success(prepared, result)
-            final_result = self._finalize(tool_call, result.content, False, {"outcome": "success", **result.metadata}, prepared.scope)
+            post_outcome = await self._hook_registry.dispatch_post_tool_use(PostToolUseContext(
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+                call_index=prepared.call_index,
+                arguments=prepared.arguments,
+                content=tuple(result.content),
+                metadata=MappingProxyType({"outcome": "success", **result.metadata}),
+            ))
+            final_result = self._finalize(
+                tool_call,
+                list(post_outcome.content if post_outcome.content is not None else result.content),
+                False,
+                post_outcome.metadata or {"outcome": "success", **result.metadata},
+                prepared.scope,
+            )
         except ToolExecutionError as error:
             if self._governance is not None and prepared.governance is not None:
                 error = self._governance.enrich_error(prepared, error)
-            final_result = self._error(tool_call, str(error), error.metadata or {"outcome": "tool_execution_error"}, prepared.scope)
+            final_result = await self._failure(
+                tool_call,
+                str(error),
+                error.metadata or {"outcome": "tool_execution_error"},
+                prepared.scope,
+                call_index=prepared.call_index,
+                stage="execution",
+                arguments=prepared.arguments,
+            )
         for middleware in self._middlewares:
             await middleware.after_tool_execute(prepared.context, copy.deepcopy(final_result))
         return final_result
 
-    def _error(
+    async def _failure(
         self,
         tool_call: ToolCall,
         text: str,
         metadata: Mapping[str, Any],
         scope: ToolOutputScope | None = None,
+        *,
+        call_index: int,
+        stage: str,
+        arguments: Mapping[str, Any] | None = None,
     ) -> ToolResultMessage:
-        return self._finalize(tool_call, [TextBlock(text)], True, metadata, scope)
+        current_metadata = dict(metadata)
+        outcome = str(current_metadata.get("outcome", "tool_execution_error"))
+        failure_outcome = await self._hook_registry.dispatch_tool_failure(ToolFailureContext(
+            stage=stage,
+            outcome=outcome,
+            tool_name=tool_call.name,
+            tool_call_id=tool_call.id,
+            call_index=call_index,
+            arguments=arguments,
+            message=text,
+            metadata=MappingProxyType(current_metadata),
+        ))
+        return self._finalize(
+            tool_call,
+            [TextBlock(text)],
+            True,
+            failure_outcome.metadata or current_metadata,
+            scope,
+        )
+
+    @staticmethod
+    def _legacy_pre_tool_hook(hook: PreToolUseHook):
+        async def dispatch(context: PreToolUseContext) -> PreToolUseContinue | None:
+            legacy_context = ToolExecutionContext(
+                tool_call_id=context.tool_call_id or "",
+                tool_name=context.tool_name or "",
+                arguments=context.arguments,
+                run_id=context.run_id,
+                session_id=context.session_id,
+            )
+            modified_arguments = await hook.pre_tool_use(legacy_context)
+            return (
+                PreToolUseContinue(modified_arguments)
+                if modified_arguments is not None
+                else None
+            )
+        return dispatch
 
     def _finalize(
         self,
@@ -359,6 +512,17 @@ def _metadata(value: Mapping[str, Any]) -> dict[str, Any]:
     if not _json_value(copied):
         raise TypeError("tool metadata must be JSON-compatible")
     return copied
+
+
+def _failure_stage(metadata: Mapping[str, Any]) -> str:
+    """Map fixed governance outcomes to the one ToolFailure stage taxonomy."""
+
+    outcome = metadata.get("outcome")
+    if outcome == "policy_denied":
+        return "policy"
+    if outcome in {"approval_denied", "approval_cancelled"}:
+        return "approval"
+    return "policy"
 
 
 def _json_value(value: Any) -> bool:

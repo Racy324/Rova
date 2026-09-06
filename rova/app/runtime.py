@@ -11,6 +11,7 @@ import warnings
 from rova.ai.context import Context
 from rova.ai.models import Model
 from rova.agent_core.agent import Agent
+from rova.agent_core.hooks import HookRegistry
 from rova.agent_core.tools import ToolExecutionMode
 from rova.agent_core.tool_output import ToolOutputProcessor
 from rova.agent_core.types import StreamFn
@@ -281,7 +282,8 @@ def build_rova_runtime(
             create_web_search_tool(source_store, web_search_backend),
             create_fetch_webpage_tool(source_store, webpage_fetcher),
         ])
-    extension_api = ExtensionAPI([tool.tool.name for tool in tools])
+    hook_registry = HookRegistry()
+    extension_api = ExtensionAPI([tool.tool.name for tool in tools], hook_registry=hook_registry)
     extension_loader = ExtensionLoader(
         ExtensionLoader.default_roots(workspace.root if workspace is not None else None)
         if extension_roots is None
@@ -317,6 +319,7 @@ def build_rova_runtime(
         tool_output_processor=ToolOutputProcessor(artifact_store),
         tool_execution_mode=tool_execution_mode,
         tool_governance=tool_governance,
+        hook_registry=hook_registry,
     )
     extension_api.bind_event_hooks(agent)
     mcp_manager = (

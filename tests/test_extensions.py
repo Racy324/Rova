@@ -6,6 +6,7 @@ import textwrap
 import pytest
 
 from rova.agent_core.agent import Agent
+from rova.agent_core.hooks import HookRegistry, PreToolUseBlock
 from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 from rova.ai.events import StreamDone
 from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage, UserMessage
@@ -133,6 +134,52 @@ async def test_extension_hook_receives_agent_lifecycle_event_and_context_is_rend
 
 
 @pytest.mark.asyncio
+async def test_extension_lifecycle_hook_uses_the_runtime_governed_tool_pipeline(tmp_path: Path) -> None:
+    extensions = tmp_path / "extensions"
+    _write_extension(
+        extensions,
+        "blocker",
+        """
+        from rova.agent_core.hooks import PreToolUseBlock
+
+        def block(context):
+            if context.tool_name == "extension_greet":
+                return PreToolUseBlock("blocked by extension")
+
+        def setup(api):
+            api.register_hook("pre_tool_use", block)
+        """,
+    )
+    executed = False
+
+    async def greet(_tool_call_id, _params):
+        nonlocal executed
+        executed = True
+        return AgentToolResult([TextBlock("hello")])
+
+    async def stream(_model, context, _options):
+        results = [message for message in context.messages if isinstance(message, ToolResultMessage)]
+        if not results:
+            yield StreamDone(AssistantMessage([ToolCall("call", "extension_greet", {})], stop_reason="tool_calls"))
+            return
+        yield StreamDone(AssistantMessage([TextBlock(results[0].metadata["outcome"])]))
+
+    runtime = build_rova_runtime(
+        model=Model(provider="mock"),
+        stream_fn=stream,
+        extension_roots=(extensions,),
+        session_root=tmp_path / "sessions",
+        artifact_root=tmp_path / "artifacts",
+    )
+    runtime.agent.registry.register_tools([
+        AgentTool(Tool("extension_greet", "greet", {}), greet, execution_mode=ToolExecutionMode.PARALLEL),
+    ])
+
+    assert (await runtime.prompt("run"))[-1].text == "hook_blocked"
+    assert executed is False
+
+
+@pytest.mark.asyncio
 async def test_failing_extension_handler_does_not_block_later_handler(tmp_path: Path) -> None:
     extensions = tmp_path / "extensions"
     marker = tmp_path / "second-handler.txt"
@@ -181,18 +228,20 @@ async def test_extension_setup_rolls_back_on_base_exception_while_preserving_pro
         return AgentToolResult([TextBlock("unused")])
 
     hook_calls: list[str] = []
-    api = ExtensionAPI(())
+    hooks = HookRegistry()
+    api = ExtensionAPI((), hook_registry=hooks)
     with pytest.raises(SetupInterrupted):
         with api.extension_setup("interrupted"):
             api.register_tool(AgentTool(Tool("rolled_back_tool", "rolled back", {}), run, execution_mode=ToolExecutionMode.PARALLEL))
             api.on("agent_end", lambda _event: hook_calls.append("called"))
+            api.register_hook("pre_tool_use", lambda _context: hook_calls.append("lifecycle"))
             api.register_context_provider(lambda: ContextContribution("rolled-back", "must not survive"))
             raise SetupInterrupted()
 
     async def stream(_model, _context, _options):
         yield StreamDone(AssistantMessage([TextBlock("done")]))
 
-    agent = Agent(Model(provider="mock"), "", [], stream)
+    agent = Agent(Model(provider="mock"), "", [], stream, hook_registry=hooks)
     api.bind_event_hooks(agent)
     await agent.run([UserMessage("hello")])
 

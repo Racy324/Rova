@@ -10,6 +10,7 @@ from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, UserMessage
 from rova.ai.models import Model
 from rova.ai.tools import Tool
 from rova.agent_core.agent import Agent
+from rova.agent_core.hooks import HookRegistry, ToolHookPoint
 from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 from rova.agent_session.agent_session import AgentSession
 
@@ -96,3 +97,56 @@ async def test_parallel_harness_failure_cancels_siblings_without_committing_part
     assert {(item["tool_call_id"], item["state"]) for item in states} >= {
         ("a", "started"), ("b", "started"), ("a", "interrupted"), ("b", "interrupted"),
     }
+
+
+@pytest.mark.asyncio
+async def test_parallel_post_hook_failure_cancels_sibling_without_partial_commit_and_preserves_execution_states(tmp_path) -> None:
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    hooks = HookRegistry()
+
+    async def complete(_call_id: str, _arguments: dict) -> AgentToolResult:
+        return AgentToolResult([TextBlock("complete")])
+
+    async def block(_call_id: str, _arguments: dict) -> AgentToolResult:
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    async def fail_post(context):
+        if context.tool_name == "complete":
+            await sibling_started.wait()
+            raise RuntimeError("post hook failed")
+
+    hooks.register(ToolHookPoint.POST_TOOL_USE, fail_post, source="test.post")
+
+    async def stream(_model, _context, _options):
+        yield StreamDone(AssistantMessage([
+            ToolCall("a", "complete", {}), ToolCall("b", "block", {}),
+        ], stop_reason="tool_calls"))
+
+    agent = Agent(
+        Model("mock"), "",
+        [
+            AgentTool(Tool("complete", "complete", {}), complete, execution_mode=ToolExecutionMode.PARALLEL),
+            AgentTool(Tool("block", "block", {}), block, execution_mode=ToolExecutionMode.PARALLEL),
+        ],
+        stream,
+        hook_registry=hooks,
+    )
+    session = AgentSession.create(agent, session_root=tmp_path)
+
+    with pytest.raises(RuntimeError, match="Lifecycle hook 'test.post' failed"):
+        await session.prompt("run")
+
+    assert sibling_cancelled.is_set()
+    assert not [message for message in agent.messages if message.__class__.__name__ == "ToolResultMessage"]
+    journal = tmp_path / f"{session.session_id}.executions.jsonl"
+    states = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    assert [(item["tool_call_id"], item["state"]) for item in states] == [
+        ("a", "started"), ("b", "started"), ("a", "completed"), ("b", "interrupted"),
+    ]

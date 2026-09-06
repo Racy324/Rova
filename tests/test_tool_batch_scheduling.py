@@ -12,6 +12,7 @@ from rova.ai.models import Model
 from rova.ai.tools import Tool
 from rova.app.runtime import build_rova_runtime
 from rova.agent_core.agent import Agent
+from rova.agent_core.hooks import HookRegistry, ToolHookPoint
 from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode, resolve_batch_mode
 
 
@@ -65,6 +66,7 @@ async def test_parallel_batch_keeps_completion_events_and_committed_messages_in_
     c_started = asyncio.Event()
     release_c = asyncio.Event()
     observed_events: list[tuple[str, str]] = []
+    observed_hooks: list[tuple[str, str]] = []
     contexts = []
 
     async def execute_a(_call_id: str, _arguments: dict) -> AgentToolResult:
@@ -95,7 +97,10 @@ async def test_parallel_batch_keeps_completion_events_and_committed_messages_in_
         AgentTool(Tool("b", "b", {}), execute_b, execution_mode=ToolExecutionMode.PARALLEL),
         AgentTool(Tool("c", "c", {}), execute_c, execution_mode=ToolExecutionMode.PARALLEL),
     ]
-    agent = Agent(Model(), "", tools, stream)
+    hooks = HookRegistry()
+    hooks.register(ToolHookPoint.PRE_TOOL_USE, lambda context: observed_hooks.append(("pre", context.tool_name)), source="test.pre")
+    hooks.register(ToolHookPoint.POST_TOOL_USE, lambda context: observed_hooks.append(("post", context.tool_name)), source="test.post")
+    agent = Agent(Model(), "", tools, stream, hook_registry=hooks)
     agent.subscribe(lambda event: observed_events.append((event.type, event.tool_name or "")))
 
     run = asyncio.create_task(agent.run([UserMessage("run tools")]))
@@ -115,6 +120,10 @@ async def test_parallel_batch_keeps_completion_events_and_committed_messages_in_
     second_context_results = [message.tool_name for message in contexts[1].messages if isinstance(message, ToolResultMessage)]
 
     assert completed == ["b", "c", "a"]
+    assert observed_hooks == [
+        ("pre", "a"), ("pre", "b"), ("pre", "c"),
+        ("post", "b"), ("post", "c"), ("post", "a"),
+    ]
     assert committed == ["a", "b", "c"]
     assert results == ["a", "b", "c"]
     assert second_context_results == ["a", "b", "c"]

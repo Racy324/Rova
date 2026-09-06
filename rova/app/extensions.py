@@ -12,6 +12,7 @@ from typing import Any, Iterator
 
 from rova.agent_core.agent import Agent
 from rova.agent_core.events import AgentEvent
+from rova.agent_core.hooks import HookRegistry, ToolHookHandler, ToolHookPoint
 from rova.agent_core.tools import AgentTool, ToolExecutionMode
 
 from .paths import RovaDataPaths
@@ -63,7 +64,7 @@ class ExtensionLoadReport:
 
 
 @dataclass(frozen=True)
-class _EventHook:
+class _EventSubscription:
     extension_name: str
     event_type: str
     handler: Callable[[AgentEvent], object]
@@ -78,11 +79,13 @@ class _ContextProvider:
 class ExtensionAPI:
     """The intentionally small public surface available to local Extensions."""
 
-    def __init__(self, reserved_tool_names: Sequence[str]) -> None:
+    def __init__(self, reserved_tool_names: Sequence[str], *, hook_registry: HookRegistry | None = None) -> None:
         self._tools: list[AgentTool] = []
         self._tool_names = set(reserved_tool_names)
-        self._hooks: list[_EventHook] = []
+        self._event_subscriptions: list[_EventSubscription] = []
         self._context_providers: list[_ContextProvider] = []
+        self._hook_registry = hook_registry or HookRegistry()
+        self._lifecycle_unsubscribers: list[Callable[[], None]] = []
         self._active_extension: str | None = None
         self._runtime_issues: list[ExtensionIssue] = []
 
@@ -114,7 +117,21 @@ class ExtensionAPI:
             raise ExtensionRegistrationError(f"unsupported AgentEvent type: {event_type}")
         if not callable(handler):
             raise ExtensionRegistrationError("event handler must be callable")
-        self._hooks.append(_EventHook(extension_name, event_type, handler))
+        self._event_subscriptions.append(_EventSubscription(extension_name, event_type, handler))
+
+    def register_hook(self, point: str | ToolHookPoint, handler: ToolHookHandler) -> None:
+        """Register a lifecycle hook governed by the Runtime's HookRegistry."""
+
+        extension_name = self._require_active_extension()
+        try:
+            hook_point = ToolHookPoint(point)
+        except ValueError as error:
+            raise ExtensionRegistrationError(f"unsupported lifecycle hook point: {point}") from error
+        if not callable(handler):
+            raise ExtensionRegistrationError("lifecycle hook handler must be callable")
+        self._lifecycle_unsubscribers.append(
+            self._hook_registry.register(hook_point, handler, source=f"extension:{extension_name}")
+        )
 
     def register_context_provider(self, provider: Callable[[], ContextContribution | None]) -> None:
         extension_name = self._require_active_extension()
@@ -127,7 +144,8 @@ class ExtensionAPI:
         if self._active_extension is not None:
             raise RuntimeError("nested Extension setup is not supported")
         tool_count = len(self._tools)
-        hook_count = len(self._hooks)
+        event_subscription_count = len(self._event_subscriptions)
+        lifecycle_hook_count = len(self._lifecycle_unsubscribers)
         provider_count = len(self._context_providers)
         tool_names = set(self._tool_names)
         self._active_extension = extension_name
@@ -135,7 +153,10 @@ class ExtensionAPI:
             yield
         except BaseException:
             del self._tools[tool_count:]
-            del self._hooks[hook_count:]
+            del self._event_subscriptions[event_subscription_count:]
+            for unregister in reversed(self._lifecycle_unsubscribers[lifecycle_hook_count:]):
+                unregister()
+            del self._lifecycle_unsubscribers[lifecycle_hook_count:]
             del self._context_providers[provider_count:]
             self._tool_names = tool_names
             raise
@@ -144,7 +165,7 @@ class ExtensionAPI:
 
     def bind_event_hooks(self, agent: Agent) -> Callable[[], None]:
         async def dispatch(event: AgentEvent) -> None:
-            for hook in self._hooks:
+            for hook in self._event_subscriptions:
                 if hook.event_type != event.type:
                     continue
                 try:

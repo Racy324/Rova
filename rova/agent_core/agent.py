@@ -12,6 +12,7 @@ from rova.ai.events import Start, StreamDone, StreamError, TextDelta, ToolCallDe
 from rova.ai.messages import AssistantMessage, TextBlock, ToolResultMessage, UserMessage
 from rova.ai.models import Model
 from .events import AgentEvent, AgentTerminationReason
+from .hooks import HookRegistry
 from .tools import AgentTool, PreparedToolCall, ToolExecutionMode, ToolGovernance, ToolRegistry, ToolRuntime, resolve_batch_mode
 from .tool_output import ToolOutputProcessor, ToolOutputScope
 from .types import StreamFn
@@ -32,6 +33,7 @@ class Agent:
         tool_output_processor: ToolOutputProcessor | None = None,
         tool_execution_mode: ToolExecutionMode = ToolExecutionMode.PARALLEL,
         tool_governance: ToolGovernance | None = None,
+        hook_registry: HookRegistry | None = None,
     ) -> None:
         if not isinstance(tool_execution_mode, ToolExecutionMode):
             raise TypeError("tool_execution_mode must be a ToolExecutionMode")
@@ -42,6 +44,7 @@ class Agent:
             self.registry,
             tool_output_processor=tool_output_processor,
             governance=tool_governance,
+            hook_registry=hook_registry,
         )
         self._tool_output_scope: ContextVar[ToolOutputScope] = ContextVar("tool_output_scope", default=ToolOutputScope())
         self.stream_fn = stream_fn
@@ -144,6 +147,10 @@ class Agent:
                 ))
                 await emit_execution_state(prepared, "completed", outcome=result.metadata.get("outcome"))
 
+            async def on_execution_finished_uncommitted(prepared: PreparedToolCall) -> None:
+                completed.add(prepared.tool_call.id)
+                await emit_execution_state(prepared, "completed")
+
             async def on_result_committed(result: ToolResultMessage) -> None:
                 self.messages.append(result)
                 await self._emit(AgentEvent("message_end", message=result))
@@ -155,6 +162,7 @@ class Agent:
                     scope=self.current_tool_output_scope(),
                     on_execution_start=on_execution_start,
                     on_execution_end=on_execution_end,
+                    on_execution_finished_uncommitted=on_execution_finished_uncommitted,
                     on_result_committed=on_result_committed,
                 )
             except asyncio.CancelledError:
