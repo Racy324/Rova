@@ -6,9 +6,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from rova.agent_core.tools import ToolRegistry
-from rova.app.workspace.approval import ApprovalHandler
-from rova.app.workspace.controlled_tool import ControlledTool
-from rova.app.workspace.policy import ToolPolicy
 
 from .config import MCPServerSettings
 from .tools import build_mcp_tools
@@ -28,9 +25,9 @@ class MCPIssue:
 
 
 class MCPManager:
-    def __init__(self, servers: Sequence[MCPServerSettings], registry: ToolRegistry, policy: ToolPolicy, approval_handler: ApprovalHandler | None, client_factory: Callable[[MCPServerSettings], MCPClientProtocol]) -> None:
-        self._servers, self._registry, self._policy = tuple(servers), registry, policy
-        self._approval_handler, self._client_factory = approval_handler, client_factory
+    def __init__(self, servers: Sequence[MCPServerSettings], registry: ToolRegistry, client_factory: Callable[[MCPServerSettings], MCPClientProtocol]) -> None:
+        self._servers, self._registry = tuple(servers), registry
+        self._client_factory = client_factory
         self._task: asyncio.Task[None] | None = None
         self._clients: list[MCPClientProtocol] = []
         self.issues: list[MCPIssue] = []
@@ -53,8 +50,7 @@ class MCPManager:
             tools = build_mcp_tools(server.server_id, await client.list_tools(), include_tools=server.include_tools, call_tool=client.call_tool)
             if not tools:
                 raise ValueError("include_tools matched no discovered MCP tools")
-            batch = [ControlledTool(tool, self._policy, self._approval_handler) for tool in tools]
-            self._registry.register_tools(batch)
+            self._registry.register_tools(tools)
             self.server_states[server.server_id] = "ready"
         except asyncio.CancelledError:
             self.server_states[server.server_id] = "cancelled"

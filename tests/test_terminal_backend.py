@@ -13,7 +13,7 @@ from rova.app.workspace.policy import DefaultCodingToolPolicy
 from rova.app.workspace import terminal
 from rova.app.workspace.terminal import DockerTerminalBackend, LocalTerminalBackend, TerminalEnvironment, TerminalExecutionResult
 from rova.app.workspace.tools import create_shell_tool
-from rova.agent_core.tools import ToolRegistry
+from rova.agent_core.tools import ToolRegistry, ToolRuntime
 from rova.ai.messages import ToolCall
 
 
@@ -122,7 +122,7 @@ async def test_shell_approval_happens_before_docker_backend_execution(tmp_path: 
         terminal_backend=backend,
     )
 
-    result = await ToolRegistry(tools).execute(ToolCall("denied-shell", "shell", {"command": "true"}))
+    result = await ToolRuntime(ToolRegistry(tools)).execute(ToolCall("denied-shell", "shell", {"command": "true"}))
 
     assert result.is_error is True
     assert backend.execute_calls == 0

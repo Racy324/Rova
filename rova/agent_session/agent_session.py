@@ -27,6 +27,7 @@ from .compaction import (
 )
 from .context_builder import build_session_messages, build_session_projection
 from .events import SessionMaintenanceEvent
+from .execution_journal import ToolExecutionJournal
 from .session_store import CompactionEntry, DurableSession, JsonlSessionStore, SessionStoreError
 from .summarization import SummaryFn, summarize_with_stream
 
@@ -87,10 +88,12 @@ class AgentSession:
         self.last_maintenance_error: Exception | None = None
         self._maintenance_listeners: list[Callable[[SessionMaintenanceEvent], None]] = []
         self._unsubscribe: Callable[[], None] | None = None
+        self._execution_journal: ToolExecutionJournal | None = None
         if durable_session is not None:
             _ensure_agent_has_no_durable_session(agent)
             self._unsubscribe = self.agent.subscribe(self._on_agent_event)
             _DURABLE_BINDINGS[agent] = weakref.ref(self)
+            self._execution_journal = ToolExecutionJournal(durable_session.store.root, durable_session.session_id)
 
     @classmethod
     def create(
@@ -230,7 +233,13 @@ class AgentSession:
         self.persisted_message_count += 1
 
     def _on_agent_event(self, event: AgentEvent) -> None:
-        if event.type in {"message_end", "tool_execution_end"}:
+        if event.type == "tool_execution_state":
+            assert self._execution_journal is not None
+            try:
+                self._execution_journal.append(event)
+            except OSError as error:
+                self._fault(SessionStoreError(f"failed to append execution journal: {error}"))
+        if event.type == "message_end":
             self._persist_committed_suffix()
 
     def _persist_committed_suffix(self) -> None:

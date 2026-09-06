@@ -4,7 +4,7 @@ import asyncio
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
 from ..workspace import CodingToolError, Workspace
 
@@ -43,4 +43,5 @@ def create_edit_tool(workspace: Workspace) -> AgentTool:
             required=("path", "old_text", "new_text"),
         ),
         execute,
+        execution_mode=ToolExecutionMode.SEQUENTIAL,
     )

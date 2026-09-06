@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from rova.ai.messages import ToolCall
-from rova.agent_core.tools import ToolRegistry
+from rova.agent_core.tools import ToolRegistry, ToolRuntime
 from rova.app.web.sources import FetchedPage, ResearchSourceStore, SearchHit
 from rova.app.web.tools import create_fetch_webpage_tool, create_web_search_tool
 from rova.app.web.http import WebNetworkError
@@ -47,7 +47,7 @@ async def test_fetch_returns_normal_tool_error_for_network_failure():
 
     store = ResearchSourceStore()
     store.register(SearchHit("Python docs", "https://docs.python.org/", "docs"))
-    result = await ToolRegistry([create_fetch_webpage_tool(store, FailingFetcher())]).execute(
+    result = await ToolRuntime(ToolRegistry([create_fetch_webpage_tool(store, FailingFetcher())])).execute(
         ToolCall("fetch-1", "fetch_webpage", {"source_id": "S1"})
     )
 

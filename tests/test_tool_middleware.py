@@ -12,6 +12,7 @@ from rova.agent_core.tools import (
     ToolExecutionError,
     ToolMiddleware,
     ToolRegistry,
+    ToolRuntime,
 )
 from rova.ai.messages import TextBlock, ToolCall
 from rova.ai.tools import Tool
@@ -33,6 +34,10 @@ def make_tool(execute):
     return AgentTool(Tool("sample", "sample", {"value": str}, required=("value",)), execute)
 
 
+def make_runtime(tools, *, middlewares=()):
+    return ToolRuntime(ToolRegistry(tools), middlewares=middlewares)
+
+
 @pytest.mark.asyncio
 async def test_middlewares_run_in_static_order_around_a_valid_tool_execution():
     events: list[tuple] = []
@@ -41,12 +46,12 @@ async def test_middlewares_run_in_static_order_around_a_valid_tool_execution():
         events.append(("tool", tool_call_id, params["value"]))
         return AgentToolResult([TextBlock("ok")])
 
-    registry = ToolRegistry(
+    runtime = make_runtime(
         [make_tool(execute)],
         middlewares=(RecordingMiddleware("first", events), RecordingMiddleware("second", events)),
     )
 
-    result = await registry.execute(ToolCall("call-1", "sample", {"value": "x"}), scope=ToolOutputScope("run-1", "session-1"))
+    result = await runtime.execute(ToolCall("call-1", "sample", {"value": "x"}), scope=ToolOutputScope("run-1", "session-1"))
 
     assert result.text == "ok"
     assert events == [
@@ -65,10 +70,10 @@ async def test_unknown_tools_and_invalid_arguments_do_not_enter_middleware_lifec
     async def execute(tool_call_id, params):
         return AgentToolResult([TextBlock("ok")])
 
-    registry = ToolRegistry([make_tool(execute)], middlewares=(RecordingMiddleware("only", events),))
+    runtime = make_runtime([make_tool(execute)], middlewares=(RecordingMiddleware("only", events),))
 
-    unknown = await registry.execute(ToolCall("unknown", "missing", {}))
-    invalid = await registry.execute(ToolCall("invalid", "sample", {"value": 1}))
+    unknown = await runtime.execute(ToolCall("unknown", "missing", {}))
+    invalid = await runtime.execute(ToolCall("invalid", "sample", {"value": 1}))
 
     assert unknown.is_error is True
     assert invalid.is_error is True
@@ -90,7 +95,7 @@ async def test_before_middleware_can_stop_a_valid_tool_with_declared_tool_error(
         calls.append("tool")
         return AgentToolResult([TextBlock("not reached")])
 
-    result = await ToolRegistry([make_tool(execute)], middlewares=(BlockingMiddleware(),)).execute(
+    result = await make_runtime([make_tool(execute)], middlewares=(BlockingMiddleware(),)).execute(
         ToolCall("call", "sample", {"value": "x"})
     )
 
@@ -115,7 +120,7 @@ async def test_after_middleware_observes_declared_tool_failures_without_changing
     async def execute(tool_call_id, params):
         raise ToolExecutionError("ordinary failure")
 
-    result = await ToolRegistry([make_tool(execute)], middlewares=(Observer(),)).execute(
+    result = await make_runtime([make_tool(execute)], middlewares=(Observer(),)).execute(
         ToolCall("call", "sample", {"value": "x"})
     )
 
@@ -137,7 +142,7 @@ async def test_programming_errors_from_middleware_propagate_as_runtime_failures(
         return AgentToolResult([TextBlock("ok")])
 
     with pytest.raises(AssertionError, match="middleware defect"):
-        await ToolRegistry([make_tool(execute)], middlewares=(BrokenMiddleware(),)).execute(
+        await make_runtime([make_tool(execute)], middlewares=(BrokenMiddleware(),)).execute(
             ToolCall("call", "sample", {"value": "x"})
         )
 
@@ -160,10 +165,10 @@ async def test_execution_context_identity_is_call_local_under_concurrency():
     async def execute(tool_call_id, params):
         return AgentToolResult([TextBlock(tool_call_id)])
 
-    registry = ToolRegistry([make_tool(execute)], middlewares=(Observer(),))
-    first = asyncio.create_task(registry.execute(ToolCall("first", "sample", {"value": "1"}), scope=ToolOutputScope("run-1", "session-1")))
+    runtime = make_runtime([make_tool(execute)], middlewares=(Observer(),))
+    first = asyncio.create_task(runtime.execute(ToolCall("first", "sample", {"value": "1"}), scope=ToolOutputScope("run-1", "session-1")))
     await entered.wait()
-    second = asyncio.create_task(registry.execute(ToolCall("second", "sample", {"value": "2"}), scope=ToolOutputScope("run-2", "session-2")))
+    second = asyncio.create_task(runtime.execute(ToolCall("second", "sample", {"value": "2"}), scope=ToolOutputScope("run-2", "session-2")))
     await asyncio.sleep(0)
     release.set()
     await asyncio.gather(first, second)

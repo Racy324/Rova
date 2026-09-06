@@ -6,7 +6,7 @@ import textwrap
 import pytest
 
 from rova.agent_core.agent import Agent
-from rova.agent_core.tools import AgentTool, AgentToolResult
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 from rova.ai.events import StreamDone
 from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage, UserMessage
 from rova.ai.models import Model
@@ -28,6 +28,25 @@ def _write_extension(root: Path, name: str, source: str) -> Path:
     return path
 
 
+def test_extension_tool_registration_requires_an_explicit_execution_mode() -> None:
+    async def run(_tool_call_id, _params):
+        return AgentToolResult([TextBlock("unused")])
+
+    api = ExtensionAPI(())
+    with api.extension_setup("mode-check"):
+        with pytest.raises(ValueError, match="execution_mode"):
+            api.register_tool(AgentTool(Tool("unmarked", "unmarked", {}), run))
+        api.register_tool(
+            AgentTool(
+                Tool("marked", "marked", {}),
+                run,
+                execution_mode=ToolExecutionMode.PARALLEL,
+            )
+        )
+
+    assert [tool.tool.name for tool in api.tools] == ["marked"]
+
+
 @pytest.mark.asyncio
 async def test_extension_tool_is_available_to_and_callable_by_agent(tmp_path: Path) -> None:
     extensions = tmp_path / "extensions"
@@ -37,13 +56,13 @@ async def test_extension_tool_is_available_to_and_callable_by_agent(tmp_path: Pa
         """
         from rova.ai.messages import TextBlock
         from rova.ai.tools import Tool
-        from rova.agent_core.tools import AgentTool, AgentToolResult
+        from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
         async def greet(_tool_call_id, params):
             return AgentToolResult([TextBlock(f"hello, {params['name']}")])
 
         def setup(api):
-            api.register_tool(AgentTool(Tool("extension_greet", "Greet a name.", {"name": str}), greet))
+            api.register_tool(AgentTool(Tool("extension_greet", "Greet a name.", {"name": str}), greet, execution_mode=ToolExecutionMode.PARALLEL))
         """,
     )
 
@@ -165,7 +184,7 @@ async def test_extension_setup_rolls_back_on_base_exception_while_preserving_pro
     api = ExtensionAPI(())
     with pytest.raises(SetupInterrupted):
         with api.extension_setup("interrupted"):
-            api.register_tool(AgentTool(Tool("rolled_back_tool", "rolled back", {}), run))
+            api.register_tool(AgentTool(Tool("rolled_back_tool", "rolled back", {}), run, execution_mode=ToolExecutionMode.PARALLEL))
             api.on("agent_end", lambda _event: hook_calls.append("called"))
             api.register_context_provider(lambda: ContextContribution("rolled-back", "must not survive"))
             raise SetupInterrupted()
@@ -195,7 +214,7 @@ async def test_failed_extension_rolls_back_tool_hook_and_context_before_loading_
         from pathlib import Path
         from rova.ai.messages import TextBlock
         from rova.ai.tools import Tool
-        from rova.agent_core.tools import AgentTool, AgentToolResult
+        from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
         from rova.app.extensions import ContextContribution
 
         async def run(_id, _params):
@@ -208,10 +227,10 @@ async def test_failed_extension_rolls_back_tool_hook_and_context_before_loading_
             return ContextContribution("partial", "partial context must not survive")
 
         def setup(api):
-            api.register_tool(AgentTool(Tool("temporary_extension_tool", "temporary", {{}}), run))
+            api.register_tool(AgentTool(Tool("temporary_extension_tool", "temporary", {{}}), run, execution_mode=ToolExecutionMode.PARALLEL))
             api.on("agent_end", partial_hook)
             api.register_context_provider(partial_context)
-            api.register_tool(AgentTool(Tool("skill_view", "duplicate", {{}}), run))
+            api.register_tool(AgentTool(Tool("skill_view", "duplicate", {{}}), run, execution_mode=ToolExecutionMode.PARALLEL))
         """,
     )
     _write_extension(
@@ -220,11 +239,11 @@ async def test_failed_extension_rolls_back_tool_hook_and_context_before_loading_
         """
         from rova.ai.messages import TextBlock
         from rova.ai.tools import Tool
-        from rova.agent_core.tools import AgentTool, AgentToolResult
+        from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
         async def run(_id, _params):
             return AgentToolResult([TextBlock("available")])
         def setup(api):
-            api.register_tool(AgentTool(Tool("available_extension_tool", "available", {}), run))
+            api.register_tool(AgentTool(Tool("available_extension_tool", "available", {}), run, execution_mode=ToolExecutionMode.PARALLEL))
         """,
     )
 
@@ -259,11 +278,11 @@ def test_default_loader_discovers_user_extensions_before_workspace_extensions(tm
     source = """
         from rova.ai.messages import TextBlock
         from rova.ai.tools import Tool
-        from rova.agent_core.tools import AgentTool, AgentToolResult
+        from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
         async def run(_id, _params):
             return AgentToolResult([TextBlock("ok")])
         def setup(api):
-            api.register_tool(AgentTool(Tool(TOOL_NAME, TOOL_NAME, {}), run))
+            api.register_tool(AgentTool(Tool(TOOL_NAME, TOOL_NAME, {}), run, execution_mode=ToolExecutionMode.PARALLEL))
     """
     _write_extension(data_root / "extensions", "a_user", source.replace("TOOL_NAME", '"user_extension_tool"'))
     _write_extension(workspace / ".rova" / "extensions", "a_workspace", source.replace("TOOL_NAME", '"workspace_extension_tool"'))
@@ -379,13 +398,13 @@ async def test_same_named_files_and_repeated_non_tool_registrations_are_append_o
         """
         from rova.ai.messages import TextBlock
         from rova.ai.tools import Tool
-        from rova.agent_core.tools import AgentTool, AgentToolResult
+        from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
         async def run(_id, _params):
             return AgentToolResult([TextBlock("user")])
 
         def setup(api):
-            api.register_tool(AgentTool(Tool("user_shared_tool", "user", {}), run))
+            api.register_tool(AgentTool(Tool("user_shared_tool", "user", {}), run, execution_mode=ToolExecutionMode.PARALLEL))
         """,
     )
     _write_extension(
@@ -436,13 +455,13 @@ def test_later_same_named_file_with_duplicate_tool_rolls_back_its_setup(tmp_path
     source = """
         from rova.ai.messages import TextBlock
         from rova.ai.tools import Tool
-        from rova.agent_core.tools import AgentTool, AgentToolResult
+        from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
         async def run(_id, _params):
             return AgentToolResult([TextBlock("ok")])
 
         def setup(api):
-            api.register_tool(AgentTool(Tool("shared_tool", "shared", {}), run))
+            api.register_tool(AgentTool(Tool("shared_tool", "shared", {}), run, execution_mode=ToolExecutionMode.PARALLEL))
     """
     _write_extension(data_root / "extensions", "shared", source)
     _write_extension(workspace / ".rova" / "extensions", "shared", source)

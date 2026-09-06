@@ -8,7 +8,7 @@ import time
 import pytest
 
 from rova.ai.messages import ToolCall
-from rova.agent_core.tools import ToolRegistry
+from rova.agent_core.tools import ToolRegistry, ToolRuntime
 from rova.app.file_lock import FileLock
 from rova.app.skills import FileSkillStore, SkillStoreError, create_skill_tools
 
@@ -170,7 +170,7 @@ async def test_skill_view_returns_a_normal_tool_result(tmp_path: Path) -> None:
     store.create("code-review", _skill_markdown("code-review", "Review code."))
     registry = ToolRegistry(create_skill_tools(store))
 
-    result = await registry.execute(ToolCall("view-1", "skill_view", {"name": "code-review"}))
+    result = await ToolRuntime(registry).execute(ToolCall("view-1", "skill_view", {"name": "code-review"}))
 
     assert result.is_error is False
     assert result.tool_name == "skill_view"
@@ -193,7 +193,7 @@ async def test_skill_view_uses_one_injected_directory_renderer_for_tool_result_a
         )
     )
 
-    result = await registry.execute(ToolCall("view-1", "skill_view", {"name": "code-review"}))
+    result = await ToolRuntime(registry).execute(ToolCall("view-1", "skill_view", {"name": "code-review"}))
 
     assert result.is_error is False
     assert "Skill directory: /opt/rova/skills/code-review" in result.text
@@ -207,21 +207,21 @@ async def test_skill_manage_create_edit_and_delete_use_normal_tool_results(tmp_p
     registry = ToolRegistry(create_skill_tools(store))
     content = _skill_markdown("code-review", "Review code.")
 
-    created = await registry.execute(ToolCall("create-1", "skill_manage", {
+    created = await ToolRuntime(registry).execute(ToolCall("create-1", "skill_manage", {
         "action": "create", "name": "code-review", "content": content,
     }))
-    duplicate = await registry.execute(ToolCall("create-2", "skill_manage", {
+    duplicate = await ToolRuntime(registry).execute(ToolCall("create-2", "skill_manage", {
         "action": "create", "name": "code-review", "content": content,
     }))
-    edited = await registry.execute(ToolCall("edit-1", "skill_manage", {
+    edited = await ToolRuntime(registry).execute(ToolCall("edit-1", "skill_manage", {
         "action": "edit", "name": "code-review", "content": "Updated.", "path": "references/checks.md",
     }))
     assert edited.is_error is False
     assert (store.root / "code-review" / "references" / "checks.md").read_text(encoding="utf-8") == "Updated.\n"
-    deleted = await registry.execute(ToolCall("delete-1", "skill_manage", {
+    deleted = await ToolRuntime(registry).execute(ToolCall("delete-1", "skill_manage", {
         "action": "delete", "name": "code-review",
     }))
-    missing = await registry.execute(ToolCall("delete-2", "skill_manage", {
+    missing = await ToolRuntime(registry).execute(ToolCall("delete-2", "skill_manage", {
         "action": "delete", "name": "code-review",
     }))
 
@@ -240,10 +240,10 @@ async def test_skill_manage_rejects_invalid_action_and_attachment_escape(tmp_pat
     store.create("code-review", _skill_markdown("code-review", "Review code."))
     registry = ToolRegistry(create_skill_tools(store))
 
-    invalid = await registry.execute(ToolCall("bad-1", "skill_manage", {
+    invalid = await ToolRuntime(registry).execute(ToolCall("bad-1", "skill_manage", {
         "action": "unknown", "name": "code-review",
     }))
-    escaped = await registry.execute(ToolCall("bad-2", "skill_manage", {
+    escaped = await ToolRuntime(registry).execute(ToolCall("bad-2", "skill_manage", {
         "action": "edit", "name": "code-review", "path": "../escape.md", "content": "no",
     }))
 

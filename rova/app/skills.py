@@ -11,7 +11,7 @@ import warnings
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError, ToolExecutionMode
 
 from .file_lock import FileLock, FileLockError
 from .paths import RovaDataPaths
@@ -220,6 +220,7 @@ def create_skill_tools(
                 required=("name",),
             ),
             view,
+            execution_mode=ToolExecutionMode.PARALLEL,
         ),
         AgentTool(
             Tool(
@@ -229,6 +230,7 @@ def create_skill_tools(
                 required=("action", "name"),
             ),
             manage,
+            execution_mode=ToolExecutionMode.SEQUENTIAL,
         ),
     ]
 

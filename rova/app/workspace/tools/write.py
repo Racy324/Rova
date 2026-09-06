@@ -4,7 +4,7 @@ import asyncio
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
 from ..workspace import Workspace
 
@@ -22,4 +22,5 @@ def create_write_tool(workspace: Workspace) -> AgentTool:
     return AgentTool(
         Tool("write", "Create or replace a UTF-8 workspace file", {"path": str, "content": str}),
         execute,
+        execution_mode=ToolExecutionMode.SEQUENTIAL,
     )

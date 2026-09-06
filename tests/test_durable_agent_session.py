@@ -7,6 +7,7 @@ from rova.ai.events import Start, StreamDone, TextDelta
 from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage, UserMessage
 from rova.ai.models import Model
 from rova.agent_core.agent import Agent
+from rova.agent_core.events import AgentEvent
 from rova.agent_core.tools import AgentTool, AgentToolResult
 from rova.agent_session.agent_session import AgentSession, SessionBranchError, SessionIncompleteError, SessionPersistenceError
 from rova.agent_session.session_store import JsonlSessionStore, SessionStoreError
@@ -66,6 +67,20 @@ async def test_durable_session_persists_only_final_streaming_message_once(tmp_pa
     loaded = JsonlSessionStore(tmp_path).load(session.session_id)
     assert loaded.messages == [UserMessage("hello"), AssistantMessage([TextBlock("partial became final")])]
     assert session.persisted_message_count == len(agent.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_durable_session_persists_tool_results_only_after_message_end(tmp_path):
+    agent = Agent(Model("mock"), "", [], partial_text_stream)
+    session = AgentSession.create(agent, session_root=tmp_path)
+    result = ToolResultMessage("call", "sample", [TextBlock("result")])
+    agent.messages.append(result)
+
+    await agent._emit(AgentEvent("tool_execution_end", tool_call_id="call", tool_name="sample", result="result"))
+    assert JsonlSessionStore(tmp_path).load(session.session_id).messages == []
+
+    await agent._emit(AgentEvent("message_end", message=result))
+    assert JsonlSessionStore(tmp_path).load(session.session_id).messages == [result]
 
 
 @pytest.mark.asyncio

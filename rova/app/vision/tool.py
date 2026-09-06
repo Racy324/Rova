@@ -6,7 +6,7 @@ from pathlib import Path
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError, ToolExecutionMode
 from rova.app.workspace import Workspace
 
 from .client import VisionClient
@@ -44,6 +44,7 @@ def create_vision_analyze_tool(
             required=("image_path", "question"),
         ),
         execute,
+        execution_mode=ToolExecutionMode.PARALLEL,
     )
 
 

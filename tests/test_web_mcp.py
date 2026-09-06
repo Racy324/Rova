@@ -6,7 +6,7 @@ from rova.app.web.mcp_backends import McpWebFetchBackend, McpWebSearchBackend
 from rova.app.web.sources import FetchedPage
 from rova.app.web.tools import create_fetch_webpage_tool
 from rova.app.web.http import WebNetworkError
-from rova.agent_core.tools import ToolRegistry
+from rova.agent_core.tools import ToolRegistry, ToolRuntime
 from rova.ai.messages import ToolCall
 from rova.mcp.client import MCPCallResult, MCPConnectionError
 
@@ -88,7 +88,7 @@ async def test_mcp_cleanup_connection_error_becomes_regular_research_tool_error(
         )
     ])
 
-    result = await registry.execute(ToolCall("fetch", "fetch_webpage", {"source_id": source.source_id}))
+    result = await ToolRuntime(registry).execute(ToolCall("fetch", "fetch_webpage", {"source_id": source.source_id}))
 
     assert result.is_error is True
     assert result.metadata["outcome"] == "tool_execution_error"

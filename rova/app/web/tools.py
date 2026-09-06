@@ -4,7 +4,7 @@ from typing import Protocol
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError, ToolExecutionMode
 
 from .sources import FetchedPage, ResearchSourceStore, SearchHit
 from .http import UnsafeUrlError, WebNetworkError
@@ -37,7 +37,7 @@ def create_web_search_tool(store: ResearchSourceStore, backend: WebSearchBackend
             )
         return AgentToolResult([TextBlock(text or "No results.")], {"result_count": len(sources)})
 
-    return AgentTool(Tool("web_search", "Search public web pages and register returned sources.", {"query": str, "max_results": int}, required=("query",)), execute)
+    return AgentTool(Tool("web_search", "Search public web pages and register returned sources.", {"query": str, "max_results": int}, required=("query",)), execute, execution_mode=ToolExecutionMode.PARALLEL)
 
 
 def create_fetch_webpage_tool(store: ResearchSourceStore, fetcher: WebFetchBackend) -> AgentTool:
@@ -61,4 +61,4 @@ def create_fetch_webpage_tool(store: ResearchSourceStore, fetcher: WebFetchBacke
             ]
         )
 
-    return AgentTool(Tool("fetch_webpage", "Fetch one already registered public-web source by source ID.", {"source_id": str}), execute)
+    return AgentTool(Tool("fetch_webpage", "Fetch one already registered public-web source by source ID.", {"source_id": str}), execute, execution_mode=ToolExecutionMode.PARALLEL)

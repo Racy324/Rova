@@ -8,7 +8,7 @@ import pytest
 from rova.ai.events import StreamDone
 from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage
 from rova.ai.models import Model
-from rova.agent_core.tools import ToolRegistry
+from rova.agent_core.tools import ToolRegistry, ToolRuntime
 from rova.app import workspace as workspace_module
 from rova.app.runtime import build_rova_runtime
 from rova.app.workspace import AlwaysApprove, AlwaysDeny, DefaultCodingToolPolicy, Workspace, build_controlled_coding_tools
@@ -142,7 +142,7 @@ async def test_workspace_context_keeps_invalid_write_inside_existing_controlled_
         )
     )
 
-    result = await registry.execute(ToolCall("invalid-write", "write", {"path": "../outside.py", "content": "no"}))
+    result = await ToolRuntime(registry).execute(ToolCall("invalid-write", "write", {"path": "../outside.py", "content": "no"}))
 
     assert result.is_error is True
     assert result.metadata["policy_decision"] == "require_approval"

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from rova.ai.events import TextDelta
-from rova.ai.messages import AssistantMessage, TextBlock, UserMessage
+from rova.ai.messages import AssistantMessage, TextBlock, ToolResultMessage, UserMessage
 from rova.ai.models import Model
 from rova.agent_core.events import AgentEvent, AgentTerminationReason
 from rova.agent_session.session_store import JsonlSessionStore
@@ -106,6 +106,22 @@ async def test_gateway_reports_status_and_creates_a_new_runtime(tmp_path):
     }
     assert next(frame for frame in frames if frame.get("id") == "new")["result"]["session_id"] == "new-session"
     assert any(frame.get("params", {}).get("type") == "session.changed" for frame in frames)
+
+
+def test_gateway_does_not_render_committed_tool_results_as_assistant_messages(tmp_path):
+    frames = []
+    gateway = TuiGateway(
+        runtime_factory=lambda session_id, approval_handler: FakeRuntime(session_id or "session-1"),
+        session_store=JsonlSessionStore(tmp_path),
+        emit_frame=frames.append,
+    )
+
+    gateway._on_agent_event(AgentEvent(
+        "message_end",
+        message=ToolResultMessage("call", "read", [TextBlock("content")]),
+    ))
+
+    assert frames == []
 
 
 @pytest.mark.asyncio

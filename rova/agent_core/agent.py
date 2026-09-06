@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from uuid import uuid4
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -11,7 +12,7 @@ from rova.ai.events import Start, StreamDone, StreamError, TextDelta, ToolCallDe
 from rova.ai.messages import AssistantMessage, TextBlock, ToolResultMessage, UserMessage
 from rova.ai.models import Model
 from .events import AgentEvent, AgentTerminationReason
-from .tools import AgentTool, ToolRegistry
+from .tools import AgentTool, PreparedToolCall, ToolExecutionMode, ToolGovernance, ToolRegistry, ToolRuntime, resolve_batch_mode
 from .tool_output import ToolOutputProcessor, ToolOutputScope
 from .types import StreamFn
 
@@ -29,13 +30,23 @@ class Agent:
         *,
         max_turns: int = 8,
         tool_output_processor: ToolOutputProcessor | None = None,
+        tool_execution_mode: ToolExecutionMode = ToolExecutionMode.PARALLEL,
+        tool_governance: ToolGovernance | None = None,
     ) -> None:
+        if not isinstance(tool_execution_mode, ToolExecutionMode):
+            raise TypeError("tool_execution_mode must be a ToolExecutionMode")
         self.model = model
         self.system_prompt = system_prompt
-        self.registry = ToolRegistry(tools, tool_output_processor=tool_output_processor)
+        self.registry = ToolRegistry(tools)
+        self.tool_runtime = ToolRuntime(
+            self.registry,
+            tool_output_processor=tool_output_processor,
+            governance=tool_governance,
+        )
         self._tool_output_scope: ContextVar[ToolOutputScope] = ContextVar("tool_output_scope", default=ToolOutputScope())
         self.stream_fn = stream_fn
         self.max_turns = max_turns
+        self.tool_execution_mode = tool_execution_mode
         self.messages: list = []
         self.events: list[AgentEvent] = []
         self.listeners: list[Listener] = []
@@ -85,32 +96,93 @@ class Agent:
                 await self._emit(AgentEvent("turn_end", message=assistant))
                 await self._emit(AgentEvent("agent_end", message=assistant, termination_reason=AgentTerminationReason.FINAL_RESPONSE))
                 return assistant_messages
-            for tool_call in assistant.tool_calls:
-                await self._emit(AgentEvent("tool_execution_start", tool_call_id=tool_call.id, tool_name=tool_call.name, args=tool_call.arguments))
-                try:
-                    result = await self.registry.execute(tool_call, scope=self.current_tool_output_scope())
-                except asyncio.CancelledError:
-                    result = ToolResultMessage(
-                        tool_call.id,
-                        tool_call.name,
-                        [TextBlock("Tool execution cancelled by user.")],
-                        is_error=True,
-                        metadata={"outcome": "cancelled"},
-                    )
-                    self.messages.append(result)
-                    await self._emit(
-                        AgentEvent(
-                            "tool_execution_end",
-                            tool_call_id=tool_call.id,
-                            tool_name=tool_call.name,
-                            result=result.text,
-                            is_error=True,
-                            metadata=result.metadata,
-                        )
-                    )
-                    raise
+            batch_id = uuid4().hex
+            resolved_tools = [self.registry.get(tool_call.name) for tool_call in assistant.tool_calls]
+            batch_mode = resolve_batch_mode(self.tool_execution_mode, resolved_tools)
+            started: dict[str, PreparedToolCall] = {}
+            completed: set[str] = set()
+            finished_results: dict[str, ToolResultMessage] = {}
+
+            async def emit_execution_state(
+                prepared: PreparedToolCall,
+                state: str,
+                *,
+                outcome: str | None = None,
+            ) -> None:
+                await self._emit(AgentEvent(
+                    "tool_execution_state",
+                    tool_call_id=prepared.tool_call.id,
+                    tool_name=prepared.tool_call.name,
+                    batch_id=batch_id,
+                    call_index=prepared.call_index,
+                    batch_mode=batch_mode.value,
+                    execution_mode=prepared.execution_mode.value,
+                    execution_state=state,
+                    outcome=outcome,
+                ))
+
+            async def on_execution_start(prepared: PreparedToolCall) -> None:
+                started[prepared.tool_call.id] = prepared
+                await self._emit(AgentEvent(
+                    "tool_execution_start",
+                    tool_call_id=prepared.tool_call.id,
+                    tool_name=prepared.tool_call.name,
+                    args=dict(prepared.arguments),
+                ))
+                await emit_execution_state(prepared, "started")
+
+            async def on_execution_end(prepared: PreparedToolCall, result: ToolResultMessage) -> None:
+                completed.add(prepared.tool_call.id)
+                finished_results[prepared.tool_call.id] = result
+                await self._emit(AgentEvent(
+                    "tool_execution_end",
+                    tool_call_id=prepared.tool_call.id,
+                    tool_name=prepared.tool_call.name,
+                    result=result.text,
+                    is_error=result.is_error,
+                    metadata=result.metadata,
+                ))
+                await emit_execution_state(prepared, "completed", outcome=result.metadata.get("outcome"))
+
+            async def on_result_committed(result: ToolResultMessage) -> None:
                 self.messages.append(result)
-                await self._emit(AgentEvent("tool_execution_end", tool_call_id=tool_call.id, tool_name=tool_call.name, result=result.text, is_error=result.is_error, metadata=result.metadata))
+                await self._emit(AgentEvent("message_end", message=result))
+
+            try:
+                await self.tool_runtime.execute_batch(
+                    assistant.tool_calls,
+                    runtime_mode=self.tool_execution_mode,
+                    scope=self.current_tool_output_scope(),
+                    on_execution_start=on_execution_start,
+                    on_execution_end=on_execution_end,
+                    on_result_committed=on_result_committed,
+                )
+            except asyncio.CancelledError:
+                for tool_call_id, prepared in started.items():
+                    if tool_call_id not in completed:
+                        await emit_execution_state(prepared, "cancelled", outcome="cancelled")
+                committed_call_ids = {
+                    message.tool_call_id for message in self.messages if isinstance(message, ToolResultMessage)
+                }
+                for tool_call in assistant.tool_calls:
+                    if tool_call.id in committed_call_ids:
+                        continue
+                    result = finished_results.get(tool_call.id)
+                    if result is None:
+                        result = ToolResultMessage(
+                            tool_call.id,
+                            tool_call.name,
+                            [TextBlock("Tool execution cancelled by user.")],
+                            is_error=True,
+                            metadata={"outcome": "cancelled"},
+                        )
+                    await on_result_committed(result)
+                raise
+            except BaseException:
+                for tool_call_id, prepared in started.items():
+                    if tool_call_id not in completed:
+                        await emit_execution_state(prepared, "interrupted", outcome="interrupted")
+                raise
             await self._emit(AgentEvent("turn_end", message=assistant))
         failure = AssistantMessage(content=[TextBlock(f"Maximum turns ({self.max_turns}) reached")], stop_reason="error", partial=False)
         self.messages.append(failure)

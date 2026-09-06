@@ -4,7 +4,7 @@ import asyncio
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
 from ..workspace import CodingToolError, Workspace
 
@@ -33,4 +33,5 @@ def create_list_dir_tool(workspace: Workspace) -> AgentTool:
     return AgentTool(
         Tool("list_dir", "List one workspace directory level", {"path": str}, required=()),
         execute,
+        execution_mode=ToolExecutionMode.PARALLEL,
     )

@@ -13,6 +13,7 @@ from rova.agent_core.agent import Agent
 from rova.agent_core.events import AgentEvent, AgentTerminationReason
 from rova.agent_session.agent_session import SessionPersistenceError
 from rova.agent_session.events import SessionMaintenanceEvent
+from rova.ai.messages import AssistantMessage
 
 from .models import (
     CompactionStatus,
@@ -142,7 +143,7 @@ class TraceRecorder:
             return
         if event.type == "turn_start":
             self._start_turn(state)
-        elif event.type == "message_end" and event.message is not None:
+        elif event.type == "message_end" and isinstance(event.message, AssistantMessage):
             self._finish_turn(state, event.message)
         elif event.type == "tool_execution_start":
             self._start_tool(state, event)

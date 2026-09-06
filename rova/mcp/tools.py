@@ -7,7 +7,7 @@ from typing import Any
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError, ToolExecutionMode
 
 from .client import MCPCallResult, MCPToolDefinition
 
@@ -41,7 +41,8 @@ def _adapter(server_id: str, definition: MCPToolDefinition, public_name: str, ca
             rendered = f"{rendered}\n\nStructured content:\n{json.dumps(result.structured_content, ensure_ascii=False, default=str)[:12000]}".strip()
         return AgentToolResult([TextBlock(rendered or "MCP tool returned no content.")])
     metadata = {"origin": "mcp", "server_id": server_id, "raw_tool_name": definition.name, "public_name": public_name}
-    return AgentTool(Tool(public_name, definition.description, input_schema=definition.input_schema), execute, metadata)
+    mode = ToolExecutionMode.PARALLEL if definition.annotations.get("readOnlyHint") is True else ToolExecutionMode.SEQUENTIAL
+    return AgentTool(Tool(public_name, definition.description, input_schema=definition.input_schema), execute, metadata, mode)
 
 
 def _normalize(value: str) -> str:

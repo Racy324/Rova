@@ -4,7 +4,7 @@ import asyncio
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
 from ..workspace import CodingToolError, Workspace
 
@@ -31,4 +31,5 @@ def create_read_tool(workspace: Workspace) -> AgentTool:
     return AgentTool(
         Tool("read", "Read a UTF-8 text file from the workspace", {"path": str, "start_line": int, "end_line": int}, required=("path",)),
         execute,
+        execution_mode=ToolExecutionMode.PARALLEL,
     )

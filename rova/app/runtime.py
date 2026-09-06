@@ -11,6 +11,7 @@ import warnings
 from rova.ai.context import Context
 from rova.ai.models import Model
 from rova.agent_core.agent import Agent
+from rova.agent_core.tools import ToolExecutionMode
 from rova.agent_core.tool_output import ToolOutputProcessor
 from rova.agent_core.types import StreamFn
 from rova.agent_session.agent_session import AgentSession
@@ -23,7 +24,7 @@ from .web.sources import ResearchSourceStore
 from .web.tools import WebFetchBackend, WebSearchBackend, create_fetch_webpage_tool, create_web_search_tool
 from .workspace.approval import AlwaysApprove, ApprovalHandler, ConsoleApprovalHandler
 from .workspace.context import WorkspaceContext
-from .workspace.controlled_tool import build_controlled_coding_tools, wrap_controlled_tools
+from .workspace.controlled_tool import RovaToolGovernance, build_coding_tools
 from .workspace.instructions import WorkspaceInstructionSnapshot, load_workspace_instruction
 from .workspace.policy import DefaultRovaToolPolicy, ToolPolicy
 from .workspace.terminal import DockerTerminalBackend, LocalTerminalBackend, TerminalBackend
@@ -198,6 +199,7 @@ def build_rova_runtime(
     terminal_backend: str = "local",
     docker_image: str | None = None,
     mcp_config_path: Path | None = None,
+    tool_execution_mode: ToolExecutionMode = ToolExecutionMode.PARALLEL,
 ) -> RovaRuntime:
     if (web_search_backend is None) != (webpage_fetcher is None):
         raise ValueError("web_search_backend and webpage_fetcher must be provided together")
@@ -269,13 +271,7 @@ def build_rova_runtime(
         effective_approval_handler = effective_approval_handler or _approval_handler_for_mode(
             permission_mode, effective_terminal_backend
         )
-        tools.extend(build_controlled_coding_tools(
-            workspace,
-            effective_policy,
-            effective_approval_handler,
-            workspace_context,
-            terminal_backend=effective_terminal_backend,
-        ))
+        tools.extend(build_coding_tools(workspace, terminal_backend=effective_terminal_backend))
         if vision_client is not None:
             tools.append(create_vision_analyze_tool(workspace, vision_client))
     if source_store is not None:
@@ -293,7 +289,13 @@ def build_rova_runtime(
     )
     extension_load_report = extension_loader.load(extension_api)
     tools.extend(extension_api.tools)
-    tools = wrap_controlled_tools(tools, effective_policy, effective_approval_handler)
+    tool_governance = RovaToolGovernance(
+        effective_policy,
+        effective_approval_handler,
+        workspace.root if workspace is not None else None,
+        workspace_context,
+        effective_terminal_backend.environment if effective_terminal_backend is not None else None,
+    )
 
     store_root = artifact_root or RovaDataPaths.resolve().artifacts
     artifact_store = FileArtifactStore(store_root)
@@ -313,14 +315,14 @@ def build_rova_runtime(
         ),
         max_turns=max_turns,
         tool_output_processor=ToolOutputProcessor(artifact_store),
+        tool_execution_mode=tool_execution_mode,
+        tool_governance=tool_governance,
     )
     extension_api.bind_event_hooks(agent)
     mcp_manager = (
         MCPManager(
             mcp_servers,
             agent.registry,
-            effective_policy,
-            effective_approval_handler,
             _create_mcp_client,
         )
         if mcp_servers

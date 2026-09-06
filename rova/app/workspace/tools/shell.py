@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
 from ..terminal import TerminalBackend, TerminalExecutionResult
 from ..workspace import CodingToolError
@@ -30,6 +30,7 @@ def create_shell_tool(backend: TerminalBackend) -> AgentTool:
             required=("command",),
         ),
         execute,
+        execution_mode=ToolExecutionMode.SEQUENTIAL,
     )
 
 

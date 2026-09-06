@@ -10,7 +10,7 @@ from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMe
 from rova.ai.models import Model
 from rova.ai.tools import Tool
 from rova.agent_core.agent import Agent
-from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError, ToolRegistry
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError, ToolRegistry, ToolRuntime
 from rova.app.workspace import Workspace
 from rova.app.workspace.approval import ApprovalDecision, AlwaysApprove, AlwaysDeny
 from rova.app.workspace.controlled_tool import ControlledTool, ToolExecutionDenied, build_controlled_coding_tools
@@ -89,7 +89,7 @@ async def test_controlled_tool_policy_deny_does_not_call_inner_and_becomes_tool_
     controlled = ControlledTool(make_inner(calls), StaticPolicy(ToolPolicyResult(ToolPolicyDecision.DENY, "denied by test")))
     with pytest.raises(ToolExecutionDenied, match="Tool execution denied by policy"):
         await controlled.execute("call", {"value": "x"})
-    result = await ToolRegistry([controlled]).execute(ToolCall("call", "inner", {"value": "x"}))
+    result = await ToolRuntime(ToolRegistry([controlled])).execute(ToolCall("call", "inner", {"value": "x"}))
     assert result.is_error is True
     assert "Reason: denied by test" in result.text
     assert result.metadata == {
@@ -129,7 +129,7 @@ async def test_registry_exposes_approval_outcomes_as_structured_metadata():
     ]
 
     for handler, is_error, outcome, approval_decision in cases:
-        result = await ToolRegistry([ControlledTool(make_inner([]), policy, handler)]).execute(
+        result = await ToolRuntime(ToolRegistry([ControlledTool(make_inner([]), policy, handler)])).execute(
             ToolCall("call", "inner", {"value": "x"})
         )
         assert result.is_error is is_error
@@ -146,7 +146,7 @@ async def test_inner_failures_still_follow_existing_tool_result_error_semantics(
         make_inner([], failure=ToolExecutionError("ordinary inner failure")),
         StaticPolicy(ToolPolicyResult(ToolPolicyDecision.ALLOW, "allowed")),
     )
-    result = await ToolRegistry([controlled]).execute(ToolCall("call", "inner", {"value": "x"}))
+    result = await ToolRuntime(ToolRegistry([controlled])).execute(ToolCall("call", "inner", {"value": "x"}))
     assert result.is_error is True
     assert result.text == "ordinary inner failure"
 
@@ -160,7 +160,7 @@ async def test_controlled_inner_failure_preserves_policy_and_approval_metadata()
         AlwaysApprove(),
     )
 
-    result = await ToolRegistry([controlled]).execute(ToolCall("call", "inner", {"value": "x"}))
+    result = await ToolRuntime(ToolRegistry([controlled])).execute(ToolCall("call", "inner", {"value": "x"}))
 
     assert result.is_error is True
     assert result.metadata == {
@@ -177,7 +177,7 @@ async def test_registry_propagates_unmarked_harness_failures():
     registry = ToolRegistry([make_inner([], failure=AssertionError("invariant violated"))])
 
     with pytest.raises(AssertionError, match="invariant violated"):
-        await registry.execute(ToolCall("call", "inner", {"value": "x"}))
+        await ToolRuntime(registry).execute(ToolCall("call", "inner", {"value": "x"}))
 
 
 @pytest.mark.asyncio
@@ -188,7 +188,7 @@ async def test_registry_rejects_non_json_tool_metadata_as_a_harness_failure():
     registry = ToolRegistry([AgentTool(Tool("inner", "Inner", {"value": str}), execute)])
 
     with pytest.raises(TypeError, match="JSON-compatible"):
-        await registry.execute(ToolCall("call", "inner", {"value": "x"}))
+        await ToolRuntime(registry).execute(ToolCall("call", "inner", {"value": "x"}))
 
 
 @pytest.mark.asyncio
@@ -203,15 +203,15 @@ async def test_controlled_coding_tools_enforce_write_and_edit_approval_side_effe
     workspace = Workspace(workspace_root)
     denied_tools = build_controlled_coding_tools(workspace, DefaultCodingToolPolicy(), AlwaysDeny())
     denied_registry = ToolRegistry(denied_tools)
-    write = await denied_registry.execute(ToolCall("write", "write", {"path": "created.txt", "content": "created"}))
-    edit = await denied_registry.execute(ToolCall("edit", "edit", {"path": "edit.txt", "old_text": "old", "new_text": "new"}))
+    write = await ToolRuntime(denied_registry).execute(ToolCall("write", "write", {"path": "created.txt", "content": "created"}))
+    edit = await ToolRuntime(denied_registry).execute(ToolCall("edit", "edit", {"path": "edit.txt", "old_text": "old", "new_text": "new"}))
     assert write.is_error and edit.is_error
     assert not (workspace_root / "created.txt").exists()
     assert (workspace_root / "edit.txt").read_text(encoding="utf-8") == "old value\n"
 
     approved_registry = ToolRegistry(build_controlled_coding_tools(workspace, DefaultCodingToolPolicy(), AlwaysApprove()))
-    approved_write = await approved_registry.execute(ToolCall("write-approved", "write", {"path": "created.txt", "content": "created"}))
-    approved_edit = await approved_registry.execute(ToolCall("edit-approved", "edit", {"path": "edit.txt", "old_text": "old", "new_text": "new"}))
+    approved_write = await ToolRuntime(approved_registry).execute(ToolCall("write-approved", "write", {"path": "created.txt", "content": "created"}))
+    approved_edit = await ToolRuntime(approved_registry).execute(ToolCall("edit-approved", "edit", {"path": "edit.txt", "old_text": "old", "new_text": "new"}))
     assert not approved_write.is_error and not approved_edit.is_error
     assert (workspace_root / "created.txt").read_text(encoding="utf-8") == "created"
     assert (workspace_root / "edit.txt").read_text(encoding="utf-8") == "new value\n"
@@ -223,12 +223,12 @@ async def test_shell_approval_happens_before_process_spawn(workspace_root: Path)
     marker = workspace_root / "marker.txt"
     command = f'"{sys.executable}" -c "from pathlib import Path; Path(\'marker.txt\').write_text(\'ran\')"'
     denied = ToolRegistry(build_controlled_coding_tools(workspace, DefaultCodingToolPolicy(), AlwaysDeny()))
-    denied_result = await denied.execute(ToolCall("shell-denied", "shell", {"command": command}))
+    denied_result = await ToolRuntime(denied).execute(ToolCall("shell-denied", "shell", {"command": command}))
     assert denied_result.is_error is True
     assert not marker.exists()
 
     approved = ToolRegistry(build_controlled_coding_tools(workspace, DefaultCodingToolPolicy(), AlwaysApprove()))
-    approved_result = await approved.execute(ToolCall("shell-approved", "shell", {"command": command}))
+    approved_result = await ToolRuntime(approved).execute(ToolCall("shell-approved", "shell", {"command": command}))
     assert not approved_result.is_error
     assert "exit_code: 0" in approved_result.text
     assert marker.read_text(encoding="utf-8") == "ran"

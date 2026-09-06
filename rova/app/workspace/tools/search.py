@@ -6,7 +6,7 @@ from pathlib import Path
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
 from ..workspace import CodingToolError, Workspace
 
@@ -49,6 +49,7 @@ def create_search_tool(workspace: Workspace) -> AgentTool:
     return AgentTool(
         Tool("search", "Search UTF-8 workspace files for exact text", {"query": str, "path": str, "max_results": int}, required=("query",)),
         execute,
+        execution_mode=ToolExecutionMode.PARALLEL,
     )
 
 

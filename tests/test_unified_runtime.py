@@ -10,7 +10,7 @@ from rova.ai.events import StreamDone
 from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage
 from rova.ai.models import Model
 from rova.app.workspace.approval import AlwaysApprove, ConsoleApprovalHandler
-from rova.app.workspace.controlled_tool import ControlledTool
+from rova.app.workspace.controlled_tool import RovaToolGovernance
 from rova.app.workspace.policy import ToolExecutionRequest, ToolPolicyDecision, ToolPolicyResult
 from rova.app.context.local import LocalContextItem, LocalResearchContext
 from rova.app.web.sources import FetchedPage, SearchHit
@@ -71,7 +71,7 @@ def test_unified_runtime_without_optional_inputs_creates_one_tool_free_agent(tmp
     assert runtime.session.session_id is not None
 
 
-def test_all_runtime_tool_sources_share_controlled_tool_governance(tmp_path: Path):
+def test_all_runtime_tool_sources_share_one_tool_runtime_governance_authority(tmp_path: Path):
     async def stream(_model, _context, _options):
         yield StreamDone(AssistantMessage([TextBlock("done")]))
 
@@ -83,7 +83,8 @@ def test_all_runtime_tool_sources_share_controlled_tool_governance(tmp_path: Pat
         artifact_root=tmp_path / "artifacts",
     )
 
-    assert all(isinstance(tool, ControlledTool) for tool in runtime.agent.registry._tools.values())
+    assert all(not isinstance(tool, RovaToolGovernance) for tool in runtime.agent.registry._tools.values())
+    assert isinstance(runtime.agent.tool_runtime._governance, RovaToolGovernance)
 
 
 def test_unified_runtime_uses_explicit_product_max_turns(tmp_path: Path):
@@ -124,10 +125,12 @@ def test_unified_runtime_selects_approval_handler_from_permission_mode(tmp_path:
         artifact_root=tmp_path / "full-artifacts",
     )
 
-    ask_tools = [ask_runtime.agent.registry._tools[name] for name in ("write", "edit", "shell")]
-    full_tools = [full_runtime.agent.registry._tools[name] for name in ("write", "edit", "shell")]
-    assert all(isinstance(tool, ControlledTool) and isinstance(tool.approval_handler, ConsoleApprovalHandler) for tool in ask_tools)
-    assert all(isinstance(tool, ControlledTool) and isinstance(tool.approval_handler, AlwaysApprove) for tool in full_tools)
+    ask_governance = ask_runtime.agent.tool_runtime._governance
+    full_governance = full_runtime.agent.tool_runtime._governance
+    assert isinstance(ask_governance, RovaToolGovernance)
+    assert isinstance(full_governance, RovaToolGovernance)
+    assert isinstance(ask_governance.approval_handler, ConsoleApprovalHandler)
+    assert isinstance(full_governance.approval_handler, AlwaysApprove)
 
 
 def test_unified_runtime_selects_terminal_backend_from_startup_configuration(tmp_path: Path):
@@ -243,7 +246,7 @@ async def test_unified_runtime_renders_loaded_skill_paths_for_docker_terminal(tm
         artifact_root=tmp_path / "artifacts",
     )
 
-    result = await runtime.agent.registry.execute(ToolCall("view", "skill_view", {"name": "paper-card"}))
+    result = await runtime.agent.tool_runtime.execute(ToolCall("view", "skill_view", {"name": "paper-card"}))
 
     assert result.is_error is False
     assert "Skill directory: /opt/rova/skills/paper-card" in result.text
@@ -328,7 +331,7 @@ async def test_unified_runtime_full_mode_does_not_bypass_policy_deny(tmp_path: P
         artifact_root=tmp_path / "artifacts",
     )
 
-    result = await runtime.agent.registry.execute(ToolCall("write-call", "write", {"path": "blocked.txt", "content": "no"}))
+    result = await runtime.agent.tool_runtime.execute(ToolCall("write-call", "write", {"path": "blocked.txt", "content": "no"}))
 
     assert result.is_error is True
     assert result.metadata["policy_decision"] == "deny"
@@ -494,7 +497,7 @@ async def test_unified_runtime_adds_web_tools_and_keeps_source_store_run_local(t
         artifact_root=tmp_path / "artifacts",
     )
 
-    result = await runtime.agent.registry.execute(ToolCall("call-1", "web_search", {"query": "Rova"}))
+    result = await runtime.agent.tool_runtime.execute(ToolCall("call-1", "web_search", {"query": "Rova"}))
 
     assert [tool.name for tool in runtime.agent.registry.schemas] == [
         "skill_view", "skill_manage", "memory_manage", "web_search", "fetch_webpage",
@@ -720,7 +723,7 @@ async def test_unified_runtime_freezes_skill_catalog_and_only_injects_metadata(t
         model=Model(provider="mock"), stream_fn=stream, skill_root=skill_root,
         session_root=tmp_path / "sessions", artifact_root=tmp_path / "artifacts",
     )
-    created = await runtime.agent.registry.execute(ToolCall("create-skill", "skill_manage", {
+    created = await runtime.agent.tool_runtime.execute(ToolCall("create-skill", "skill_manage", {
         "action": "create",
         "name": "paper-review",
         "content": "---\nname: paper-review\ndescription: Review papers.\n---\n\n# Paper Review\n\nFull paper procedure.",
@@ -773,4 +776,4 @@ async def test_unified_runtime_persists_skill_view_as_a_normal_tool_result(tmp_p
     skill_result = next(message for message in runtime.agent.messages if isinstance(message, ToolResultMessage))
     assert skill_result.tool_name == "skill_view"
     assert "# Code Review" in skill_result.text
-    assert "# Code Review" in next(session_root.glob("*.jsonl")).read_text(encoding="utf-8")
+    assert "# Code Review" in (session_root / f"{runtime.session.session_id}.jsonl").read_text(encoding="utf-8")

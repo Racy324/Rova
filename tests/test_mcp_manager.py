@@ -5,9 +5,6 @@ import asyncio
 import pytest
 
 from rova.agent_core.tools import ToolRegistry
-from rova.app.workspace.approval import AlwaysApprove
-from rova.app.workspace.controlled_tool import ControlledTool
-from rova.app.workspace.policy import DefaultCodingToolPolicy
 from rova.mcp.client import MCPCallResult, MCPToolDefinition
 from rova.mcp.config import MCPServerSettings
 from rova.mcp.manager import MCPManager
@@ -29,14 +26,14 @@ async def test_fast_server_registers_without_waiting_for_slow_server() -> None:
     slow = MCPServerSettings("slow", "stdio", ("search",), command="fake")
     clients = {"fast": FakeClient([MCPToolDefinition("search", "Search", {"type": "object"})]), "slow": FakeClient([MCPToolDefinition("search", "Search", {"type": "object"})], gate)}
     registry = ToolRegistry([])
-    manager = MCPManager((fast, slow), registry, DefaultCodingToolPolicy(), AlwaysApprove(), lambda setting: clients[setting.server_id])
+    manager = MCPManager((fast, slow), registry, lambda setting: clients[setting.server_id])
 
     task = manager.start()
     for _ in range(20):
         if registry.schemas: break
         await asyncio.sleep(0)
     assert [tool.name for tool in registry.schemas] == ["mcp_fast_search"]
-    assert isinstance(registry._tools["mcp_fast_search"], ControlledTool)
+    assert registry._tools["mcp_fast_search"].metadata["origin"] == "mcp"
     assert not task.done()
     await manager.close()
     assert clients["fast"].closed and clients["slow"].closed
@@ -51,7 +48,7 @@ async def test_failed_server_is_isolated_and_redacts_configured_values() -> None
             raise RuntimeError("connection used private-value")
 
     registry = ToolRegistry([])
-    manager = MCPManager((server,), registry, DefaultCodingToolPolicy(), AlwaysApprove(), lambda _setting: BrokenClient([]))
+    manager = MCPManager((server,), registry, lambda _setting: BrokenClient([]))
     await manager.start()
 
     assert manager.server_states == {"broken": "failed"}

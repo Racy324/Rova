@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
-from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError
+from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError, ToolExecutionMode
 
 from .file_lock import FileLock, FileLockError
 from .paths import RovaDataPaths
@@ -247,6 +247,7 @@ def create_memory_tools(store: MemoryStore, *, max_chars: int) -> list[AgentTool
                 },
             ),
             manage,
+            execution_mode=ToolExecutionMode.SEQUENTIAL,
         )
     ]
 

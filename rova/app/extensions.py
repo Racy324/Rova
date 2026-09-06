@@ -12,7 +12,7 @@ from typing import Any, Iterator
 
 from rova.agent_core.agent import Agent
 from rova.agent_core.events import AgentEvent
-from rova.agent_core.tools import AgentTool
+from rova.agent_core.tools import AgentTool, ToolExecutionMode
 
 from .paths import RovaDataPaths
 
@@ -98,6 +98,10 @@ class ExtensionAPI:
         extension_name = self._require_active_extension()
         if not isinstance(tool, AgentTool):
             raise ExtensionRegistrationError("register_tool requires an AgentTool")
+        if tool.execution_mode is None:
+            raise ExtensionRegistrationError("Extension tools must declare execution_mode")
+        if not isinstance(tool.execution_mode, ToolExecutionMode):
+            raise ExtensionRegistrationError("Extension tool execution_mode must be a ToolExecutionMode")
         name = tool.tool.name
         if name in self._tool_names:
             raise ExtensionRegistrationError(f"duplicate tool name: {name}")

@@ -54,6 +54,7 @@ class MCPToolDefinition:
     name: str
     description: str
     input_schema: dict[str, Any]
+    annotations: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,16 @@ class MCPCallResult:
     text_blocks: list[str]
     structured_content: Any
     is_error: bool
+
+
+def _tool_annotations(tool: Any) -> dict[str, Any]:
+    annotations = getattr(tool, "annotations", None)
+    if annotations is None:
+        return {}
+    if isinstance(annotations, dict):
+        return dict(annotations)
+    read_only = getattr(annotations, "readOnlyHint", None)
+    return {"readOnlyHint": read_only} if isinstance(read_only, bool) else {}
 
 
 class _MCPToolSession(Protocol):
@@ -111,7 +122,15 @@ class MCPClient:
             result = await self._require_session().list_tools()
         except Exception as error:
             _raise_normalized_error(self.config, error)
-        return [MCPToolDefinition(item.name, item.description or "", dict(item.input_schema)) for item in result.tools]
+        return [
+            MCPToolDefinition(
+                item.name,
+                item.description or "",
+                dict(item.input_schema),
+                _tool_annotations(item),
+            )
+            for item in result.tools
+        ]
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPCallResult:
         try:

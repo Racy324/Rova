@@ -8,7 +8,7 @@ import pytest
 from rova.ai.events import StreamDone
 from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage
 from rova.ai.models import Model
-from rova.agent_core.tools import ToolRegistry
+from rova.agent_core.tools import ToolRegistry, ToolRuntime
 from rova.app import cli
 from rova.app.runtime import build_rova_runtime
 from rova.app.settings import AppSettings
@@ -193,7 +193,7 @@ async def test_vision_tool_returns_normal_tool_errors_for_invalid_image_paths(
     (workspace_root / "folder.png").mkdir()
     registry = ToolRegistry([create_vision_analyze_tool(Workspace(workspace_root), FakeVisionClient())])
 
-    result = await registry.execute(ToolCall("vision-call", "vision_analyze", {
+    result = await ToolRuntime(registry).execute(ToolCall("vision-call", "vision_analyze", {
         "image_path": image_path,
         "question": "Inspect it",
     }))
@@ -208,7 +208,7 @@ async def test_vision_tool_rejects_images_over_the_size_limit(workspace_root: Pa
     (workspace_root / "large.png").write_bytes(b"0" * (MAX_IMAGE_BYTES + 1))
     registry = ToolRegistry([create_vision_analyze_tool(Workspace(workspace_root), FakeVisionClient())])
 
-    result = await registry.execute(ToolCall("vision-call", "vision_analyze", {
+    result = await ToolRuntime(registry).execute(ToolCall("vision-call", "vision_analyze", {
         "image_path": "large.png",
         "question": "Inspect it",
     }))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from rova.agent_core.tools import ToolExecutionMode
 from rova.mcp.client import MCPCallResult, MCPToolDefinition
 from rova.mcp.tools import MCPToolAdapterError, build_mcp_tools
 from rova.app.workspace.approval import AlwaysApprove, AlwaysDeny
@@ -27,6 +28,25 @@ def test_normalization_collision_rejects_entire_server_batch() -> None:
     ]
     with pytest.raises(MCPToolAdapterError, match="normalization collision"):
         build_mcp_tools("server", definitions, include_tools=("foo-bar", "foo_bar"), call_tool=lambda _name, _args: None)
+
+
+def test_mcp_execution_mode_uses_only_an_explicit_read_only_annotation() -> None:
+    tools = build_mcp_tools(
+        "server",
+        [
+            MCPToolDefinition("read", "read", {"type": "object"}, {"readOnlyHint": True}),
+            MCPToolDefinition("unknown", "unknown", {"type": "object"}),
+            MCPToolDefinition("false", "false", {"type": "object"}, {"readOnlyHint": False}),
+        ],
+        include_tools=("read", "unknown", "false"),
+        call_tool=lambda _name, _args: None,
+    )
+
+    assert {tool.tool.name: tool.execution_mode for tool in tools} == {
+        "mcp_server_read": ToolExecutionMode.PARALLEL,
+        "mcp_server_unknown": ToolExecutionMode.SEQUENTIAL,
+        "mcp_server_false": ToolExecutionMode.SEQUENTIAL,
+    }
 
 
 @pytest.mark.asyncio

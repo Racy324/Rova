@@ -15,7 +15,7 @@ from rova.app.memory import (
 )
 from rova.ai.messages import ToolCall
 from rova.ai.providers.openai_compatible import to_provider_tools
-from rova.agent_core.tools import ToolRegistry
+from rova.agent_core.tools import ToolRegistry, ToolRuntime
 from rova.app.workspace.instructions import load_workspace_instruction
 
 
@@ -139,7 +139,7 @@ async def test_memory_manage_immediately_applies_a_complete_explicit_update(tmp_
     store = FileMemoryStore(tmp_path / "memory")
     registry = ToolRegistry(create_memory_tools(store, max_chars=200))
 
-    result = await registry.execute(
+    result = await ToolRuntime(registry).execute(
         ToolCall(
             "memory-1",
             "memory_manage",
@@ -169,7 +169,7 @@ async def test_memory_manage_rejects_invalid_action_without_partial_write(tmp_pa
     )
     registry = ToolRegistry(create_memory_tools(store, max_chars=200))
 
-    result = await registry.execute(
+    result = await ToolRuntime(registry).execute(
         ToolCall(
             "memory-2",
             "memory_manage",
@@ -210,7 +210,7 @@ async def test_memory_manage_accepts_every_declared_action(tmp_path: Path, actio
     if action in {"ADD", "UPDATE"}:
         arguments["user_markdown"] = "- Stable user information"
 
-    result = await registry.execute(ToolCall("memory-valid", "memory_manage", arguments))
+    result = await ToolRuntime(registry).execute(ToolCall("memory-valid", "memory_manage", arguments))
 
     assert not result.is_error
 
@@ -225,7 +225,7 @@ async def test_memory_manage_reports_invalid_action_with_allowed_values(tmp_path
     }
     arguments[field] = invalid
 
-    result = await registry.execute(ToolCall("memory-invalid", "memory_manage", arguments))
+    result = await ToolRuntime(registry).execute(ToolCall("memory-invalid", "memory_manage", arguments))
 
     assert result.is_error
     assert field in result.text
