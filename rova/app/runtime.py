@@ -114,6 +114,11 @@ class RovaRuntime:
     def trace_runtime_issues(self) -> tuple[str, ...]:
         return tuple(self._trace_issues)
 
+    @property
+    def recovery_report(self):
+        """Return the selected Session's load/branch reconciliation facts."""
+        return self.session.recovery_report
+
     def start_mcp_discovery(self) -> None:
         if self.mcp_manager is not None:
             self.mcp_manager.start()

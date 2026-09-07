@@ -7,6 +7,10 @@ export type RuntimeStatus = {
 	web_enabled: boolean;
 	permission_mode: 'ask' | 'full';
 	session_id: string | null;
+	recovery: {
+		recovered_count: number;
+		side_effects_unknown_count: number;
+	};
 	skill_count: number;
 	terminal_backend: {
 		kind: string;

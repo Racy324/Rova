@@ -137,6 +137,7 @@ class Agent:
                 state: str,
                 *,
                 outcome: str | None = None,
+                result: ToolResultMessage | None = None,
             ) -> None:
                 await self._emit(AgentEvent(
                     "tool_execution_state",
@@ -147,7 +148,10 @@ class Agent:
                     batch_mode=batch_mode.value,
                     execution_mode=prepared.execution_mode.value,
                     execution_state=state,
-                    outcome=outcome,
+                    outcome=outcome if result is None else result.metadata.get("outcome"),
+                    result=result.text if result is not None else None,
+                    is_error=result.is_error if result is not None else False,
+                    metadata=dict(result.metadata) if result is not None else None,
                 ))
 
             async def on_execution_start(prepared: PreparedToolCall) -> None:
@@ -179,7 +183,7 @@ class Agent:
                     is_error=result.is_error,
                     metadata=result.metadata,
                 ))
-                await emit_execution_state(prepared, "completed", outcome=result.metadata.get("outcome"))
+                await emit_execution_state(prepared, "completed", result=result)
 
             async def on_executor_completed(prepared: PreparedToolCall) -> None:
                 completed.add(prepared.tool_call.id)

@@ -210,6 +210,10 @@ function StatusBar({status}: {status: RuntimeStatus | null}): React.ReactNode {
 	if (status) {
 		items.push(`model: ${status.model}`, `session: ${status.session_id?.slice(0, 8) ?? 'none'}`);
 		if (status.workspace) items.push(`workspace: ${status.workspace}`);
+		if (status.recovery.recovered_count) {
+			items.push(`recovery:${status.recovery.recovered_count}`);
+			if (status.recovery.side_effects_unknown_count) items.push(`side-effects?:${status.recovery.side_effects_unknown_count}`);
+		}
 		if (status.terminal_backend) items.push(`terminal: ${status.terminal_backend.kind} (${status.terminal_backend.cwd})`);
 		if (status.web_enabled) items.push('web:on');
 		if (status.skill_count) items.push(`skills:${status.skill_count}`);

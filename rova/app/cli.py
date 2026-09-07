@@ -124,6 +124,7 @@ async def run_rova_cli(
     if callable(start_mcp_discovery):
         start_mcp_discovery()
     _render_permission_mode(args.permission)
+    _render_recovery_report(runtime)
     terminal_backend = getattr(runtime, "terminal_backend", None)
     _subscribe_console_renderer(
         runtime.agent,
@@ -355,6 +356,17 @@ def _render_permission_mode(permission_mode: str) -> None:
     if permission_mode == "full":
         _console_print("Warning: Full mode automatically approves tool operations that require approval.")
         _console_print("Warning: Shell commands are not sandboxed.")
+
+
+def _render_recovery_report(runtime) -> None:
+    report = getattr(runtime, "recovery_report", getattr(runtime.session, "recovery_report", None))
+    if report is None or report.recovered_count == 0:
+        return
+    unknown_count = sum(item.side_effects_unknown for item in report.items)
+    message = f"Session recovery: committed {report.recovered_count} pending tool result(s)."
+    if unknown_count:
+        message += f" {unknown_count} may have unknown side effects; inspect the current state before continuing."
+    _console_print(message)
 
 
 def _max_turns_argument(value: str) -> int:

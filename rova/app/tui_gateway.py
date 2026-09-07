@@ -212,12 +212,19 @@ class TuiGateway:
         runtime = self._runtime()
         terminal_backend = runtime.terminal_backend
         mcp_manager = getattr(runtime, "mcp_manager", None)
+        recovery_report = getattr(runtime, "recovery_report", runtime.session.recovery_report)
         return {
             "model": runtime.agent.model.model,
             "workspace": str(runtime.workspace.root) if runtime.workspace is not None else None,
             "web_enabled": runtime.source_store is not None,
             "permission_mode": self._permission_mode,
             "session_id": runtime.session.session_id,
+            "recovery": {
+                "recovered_count": recovery_report.recovered_count,
+                "side_effects_unknown_count": sum(
+                    item.side_effects_unknown for item in recovery_report.items
+                ),
+            },
             "skill_count": len(runtime.skill_catalog_snapshot.skills),
             "terminal_backend": (
                 None

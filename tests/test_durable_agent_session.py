@@ -116,7 +116,7 @@ async def test_cancelled_tool_execution_closes_the_durable_tool_call_tail(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_resume_with_one_of_multiple_tool_calls_missing_result_blocks_new_provider_run(tmp_path):
+async def test_resume_with_one_of_multiple_tool_calls_missing_result_is_reconciled_before_new_provider_run(tmp_path):
     store = JsonlSessionStore(tmp_path)
     durable = store.create()
     durable.append(UserMessage("two tools"))
@@ -130,10 +130,11 @@ async def test_resume_with_one_of_multiple_tool_calls_missing_result_blocks_new_
     agent = Agent(Model("mock"), "", [make_test_calc_tool()], two_turn_calc_stream)
     resumed = AgentSession.load(agent, durable.session_id, session_root=tmp_path)
 
-    with pytest.raises(SessionIncompleteError, match="incomplete"):
-        await resumed.prompt("continue")
+    result = await resumed.prompt("continue")
 
-    assert agent.messages == durable.messages
+    assert result[-1].text == "2 + 2 = 4"
+    recovered = next(message for message in agent.messages if isinstance(message, ToolResultMessage) and message.tool_call_id == "call-2")
+    assert recovered.metadata["outcome"] == "execution_not_started"
 
 
 @pytest.mark.asyncio
@@ -390,7 +391,7 @@ async def test_provider_exception_releases_prompt_guard_for_later_branch(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_branch_to_incomplete_tool_call_path_blocks_prompt_until_complete_branch_is_selected(tmp_path):
+async def test_branch_to_incomplete_tool_call_path_reconciles_only_that_branch(tmp_path):
     store = JsonlSessionStore(tmp_path)
     durable = store.create()
     root = durable.append(UserMessage("root"))
@@ -409,8 +410,8 @@ async def test_branch_to_incomplete_tool_call_path_blocks_prompt_until_complete_
 
     assert session._durable_session.leaf_id == complete_leaf
     session.branch(incomplete_leaf)
-    with pytest.raises(SessionIncompleteError, match="incomplete"):
-        await session.prompt("do not run")
+    assert any(isinstance(message, ToolResultMessage) and message.tool_call_id == "call-1" for message in session.agent.messages)
+    await session.prompt("continue")
 
     session.branch(complete_leaf)
     await session.prompt("continue")

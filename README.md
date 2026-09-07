@@ -34,7 +34,7 @@ python -m rova --workspace . --web
   支持 Web Search、网页获取，以及用户配置的 STDIO / Streamable HTTP MCP Server。
 
 - 💬 **持久化 Session**  
-  使用 JSONL 保存会话，支持恢复、分支与长上下文压缩。
+  使用 JSONL 保存会话，支持恢复、分支与长上下文压缩。恢复时会补齐未闭合的 ToolCall；Rova 不会自动重试可能已有副作用的 Tool，并会提示先检查当前状态。
 
 - 🧠 **Memory 与 Experience Evolution**
   保存长期信息，并从任务与工具执行轨迹中持续沉淀可复用的 Memory 或 Skill。

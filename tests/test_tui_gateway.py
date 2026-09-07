@@ -9,6 +9,7 @@ from rova.ai.events import TextDelta
 from rova.ai.messages import AssistantMessage, TextBlock, ToolResultMessage, UserMessage
 from rova.ai.models import Model
 from rova.agent_core.events import AgentEvent, AgentTerminationReason
+from rova.agent_session.agent_session import RecoveryItem, RecoveryReport
 from rova.agent_session.session_store import JsonlSessionStore
 from rova.app.workspace.approval import ApprovalDecision, ApprovalRequest
 from rova.app import tui_gateway
@@ -37,18 +38,19 @@ class FakeAgent:
 
 
 class FakeSession:
-    def __init__(self, session_id):
+    def __init__(self, session_id, recovery_report=None):
         self.session_id = session_id
         self.closed = False
+        self.recovery_report = recovery_report or RecoveryReport()
 
     def close(self):
         self.closed = True
 
 
 class FakeRuntime:
-    def __init__(self, session_id, messages=None):
+    def __init__(self, session_id, messages=None, recovery_report=None):
         self.agent = FakeAgent(messages)
-        self.session = FakeSession(session_id)
+        self.session = FakeSession(session_id, recovery_report)
         self.workspace = None
         self.terminal_backend = type("Terminal", (), {
             "environment": type("Environment", (), {
@@ -104,8 +106,37 @@ async def test_gateway_reports_status_and_creates_a_new_runtime(tmp_path):
         "cwd": "C:/workspace",
         "is_filesystem_sandboxed": False,
     }
+    assert status["recovery"] == {
+        "recovered_count": 0,
+        "side_effects_unknown_count": 0,
+    }
     assert next(frame for frame in frames if frame.get("id") == "new")["result"]["session_id"] == "new-session"
     assert any(frame.get("params", {}).get("type") == "session.changed" for frame in frames)
+
+
+@pytest.mark.asyncio
+async def test_gateway_status_exposes_only_desensitized_recovery_summary(tmp_path):
+    frames = []
+    report = RecoveryReport((
+        RecoveryItem("shell", 0, "execution_interrupted", side_effects_unknown=True),
+        RecoveryItem("read_file", 1, "execution_not_started", side_effects_unknown=False),
+    ))
+    gateway = TuiGateway(
+        runtime_factory=lambda session_id, approval_handler: FakeRuntime(
+            session_id or "session-1", recovery_report=report,
+        ),
+        session_store=JsonlSessionStore(tmp_path),
+        emit_frame=frames.append,
+    )
+
+    await gateway.initialize()
+    await gateway.process_line(_request("status", "runtime.status"))
+
+    status = next(frame for frame in frames if frame.get("id") == "status")["result"]
+    assert status["recovery"] == {
+        "recovered_count": 2,
+        "side_effects_unknown_count": 1,
+    }
 
 
 def test_gateway_does_not_render_committed_tool_results_as_assistant_messages(tmp_path):

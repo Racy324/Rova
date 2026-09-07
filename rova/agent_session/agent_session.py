@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from rova.ai.messages import AssistantMessage, Message, ToolResultMessage, UserMessage
+from rova.ai.messages import AssistantMessage, Message, TextBlock, ToolCall, ToolResultMessage, UserMessage
 from rova.ai.context import Context
 from rova.agent_core.agent import Agent
 from rova.agent_core.events import AgentEvent
@@ -29,7 +30,7 @@ from .compaction import (
 )
 from .context_builder import build_session_messages, build_session_projection
 from .events import SessionMaintenanceEvent
-from .execution_journal import ToolExecutionJournal
+from .execution_journal import ExecutionJournalError, JournalRecord, ToolExecutionJournal
 from .session_store import CompactionEntry, DurableSession, JsonlSessionStore, SessionStoreError
 from .summarization import SUMMARIZATION_SYSTEM_PROMPT, SummaryFn, summarize_with_stream
 
@@ -60,6 +61,27 @@ class CompactionHeadroomWarning(CompactionError):
 
 class PreRunContextTooLarge(CompactionError):
     pass
+
+
+class SessionRecoveryError(SessionPersistenceError):
+    pass
+
+
+@dataclass(frozen=True)
+class RecoveryItem:
+    tool_name: str
+    call_index: int
+    outcome: str
+    side_effects_unknown: bool
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    items: tuple[RecoveryItem, ...] = ()
+
+    @property
+    def recovered_count(self) -> int:
+        return len(self.items)
 
 
 _DURABLE_BINDINGS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -94,11 +116,14 @@ class AgentSession:
         self._maintenance_listeners: list[Callable[[SessionMaintenanceEvent], None]] = []
         self._unsubscribe: Callable[[], None] | None = None
         self._execution_journal: ToolExecutionJournal | None = None
+        self._assistant_entry_ids: dict[str, str] = {}
+        self.recovery_report = RecoveryReport()
         if durable_session is not None:
             _ensure_agent_has_no_durable_session(agent)
             self._unsubscribe = self.agent.subscribe(self._on_agent_event)
             _DURABLE_BINDINGS[agent] = weakref.ref(self)
             self._execution_journal = ToolExecutionJournal(durable_session.store.root, durable_session.session_id)
+            self._refresh_assistant_entry_ids()
 
     @classmethod
     def create(
@@ -143,9 +168,6 @@ class AgentSession:
         durable_session = JsonlSessionStore(session_root).load(session_id)
         if leaf_id is not None:
             durable_session.branch(leaf_id)
-        path = durable_session.path_to_leaf()
-        messages = build_session_messages(path)
-        agent.messages[:] = messages
         session = cls(
             agent,
             durable_session,
@@ -154,7 +176,11 @@ class AgentSession:
             summary_fn=summary_fn,
             provider_context_estimator=provider_context_estimator,
         )
-        session._incomplete_tail = _has_incomplete_tool_calls(agent.messages)
+        try:
+            session._reconcile_selected_branch()
+        except Exception:
+            session.close()
+            raise
         return session
 
     @property
@@ -199,12 +225,13 @@ class AgentSession:
             raise SessionBranchError("branch requires a durable session")
         if entry_id not in self._durable_session.by_id:
             raise SessionBranchError(f"unknown branch entry: {entry_id}")
+        previous_leaf_id = self._durable_session.leaf_id
         self._durable_session.branch(entry_id)
-        path = self._durable_session.path_to_leaf()
-        messages = build_session_messages(path)
-        self.agent.messages[:] = messages
-        self.persisted_message_count = len(messages)
-        self._incomplete_tail = _has_incomplete_tool_calls(self.agent.messages)
+        try:
+            self._reconcile_selected_branch()
+        except Exception:
+            self._durable_session.branch(previous_leaf_id) if previous_leaf_id is not None else None
+            raise
 
     async def prompt(self, user_text: str) -> list[AssistantMessage]:
         if self._closed:
@@ -322,8 +349,11 @@ class AgentSession:
         if event.type == "tool_execution_state":
             assert self._execution_journal is not None
             try:
-                self._execution_journal.append(event)
-            except OSError as error:
+                assistant_entry_id = self._assistant_entry_ids.get(event.tool_call_id or "")
+                if assistant_entry_id is None:
+                    raise SessionStoreError("tool execution state has no durable Assistant ToolCall entry")
+                self._execution_journal.append(event, assistant_entry_id=assistant_entry_id)
+            except (OSError, ValueError, SessionStoreError) as error:
                 self._fault(SessionStoreError(f"failed to append execution journal: {error}"))
         if event.type == "message_end":
             self._persist_committed_suffix()
@@ -333,7 +363,10 @@ class AgentSession:
         try:
             while self.persisted_message_count < len(self.agent.messages):
                 message = self.agent.messages[self.persisted_message_count]
-                self._durable_session.append(message)
+                entry_id = self._durable_session.append(message)
+                if isinstance(message, AssistantMessage):
+                    for tool_call in message.tool_calls:
+                        self._assistant_entry_ids[tool_call.id] = entry_id
                 self.persisted_message_count += 1
         except SessionStoreError as error:
             self._fault(error)
@@ -572,6 +605,48 @@ class AgentSession:
     async def _summarize_with_agent_stream(self, request) -> str:
         return await summarize_with_stream(self.agent.model, self.agent.stream_fn, request)
 
+    def _refresh_assistant_entry_ids(self) -> None:
+        if self._durable_session is None:
+            self._assistant_entry_ids = {}
+            return
+        self._assistant_entry_ids = {}
+        for projected in build_session_projection(self._durable_session.path_to_leaf()):
+            if not isinstance(projected.message, AssistantMessage) or projected.source_entry_id is None:
+                continue
+            for tool_call in projected.message.tool_calls:
+                self._assistant_entry_ids[tool_call.id] = projected.source_entry_id
+
+    def _reconcile_selected_branch(self) -> None:
+        """Durably close only unresolved ToolCalls on the selected branch."""
+        assert self._durable_session is not None
+        try:
+            records = self._execution_journal.load() if self._execution_journal is not None else []
+            projection = build_session_projection(self._durable_session.path_to_leaf())
+            pending = _pending_tool_calls(projection)
+            records_by_call = _records_by_call(records, pending)
+            legacy_records = [record for record in records if record.is_legacy]
+            reports: list[RecoveryItem] = []
+            for assistant_entry_id, call_index, call in pending:
+                record = records_by_call.get((assistant_entry_id, call.id, call_index))
+                if record is None:
+                    candidates = [
+                        item for item in legacy_records
+                        if item.tool_call_id == call.id and item.call_index == call_index and item.tool_name == call.name
+                    ]
+                    if candidates:
+                        record = candidates[-1]
+                result, report = _recovery_result(call, record, call_index=call_index)
+                self._durable_session.append(result)
+                reports.append(report)
+            messages = build_session_messages(self._durable_session.path_to_leaf())
+            self.agent.messages[:] = messages
+            self.persisted_message_count = len(messages)
+            self._refresh_assistant_entry_ids()
+            self._incomplete_tail = _has_incomplete_tool_calls(messages)
+            self.recovery_report = RecoveryReport(tuple(reports))
+        except (ExecutionJournalError, SessionStoreError, ValueError) as error:
+            raise SessionRecoveryError(f"could not reconcile interrupted tool calls: {error}") from error
+
     def _summary_token_limit(self) -> int | None:
         if self._compaction_policy is None:
             return self.agent.model.max_tokens
@@ -585,6 +660,84 @@ class AgentSession:
         self._faulted = True
         raise SessionPersistenceError("failed to apply durable compaction") from error
 
+
+def _records_by_call(
+    records: list[JournalRecord],
+    pending: list[tuple[str, int, ToolCall]],
+) -> dict[tuple[str, str, int], JournalRecord]:
+    expected = {
+        (assistant_entry_id, call.id, call_index): call.name
+        for assistant_entry_id, call_index, call in pending
+    }
+    selected_assistant_ids = {assistant_entry_id for assistant_entry_id, _, _ in expected}
+    result: dict[tuple[str, str, int], JournalRecord] = {}
+    for record in records:
+        if record.assistant_entry_id is None:
+            continue
+        key = (record.assistant_entry_id, record.tool_call_id, record.call_index)
+        if record.assistant_entry_id not in selected_assistant_ids:
+            continue
+        expected_tool_name = expected.get(key)
+        if expected_tool_name is None or expected_tool_name != record.tool_name:
+            raise ExecutionJournalError("execution journal record does not match the selected Session ToolCall")
+        result[key] = record
+    return result
+
+
+def _pending_tool_calls(projection) -> list[tuple[str, int, ToolCall]]:
+    pending: list[tuple[str, int, ToolCall]] = []
+    for projected in projection:
+        message = projected.message
+        if isinstance(message, AssistantMessage):
+            if pending:
+                raise SessionStoreError("AssistantMessage appeared before prior ToolCalls were resolved")
+            if projected.source_entry_id is None and message.tool_calls:
+                raise SessionStoreError("Assistant ToolCall has no durable source entry")
+            pending.extend((projected.source_entry_id, index, call) for index, call in enumerate(message.tool_calls))
+            continue
+        if isinstance(message, ToolResultMessage):
+            if not pending:
+                raise SessionStoreError("ToolResultMessage has no preceding unresolved ToolCall")
+            assistant_entry_id, call_index, call = pending[0]
+            if message.tool_call_id != call.id or message.tool_name != call.name:
+                raise SessionStoreError("ToolResultMessage does not match the next unresolved ToolCall")
+            pending.pop(0)
+            continue
+        if pending:
+            raise SessionStoreError("non-tool message appeared before ToolCalls were resolved")
+    return pending
+
+
+def _recovery_result(
+    call: ToolCall,
+    record: JournalRecord | None,
+    *,
+    call_index: int,
+) -> tuple[ToolResultMessage, RecoveryItem]:
+    if record is not None and record.state == "completed" and record.receipt is not None:
+        receipt = record.receipt
+        outcome = str(receipt.metadata.get("outcome", "success"))
+        return (
+            ToolResultMessage(call.id, call.name, [TextBlock(receipt.content)], receipt.is_error, dict(receipt.metadata)),
+            RecoveryItem(call.name, record.call_index, outcome, False),
+        )
+    if record is None:
+        outcome = "execution_not_started"
+        unknown = False
+        text = "The previous tool call was durably recorded, but its executor was never launched. Do not assume any side effects occurred."
+    elif record.state == "cancelled":
+        outcome = "execution_cancelled"
+        unknown = True
+        text = "The previous tool execution was cancelled before a durable result was recorded. Its side effects may have occurred. Inspect the current state before taking a new action."
+    else:
+        outcome = "execution_interrupted"
+        unknown = True
+        text = "The previous tool execution was interrupted before a durable result was recorded. Its side effects may have occurred. Inspect the current state before taking a new action."
+    metadata = {"outcome": outcome, "recovered": True, "side_effects_unknown": unknown}
+    if unknown:
+        metadata["recovery_state"] = "orphaned" if record is None or record.state in {"started", "executor_completed", "completed"} else record.state
+    report_call_index = record.call_index if record is not None else call_index
+    return ToolResultMessage(call.id, call.name, [TextBlock(text)], True, metadata), RecoveryItem(call.name, report_call_index, outcome, unknown)
 
 def _has_incomplete_tool_calls(messages: list[Message]) -> bool:
     pending_tool_call_ids: set[str] = set()

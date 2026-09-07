@@ -11,6 +11,7 @@ from rova.ai.events import StreamDone, TextDelta
 from rova.ai.messages import AssistantMessage, TextBlock
 from rova.ai.models import Model
 from rova.agent_core.events import AgentEvent
+from rova.agent_session.agent_session import RecoveryItem, RecoveryReport
 from rova.app import cli
 from rova.app.cli import _resolve_terminal_settings, _subscribe_console_renderer, _tool_display_lines, parse_rova_cli_args, run_rova_cli
 from rova.app.paths import RovaDataPaths
@@ -73,6 +74,25 @@ def test_unified_cli_parses_explicit_tools_context_and_prompt() -> None:
 def test_unified_cli_defaults_permission_to_ask() -> None:
     assert parse_rova_cli_args([]).permission == "ask"
     assert parse_rova_cli_args([]).data_dir is None
+
+
+def test_cli_renders_only_recovery_counts_and_side_effect_warning(capsys) -> None:
+    runtime = SimpleNamespace(
+        session=SimpleNamespace(
+            recovery_report=RecoveryReport((
+                RecoveryItem("shell", 0, "execution_interrupted", side_effects_unknown=True),
+                RecoveryItem("read_file", 1, "execution_not_started", side_effects_unknown=False),
+            )),
+        ),
+    )
+
+    cli._render_recovery_report(runtime)
+
+    rendered = capsys.readouterr().out
+    assert "Session recovery: committed 2 pending tool result(s)." in rendered
+    assert "1 may have unknown side effects" in rendered
+    assert "shell" not in rendered
+    assert "read_file" not in rendered
 
 
 def test_unified_cli_accepts_mcp_config_and_forwards_it_to_tui() -> None:
