@@ -25,6 +25,7 @@ from .runtime import DEFAULT_MAX_TURNS, MAX_PRODUCT_TURNS, build_rova_runtime
 from .settings import AppSettings
 from .vision import OpenAICompatibleVisionClient, VisionSettings
 from .workspace.terminal import TerminalEnvironment
+from .workspace.sandbox import SandboxError
 
 
 _REPL_EXIT_COMMANDS = frozenset({"exit", "quit", "/q"})
@@ -63,6 +64,13 @@ def _console_print(
 def parse_rova_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the local Rova agent")
     parser.add_argument("--workspace", type=Path, help="enable filesystem and shell tools within this workspace")
+    parser.add_argument(
+        "--environment",
+        choices=("local", "sandbox"),
+        default=None,
+        help="execution environment: local trusted Host workspace or isolated Sandbox",
+    )
+    parser.add_argument("--sandbox-image", help="Docker image for --environment sandbox")
     parser.add_argument(
         "--terminal-backend",
         choices=("local", "docker"),
@@ -125,6 +133,7 @@ async def run_rova_cli(
         start_mcp_discovery()
     _render_permission_mode(args.permission)
     _render_recovery_report(runtime)
+    _render_execution_environment(runtime)
     terminal_backend = getattr(runtime, "terminal_backend", None)
     _subscribe_console_renderer(
         runtime.agent,
@@ -156,7 +165,13 @@ async def run_rova_cli(
             return
         if not normalized_prompt:
             continue
-        await runtime.prompt(prompt)
+        if normalized_prompt.startswith("/sandbox"):
+            runtime = await _run_sandbox_command(runtime, normalized_prompt, args, input_fn)
+            continue
+        try:
+            await runtime.prompt(prompt)
+        except SandboxError as error:
+            _console_print(f"Request blocked: {error}")
 
 
 def _build_runtime_from_args(
@@ -183,7 +198,8 @@ def _build_runtime_from_args(
     memory_root = data_paths.memory if args.data_dir is not None else getattr(app_settings, "memory_root", None) or data_paths.memory
     skill_root = data_paths.skills
     experience_root = data_paths.experience
-    resolved_terminal_backend, resolved_docker_image = _resolve_terminal_settings(args, app_settings)
+    environment_kind, sandbox_image = _resolve_execution_environment(args, app_settings)
+    resolved_terminal_backend = "docker" if environment_kind == "sandbox" else "local"
     runtime = build_rova_runtime(
         model=app_settings.to_model(),
         stream_fn=stream_simple,
@@ -212,7 +228,9 @@ def _build_runtime_from_args(
         experience_root=experience_root,
         vision_client=vision_client,
         terminal_backend=resolved_terminal_backend,
-        docker_image=resolved_docker_image,
+        docker_image=sandbox_image,
+        isolated_sandbox=environment_kind == "sandbox",
+        sandbox_root=data_paths.sandboxes,
         mcp_config_path=(
             getattr(args, "mcp_config", None)
             if getattr(args, "mcp_config", None) is not None
@@ -234,6 +252,34 @@ def _resolve_terminal_settings(args: argparse.Namespace, app_settings: AppSettin
     if args.docker_image is not None:
         raise ValueError("--docker-image requires terminal backend 'docker'")
     return backend, None
+
+
+def _resolve_execution_environment(args: argparse.Namespace, app_settings: AppSettings) -> tuple[str, str | None]:
+    """Resolve the public environment contract without exposing direct-bind Docker."""
+    legacy_backend = getattr(args, "terminal_backend", None)
+    legacy_image = getattr(args, "docker_image", None)
+    if legacy_backend == "docker" or legacy_image is not None:
+        raise ValueError(
+            "The legacy Host-bound Docker terminal is not a public isolation mode; "
+            "use --environment sandbox --sandbox-image IMAGE instead."
+        )
+    configured = getattr(app_settings, "execution_environment", None)
+    if configured is None and getattr(app_settings, "terminal_backend", None) == "docker":
+        raise ValueError(
+            "ROVA_TERMINAL_BACKEND=docker is a legacy Host-bound setting; "
+            "use ROVA_EXECUTION_ENVIRONMENT=sandbox and ROVA_SANDBOX_IMAGE instead."
+        )
+    environment = getattr(args, "environment", None) or configured or "local"
+    image = getattr(args, "sandbox_image", None) or getattr(app_settings, "sandbox_image", None)
+    if environment == "sandbox":
+        if args.workspace is None:
+            raise ValueError("--environment sandbox requires --workspace")
+        if not image:
+            raise ValueError("--environment sandbox requires --sandbox-image or ROVA_SANDBOX_IMAGE")
+        return "sandbox", image
+    if getattr(args, "sandbox_image", None) is not None:
+        raise ValueError("--sandbox-image requires --environment sandbox")
+    return "local", None
 
 
 async def _close_repl_session(runtime) -> None:
@@ -358,6 +404,87 @@ def _render_permission_mode(permission_mode: str) -> None:
         _console_print("Warning: Shell commands are not sandboxed.")
 
 
+def _render_execution_environment(runtime) -> None:
+    control = getattr(runtime, "sandbox_control", None)
+    if control is None:
+        if runtime.workspace is not None:
+            _console_print("Environment: Local (trusted Host). File and shell tools modify the Host Workspace directly.")
+        return
+    status = control.status()
+    _console_print(
+        f"Environment: Sandbox (isolated) | state: {status.sandbox_state.value} | id: {status.sandbox_id}. "
+        "Host Workspace remains unchanged until explicit Apply."
+    )
+    if status.container_recreated_on_resume:
+        _console_print("Sandbox files were preserved; the execution container was recreated, so container-local state may need recreation.")
+
+
+async def _run_sandbox_command(runtime, command: str, args: argparse.Namespace, input_fn: Callable[[str], str]):
+    """REPL control-plane commands; deliberately separate from Agent tools."""
+    control = getattr(runtime, "sandbox_control", None)
+    action = command.removeprefix("/sandbox").strip().lower() or "status"
+    if control is None:
+        _console_print("Sandbox controls are unavailable in Local mode. Local mode modifies the Host Workspace directly.")
+        return runtime
+    if action == "status":
+        status = control.status()
+        _console_print(
+            f"Environment: Sandbox (isolated) | state: {status.sandbox_state.value} | "
+            f"id: {status.sandbox_id} | changed paths: {status.changed_path_count if status.changed_path_count is not None else 'unavailable'}"
+        )
+        return runtime
+    if action == "diff":
+        changed = control.diff()
+        _console_print(f"Sandbox diff: {len(changed.changes)} changed path(s)")
+        for item in changed.changes:
+            _console_print(f"- {item.kind.value}: {item.path}")
+        return runtime
+    if action == "apply":
+        plan = control.apply_plan()
+        if plan.conflicts:
+            _console_print("Apply blocked: Host Workspace changed since the Sandbox baseline.")
+            for conflict in plan.conflicts:
+                _console_print(f"- {conflict.path}: {conflict.reason}")
+            return runtime
+        if input_fn(f"Apply {len(plan.changed_set.changes)} Sandbox change(s) to the Host Workspace? [y/N] ").strip().lower() != "y":
+            _console_print("Apply cancelled. Host Workspace was not modified.")
+            return runtime
+        report = control.apply(confirm=lambda _plan: True)
+        _console_print("Host changes applied successfully." if report.applied else f"Apply did not complete: {report.error or report.state}")
+        return runtime
+    if action == "discard":
+        changed = control.diff()
+        if input_fn(f"Discard {len(changed.changes)} Sandbox change(s)? Host Workspace remains unchanged. [y/N] ").strip().lower() != "y":
+            _console_print("Discard cancelled.")
+            return runtime
+        report = control.discard(confirm=lambda _plan: True)
+        _console_print("Sandbox changes were discarded. Host Workspace was not modified." if report.discarded else f"Discard did not complete: {report.error or report.state.value}")
+        return runtime
+    if action == "restore":
+        operation_id = control.metadata().active_apply_id
+        if not operation_id:
+            _console_print("No unfinished Apply requires preimage recovery.")
+            return runtime
+        if input_fn("Restore Host preimages touched by the unfinished Apply? [y/N] ").strip().lower() != "y":
+            _console_print("Recovery cancelled.")
+            return runtime
+        report = control.restore_preimages(operation_id, confirm=lambda _report: True)
+        _console_print(f"Apply recovery state: {report.state.value if report.state else 'unknown'}")
+        return runtime
+    if action == "new":
+        if input_fn("Create a new Sandbox baseline from the current Host Workspace? [y/N] ").strip().lower() != "y":
+            _console_print("New Sandbox creation cancelled.")
+            return runtime
+        metadata = control.create_new()
+        session_id = runtime.session.session_id
+        await runtime.close()
+        replacement = _build_runtime_from_args(args, session_id=session_id)
+        _console_print(f"Sandbox created ({metadata.sandbox_id[:8]}). Host Workspace remains unchanged until explicit Apply.")
+        return replacement
+    _console_print("Sandbox commands: /sandbox status | diff | apply | discard | restore | new")
+    return runtime
+
+
 def _render_recovery_report(runtime) -> None:
     report = getattr(runtime, "recovery_report", getattr(runtime.session, "recovery_report", None))
     if report is None or report.recovered_count == 0:
@@ -445,6 +572,10 @@ def _tui_gateway_argv(args: argparse.Namespace) -> list[str]:
     argv: list[str] = []
     if args.workspace is not None:
         argv.extend(["--workspace", str(args.workspace)])
+    if getattr(args, "environment", None) is not None:
+        argv.extend(["--environment", args.environment])
+    if getattr(args, "sandbox_image", None) is not None:
+        argv.extend(["--sandbox-image", args.sandbox_image])
     if args.terminal_backend is not None:
         argv.extend(["--terminal-backend", args.terminal_backend])
     if args.docker_image is not None:

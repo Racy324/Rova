@@ -373,3 +373,37 @@ cd ui-tui
 pnpm typecheck
 pnpm build
 ```
+
+---
+
+## 隔离 Sandbox 工作流
+
+Rova 有两种不同的执行环境：
+
+- **Local（可信 Host）**：文件工具和 Shell 直接操作 Host Workspace。Policy 与逐次 Approval 不等同于文件系统隔离。
+- **Sandbox（隔离）**：内置编码工具只操作 Rova 管理的 Sandbox；Shell 只在挂载该 Sandbox 的 Docker 容器中运行。Host 项目在显式 Apply 前保持不变。
+
+```bash
+python -m rova --workspace . --environment sandbox --sandbox-image python:3.12-slim
+```
+
+也可以在 `.env` 设置默认选择：
+
+```dotenv
+ROVA_EXECUTION_ENVIRONMENT=sandbox
+ROVA_SANDBOX_IMAGE=python:3.12-slim
+```
+
+```text
+Host Workspace → Sandbox baseline B0 → Agent 编码/测试 → ChangedSet
+                                                        ├─ Apply → 修改 Host
+                                                        └─ Discard → Host 不变
+```
+
+CLI 使用 `/sandbox status`、`/sandbox diff`、`/sandbox apply`、`/sandbox discard`、`/sandbox restore` 和 `/sandbox new`。Apply、Discard 与 Apply preimage restore 都需要独立确认；`--permission full` 不会跳过它们。TUI 状态栏持续显示环境，并提供相同的控制。
+
+Sandbox 创建时捕获 Host 当前文件树为不可变 B0；退出后 Sandbox 文件保留，同一 Session 恢复时继续使用原 B0。容器会重新创建，因此容器内安装的包、进程、`/tmp` 和可写层状态不保证保留。Sandbox 的私有 Git 仅用于基线和 diff，不包含 Host Git 历史或远程仓库。
+
+Sandbox 默认关闭网络，不自动继承 Host 环境变量、挂载 Host secrets 或暴露 Docker socket。这是 Host Workspace 隔离边界，不是对受信任 Extension、MCP 外部副作用或 Docker 本身的绝对安全承诺。
+
+旧的 `--terminal-backend docker` / `ROVA_TERMINAL_BACKEND=docker` Host 直接挂载入口不再是公开隔离模式；请使用 `--environment sandbox` / `ROVA_EXECUTION_ENVIRONMENT=sandbox`。

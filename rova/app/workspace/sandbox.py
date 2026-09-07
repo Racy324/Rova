@@ -249,6 +249,33 @@ class SandboxStore:
             raise
         return metadata
 
+    def create_new_for_terminal_session(self, host_workspace: Workspace, session_id: str) -> SandboxMetadata:
+        """Explicitly create a new B0 after this Session's prior Sandbox ended.
+
+        This is intentionally not used by Runtime startup: replacing a baseline
+        must be a user control-plane decision.
+        """
+        workspace_id = workspace_identity(host_workspace.root)
+        pointer = self._session_pointer_path(session_id)
+        if not pointer.exists():
+            raise SandboxConflictError("Session has no terminal Sandbox to replace")
+        previous_value = self._read_json(pointer)
+        previous_id = previous_value.get("sandbox_id")
+        if not isinstance(previous_id, str) or previous_value.get("workspace_id") != workspace_id:
+            raise SandboxConflictError("Session Sandbox belongs to a different Host Workspace")
+        previous = self.load_for_execution(previous_id)
+        if previous.state not in {SandboxState.APPLIED, SandboxState.DISCARDED, SandboxState.FAILED, SandboxState.ABANDONED}:
+            raise SandboxConflictError("Apply or Discard the active Sandbox before creating a new one")
+        self._release_workspace_reservation(workspace_id, previous_id)
+        created = self.create_unbound(host_workspace)
+        try:
+            imported = self.import_baseline(created.sandbox_id)
+            self.bind_session(imported.sandbox_id, session_id)
+            return self.mark_ready(imported.sandbox_id)
+        except Exception:
+            self._release_workspace_reservation(workspace_id, created.sandbox_id)
+            raise
+
     def bind_session(self, sandbox_id: str, session_id: str) -> SandboxMetadata:
         if not isinstance(session_id, str) or not session_id:
             raise SandboxError("session_id must be a non-empty string")
@@ -259,7 +286,12 @@ class SandboxStore:
         if pointer.exists():
             existing = self._read_json(pointer)
             if existing.get("sandbox_id") != sandbox_id:
-                raise SandboxConflictError("Session already has an active Sandbox")
+                old_id = existing.get("sandbox_id")
+                if not isinstance(old_id, str):
+                    raise SandboxConflictError("Session Sandbox pointer is invalid")
+                old = self.load_for_execution(old_id)
+                if old.state not in {SandboxState.APPLIED, SandboxState.DISCARDED, SandboxState.FAILED, SandboxState.ABANDONED}:
+                    raise SandboxConflictError("Session already has an active Sandbox")
         bound = replace(metadata, session_id=session_id, updated_at=_utc_now())
         self._write_metadata(bound)
         self._write_json(pointer, {"version": 1, "sandbox_id": sandbox_id, "workspace_id": bound.workspace_id})

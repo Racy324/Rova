@@ -18,6 +18,7 @@ from rova.agent_core.events import AgentEvent
 from rova.agent_session.session_store import JsonlSessionStore
 
 from .workspace.approval import ApprovalDecision, ApprovalHandler, ApprovalRequest
+from .workspace.sandbox import ApplyPlan, ChangedSet
 from .runtime import RovaRuntime
 from .settings import AppSettings
 
@@ -136,6 +137,46 @@ class TuiGateway:
                 raise _GatewayRequestError(-32000, "no prompt is active")
             self._prompt_task.cancel()
             return {"cancelled": True}
+        if method == "sandbox.status":
+            return self._sandbox_status()
+        if method == "sandbox.diff":
+            return _changed_set_payload(self._sandbox_control().diff())
+        if method == "sandbox.apply":
+            control = self._sandbox_control()
+            plan = control.apply_plan()
+            if not params.get("confirm", False):
+                return {"applied": False, "confirmation_required": True, "plan": _apply_plan_payload(plan)}
+            report = control.apply(confirm=lambda _plan: True)
+            return _apply_report_payload(report)
+        if method == "sandbox.discard":
+            control = self._sandbox_control()
+            if not params.get("confirm", False):
+                return {"discarded": False, "confirmation_required": True, "changed_path_count": len(control.diff().changes)}
+            report = control.discard(confirm=lambda _plan: True)
+            return {
+                "discarded": report.discarded,
+                "state": report.state.value,
+                "changed_path_count": report.plan.changed_path_count if report.plan is not None else None,
+                "error": report.error,
+            }
+        if method == "sandbox.restore_preimages":
+            operation_id = params.get("operation_id")
+            if operation_id is None:
+                operation_id = self._sandbox_control().metadata().active_apply_id
+            if not isinstance(operation_id, str) or not operation_id:
+                raise _GatewayRequestError(-32005, "there is no unfinished Apply to repair")
+            if not params.get("confirm", False):
+                return {"restored": False, "confirmation_required": True, "operation_id": operation_id}
+            report = self._sandbox_control().restore_preimages(operation_id, confirm=lambda _report: True)
+            return _apply_report_payload(report)
+        if method == "sandbox.create":
+            self._ensure_idle()
+            control = self._sandbox_control()
+            if not params.get("confirm", False):
+                return {"created": False, "confirmation_required": True}
+            metadata = control.create_new()
+            await self._replace_runtime(self._runtime().session.session_id)
+            return {"created": True, "sandbox_id": metadata.sandbox_id[:8], "status": self._status()}
         if method == "session.list":
             limit = params.get("limit")
             if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
@@ -208,6 +249,27 @@ class TuiGateway:
             raise _GatewayRequestError(-32002, "runtime is not initialized")
         return self.runtime
 
+    def _sandbox_control(self):
+        control = getattr(self._runtime(), "sandbox_control", None)
+        if control is None:
+            raise _GatewayRequestError(-32005, "this Runtime is not using an isolated Sandbox")
+        return control
+
+    def _sandbox_status(self) -> dict[str, Any] | None:
+        control = getattr(self._runtime(), "sandbox_control", None)
+        if control is None:
+            return None
+        status = control.status()
+        return {
+            "environment_kind": status.environment_kind,
+            "state": status.sandbox_state.value,
+            "sandbox_id": status.sandbox_id,
+            "changed_path_count": status.changed_path_count,
+            "apply_recovery_required": status.apply_recovery_required,
+            "host_isolation_active": status.host_isolation_active,
+            "container_recreated_on_resume": status.container_recreated_on_resume,
+        }
+
     def _status(self) -> dict[str, Any]:
         runtime = self._runtime()
         terminal_backend = runtime.terminal_backend
@@ -236,6 +298,7 @@ class TuiGateway:
                     "is_filesystem_sandboxed": terminal_backend.environment.is_filesystem_sandboxed,
                 }
             ),
+            "sandbox": self._sandbox_status(),
             "mcp": (
                 None
                 if mcp_manager is None
@@ -338,6 +401,34 @@ def _transcript(messages: list[Any]) -> list[dict[str, Any]]:
 def _preview(value: str, *, max_length: int = 240) -> str:
     normalized = " ".join(value.split())
     return normalized if len(normalized) <= max_length else f"{normalized[:max_length - 1]}…"
+
+
+def _changed_set_payload(changed: ChangedSet) -> dict[str, Any]:
+    return {
+        "sandbox_id": changed.sandbox_id[:8],
+        "summary": asdict(changed.summary),
+        "changes": [{"path": item.path, "kind": item.kind.value} for item in changed.changes],
+    }
+
+
+def _apply_plan_payload(plan: ApplyPlan) -> dict[str, Any]:
+    return {
+        "sandbox_id": plan.sandbox_id[:8],
+        "changed": _changed_set_payload(plan.changed_set),
+        "conflicts": [{"path": item.path, "reason": item.reason} for item in plan.conflicts],
+    }
+
+
+def _apply_report_payload(report) -> dict[str, Any]:
+    return {
+        "sandbox_id": report.sandbox_id[:8],
+        "state": report.state.value if report.state is not None else None,
+        "applied": report.applied,
+        "confirmed": report.confirmed,
+        "operation_id": report.operation_id,
+        "conflicts": [{"path": item.path, "reason": item.reason} for item in report.conflicts],
+        "error": report.error,
+    }
 
 
 def _safe_error_message(error: Exception) -> str:

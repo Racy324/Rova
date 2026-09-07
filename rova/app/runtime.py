@@ -32,6 +32,7 @@ from .workspace.environment import DockerSandboxEnvironment, ExecutionEnvironmen
 from .workspace.instructions import WorkspaceInstructionSnapshot, load_workspace_instruction
 from .workspace.policy import DefaultRovaToolPolicy, ToolPolicy
 from .workspace.sandbox import SandboxError, SandboxState, SandboxStore, workspace_identity
+from .workspace.sandbox_control import SandboxControl
 from .workspace.terminal import DockerTerminalBackend, LocalTerminalBackend, TerminalBackend
 from .workspace.workspace import Workspace
 from .memory import (
@@ -90,6 +91,8 @@ class RovaRuntime:
     extension_load_report: ExtensionLoadReport
     mcp_manager: MCPManager | None
     trace_store: TraceStore
+    sandbox_control: SandboxControl | None = None
+    sandbox_unavailable_state: SandboxState | None = None
 
     def __post_init__(self) -> None:
         self._memory_listeners: list[Callable[[MemoryObservation], None]] = []
@@ -145,6 +148,17 @@ class RovaRuntime:
                 self.session.close()
 
     async def prompt(self, text: str):
+        if self.sandbox_unavailable_state is not None:
+            raise SandboxError(
+                f"Sandbox is unavailable in state {self.sandbox_unavailable_state.value}; "
+                "coding is blocked until the user explicitly creates a new Sandbox"
+            )
+        if self.sandbox_control is not None:
+            state = self.sandbox_control.metadata().state
+            if state is not SandboxState.READY:
+                raise SandboxError(
+                    f"Sandbox is in state {state.value}; coding is blocked until the user explicitly creates a new Sandbox"
+                )
         self.start_mcp_discovery()
         if self.experience_review_service is not None:
             self.experience_review_service.begin_run(text)
@@ -460,11 +474,17 @@ def build_rova_runtime(
         assert session.session_id is not None
         pending_sandbox_store.bind_session(pending_sandbox_id, session.session_id)
         pending_sandbox_store.mark_ready(pending_sandbox_id)
-    if unavailable_sandbox is not None:
-        session.close()
-        raise SandboxError(
-            f"Sandbox is unavailable in state {unavailable_sandbox.value}; create a new Sandbox explicitly"
+    sandbox_control = (
+        SandboxControl(
+            active_sandbox_store,
+            workspace,
+            session.session_id or "",
+            active_sandbox_id,
+            container_recreated_on_resume=sandbox_resumed,
         )
+        if active_sandbox_store is not None and active_sandbox_id is not None and workspace is not None
+        else None
+    )
 
     async def prepare_runtime_context(base_context: Context) -> Context:
         provider_context = _assemble_runtime_context(
@@ -535,6 +555,8 @@ def build_rova_runtime(
         extension_load_report=extension_load_report,
         mcp_manager=mcp_manager,
         trace_store=trace_store,
+        sandbox_control=sandbox_control,
+        sandbox_unavailable_state=unavailable_sandbox,
     )
 
 
@@ -693,7 +715,9 @@ def _runtime_facts_section(
                 f"- Shell executor: {terminal_backend.environment.executor}",
                 "- Workspace shell cwd: /workspace",
                 "- Logical workspace: /workspace (use relative paths with workspace-aware tools)",
-                "- Host workspace is isolated from Docker Sandbox tool changes in this Runtime.",
+                "- You are working in an isolated Sandbox; ordinary workspace tools cannot modify the Host Workspace.",
+                "- Applying or discarding Sandbox changes is a user control-plane action, not an available tool.",
+                "- This Sandbox has private Git baseline metadata only; it has no Host Git history or remotes.",
             ])
             if execution_environment.descriptor.resume_note:
                 lines.append(f"- Sandbox environment: {execution_environment.descriptor.resume_note}")
@@ -721,7 +745,7 @@ def _sandbox_branch_guard(store: SandboxStore, sandbox_id: str) -> Callable[[], 
     def guard() -> str | None:
         metadata = store._load_metadata(sandbox_id)
         if metadata.state is SandboxState.READY:
-            return "cannot branch while an active Sandbox owns the mutable workspace"
+            return "Current conversation has an active mutable Sandbox. Apply or Discard it before switching branches."
         return None
 
     return guard

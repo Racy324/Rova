@@ -160,6 +160,20 @@ def test_unified_cli_accepts_tui_without_changing_standard_options() -> None:
     assert args.web is True
 
 
+def test_public_environment_settings_prefer_explicit_sandbox_over_persistent_default() -> None:
+    settings = SimpleNamespace(execution_environment="local", sandbox_image="config:image")
+    args = parse_rova_cli_args(["--workspace", "project", "--environment", "sandbox", "--sandbox-image", "cli:image"])
+
+    assert cli._resolve_execution_environment(args, settings) == ("sandbox", "cli:image")
+
+
+def test_legacy_host_bound_docker_cli_is_rejected_with_a_sandbox_migration_message() -> None:
+    args = parse_rova_cli_args(["--workspace", "project", "--terminal-backend", "docker", "--docker-image", "old:image"])
+
+    with pytest.raises(ValueError, match="--environment sandbox"):
+        cli._resolve_execution_environment(args, SimpleNamespace(execution_environment=None, sandbox_image=None))
+
+
 def test_tui_terminal_support_requires_real_input_and_output_ttys(monkeypatch) -> None:
     class Stream:
         def __init__(self, is_tty: bool) -> None:

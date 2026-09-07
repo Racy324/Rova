@@ -31,6 +31,8 @@ class AppSettings:
     data_dir: Path | None = None
     terminal_backend: str | None = None
     docker_image: str | None = None
+    execution_environment: str | None = None
+    sandbox_image: str | None = None
     mcp_config_path: Path | None = None
     provider_timeout: float = 60.0
 
@@ -56,6 +58,9 @@ class AppSettings:
         terminal_backend = source.get("ROVA_TERMINAL_BACKEND", "").strip().lower() or None
         if terminal_backend not in {None, "local", "docker"}:
             raise ValueError("ROVA_TERMINAL_BACKEND must be 'local' or 'docker'")
+        execution_environment = source.get("ROVA_EXECUTION_ENVIRONMENT", "").strip().lower() or None
+        if execution_environment not in {None, "local", "sandbox"}:
+            raise ValueError("ROVA_EXECUTION_ENVIRONMENT must be 'local' or 'sandbox'")
         provider_timeout = _parse_positive_float(source.get("ROVA_PROVIDER_TIMEOUT"), "ROVA_PROVIDER_TIMEOUT", default=60.0)
         return cls(
             provider=source.get("ROVA_PROVIDER", "mock"),
@@ -81,6 +86,8 @@ class AppSettings:
             data_dir=Path(data_dir).expanduser() if data_dir else None,
             terminal_backend=terminal_backend,
             docker_image=source.get("ROVA_DOCKER_IMAGE") or None,
+            execution_environment=execution_environment,
+            sandbox_image=source.get("ROVA_SANDBOX_IMAGE") or None,
             mcp_config_path=(Path(source["ROVA_MCP_CONFIG"]).expanduser() if source.get("ROVA_MCP_CONFIG") else None),
             provider_timeout=provider_timeout,
         )

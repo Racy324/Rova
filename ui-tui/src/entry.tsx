@@ -7,6 +7,7 @@ import {Markdown} from './markdown.js';
 import {TUI_RENDER_OPTIONS} from './tui_render_options.js';
 
 type Approval = {requestId: string; toolName: string; summary: string; policyReason: string; command?: string; path?: string; cwd?: string};
+type SandboxConfirmation = {kind: 'apply' | 'discard' | 'restore' | 'create'; text: string};
 
 function value(payload: Record<string, unknown>, key: string): string {
 	return typeof payload[key] === 'string' ? payload[key] : '';
@@ -24,6 +25,7 @@ function App(): React.ReactNode {
 	const [notice, setNotice] = useState('');
 	const [busy, setBusy] = useState(false);
 	const [cancelling, setCancelling] = useState(false);
+	const [sandboxConfirmation, setSandboxConfirmation] = useState<SandboxConfirmation | null>(null);
 
 	useEffect(() => {
 		const unsubscribe = client.onEvent(event => handleEvent(event));
@@ -174,18 +176,58 @@ function App(): React.ReactNode {
 		exit();
 	}
 
+	async function sandboxAction(kind: SandboxConfirmation['kind'] | 'diff'): Promise<void> {
+		if (busy || !status?.sandbox) return;
+		try {
+			if (kind === 'diff') {
+				const result = await client.request<{changes: {path: string; kind: string}[]}>('sandbox.diff');
+				setNotice(`Sandbox diff: ${result.changes.length} path(s) — ${result.changes.map(change => `${change.kind}:${change.path}`).join(', ') || 'no changes'}`);
+				return;
+			}
+			if (kind === 'apply') {
+				const result = await client.request<{plan: {changed: {changes: unknown[]}; conflicts: {path: string}[]}}>('sandbox.apply');
+				setSandboxConfirmation({kind, text: result.plan.conflicts.length ? `Apply is blocked by Host drift: ${result.plan.conflicts.map(item => item.path).join(', ')}` : `Apply ${result.plan.changed.changes.length} Sandbox change(s) to the Host Workspace?`});
+				return;
+			}
+			if (kind === 'discard') {
+				const result = await client.request<{changed_path_count: number}>('sandbox.discard');
+				setSandboxConfirmation({kind, text: `Discard ${result.changed_path_count} Sandbox working change(s)? The Host Workspace remains unchanged.`});
+				return;
+			}
+			setSandboxConfirmation({kind, text: kind === 'restore' ? 'Restore Host preimages for the interrupted Apply? Later Host edits will not be overwritten.' : 'Create a new Sandbox baseline from the current Host Workspace?'});
+		} catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
+	}
+
+	async function confirmSandboxAction(): Promise<void> {
+		if (!sandboxConfirmation) return;
+		const kind = sandboxConfirmation.kind;
+		try {
+			const method = kind === 'restore' ? 'sandbox.restore_preimages' : `sandbox.${kind}`;
+			const result = await client.request<Record<string, unknown>>(method, {confirm: true});
+			setNotice(kind === 'apply' ? (result.applied ? 'Host changes applied. Create a new Sandbox before further coding.' : 'Apply was not completed; inspect Host drift or recovery status.') : kind === 'discard' ? 'Sandbox changes discarded. Host Workspace was not modified.' : kind === 'restore' ? 'Apply preimage recovery completed or requires review.' : 'New Sandbox created from current Host state.');
+			if (result.status && typeof result.status === 'object') setStatus(result.status as RuntimeStatus);
+			else setStatus(await client.request<RuntimeStatus>('runtime.status'));
+		} catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
+		finally { setSandboxConfirmation(null); }
+	}
+
 	useInput((input, key) => {
 		if (busy && key.ctrl && input === 'c') {
 			void cancelCurrentTurn();
 			return;
 		}
-		if (approval || sessions) return;
+		if (approval || sessions || sandboxConfirmation) return;
 		if (busy && key.escape) {
 			void cancelCurrentTurn();
 			return;
 		}
 		if (key.ctrl && input === 'n') void newSession();
 		else if (key.ctrl && input === 'r') void openSessions();
+		else if (key.ctrl && input === 'i') void sandboxAction('diff');
+		else if (key.ctrl && input === 'a') void sandboxAction('apply');
+		else if (key.ctrl && input === 'd') void sandboxAction('discard');
+		else if (key.ctrl && input === 'p') void sandboxAction('restore');
+		else if (key.ctrl && input === 'g') void sandboxAction('create');
 		else if (key.ctrl && input === 'c') void close();
 	});
 
@@ -199,9 +241,10 @@ function App(): React.ReactNode {
 			{notice ? <Text color="yellow">{notice}</Text> : null}
 		</Box>
 		<Composer busy={busy} onSubmit={submit}/>
-		<Text dimColor>{busy ? 'Esc / Ctrl+C cancel current turn' : 'Ctrl+N new session · Ctrl+R sessions · Ctrl+C exit when idle'}</Text>
+		<Text dimColor>{busy ? 'Esc / Ctrl+C cancel current turn' : 'Ctrl+N new session · Ctrl+R sessions · Ctrl+I diff · Ctrl+A apply · Ctrl+D discard · Ctrl+G new Sandbox · Ctrl+C exit'}</Text>
 		{approval ? <ApprovalModal approval={approval} onDecision={chooseApproval} onCancel={cancelCurrentTurn}/> : null}
 		{sessions ? <SessionPicker sessions={sessions} onResume={resume} onClose={() => setSessions(null)}/> : null}
+		{sandboxConfirmation ? <SandboxConfirmationModal confirmation={sandboxConfirmation} onConfirm={confirmSandboxAction} onCancel={() => setSandboxConfirmation(null)}/> : null}
 	</Box>;
 }
 
@@ -209,12 +252,14 @@ function StatusBar({status}: {status: RuntimeStatus | null}): React.ReactNode {
 	const items = ['Rova'];
 	if (status) {
 		items.push(`model: ${status.model}`, `session: ${status.session_id?.slice(0, 8) ?? 'none'}`);
-		if (status.workspace) items.push(`workspace: ${status.workspace}`);
+		if (status.sandbox) {
+			items.push('environment: Sandbox (isolated)', `sandbox: ${status.sandbox.state}/${status.sandbox.sandbox_id}`, `changes:${status.sandbox.changed_path_count ?? '?'}`);
+		} else if (status.workspace) items.push('environment: Local (trusted Host)', `workspace: ${status.workspace}`);
 		if (status.recovery.recovered_count) {
 			items.push(`recovery:${status.recovery.recovered_count}`);
 			if (status.recovery.side_effects_unknown_count) items.push(`side-effects?:${status.recovery.side_effects_unknown_count}`);
 		}
-		if (status.terminal_backend) items.push(`terminal: ${status.terminal_backend.kind} (${status.terminal_backend.cwd})`);
+		if (status.terminal_backend && !status.sandbox) items.push(`terminal: ${status.terminal_backend.kind} (${status.terminal_backend.cwd})`);
 		if (status.web_enabled) items.push('web:on');
 		if (status.skill_count) items.push(`skills:${status.skill_count}`);
 		if (status.mcp) {
@@ -273,6 +318,18 @@ function ApprovalModal({approval, onDecision, onCancel}: {approval: Approval; on
 		<Text>Reason: {approval.policyReason}</Text>
 		{approval.toolName === 'shell' ? <Text color="yellow">Shell commands are not sandboxed and may access external resources.</Text> : null}
 		<Text>[Y] Allow  [N] Deny  [Esc] Cancel turn</Text>
+	</Box>;
+}
+
+function SandboxConfirmationModal({confirmation, onConfirm, onCancel}: {confirmation: SandboxConfirmation; onConfirm: () => Promise<void>; onCancel: () => void}): React.ReactNode {
+	useInput((input, key) => {
+		if (input.toLowerCase() === 'y') void onConfirm();
+		else if (input.toLowerCase() === 'n' || key.escape) onCancel();
+	});
+	return <Box borderStyle="double" borderColor="yellow" flexDirection="column" paddingX={1} marginTop={1}>
+		<Text bold color="yellow">Sandbox {confirmation.kind}</Text>
+		<Text>{confirmation.text}</Text>
+		<Text>[Y] Confirm  [N/Esc] Cancel</Text>
 	</Box>;
 }
 

@@ -22,6 +22,15 @@ export type RuntimeStatus = {
 		server_states: Record<string, string>;
 		issue_count: number;
 	} | null;
+	sandbox: {
+		environment_kind: 'sandbox';
+		state: string;
+		sandbox_id: string;
+		changed_path_count: number | null;
+		apply_recovery_required: boolean;
+		host_isolation_active: boolean;
+		container_recreated_on_resume: boolean;
+	} | null;
 };
 
 export type SessionSummary = {

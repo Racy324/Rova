@@ -220,7 +220,8 @@ async def test_sandbox_runtime_keeps_coding_tool_schemas_and_runtime_facts_logic
     await sandbox.close()
 
 
-def test_corrupt_resumed_sandbox_fails_closed_without_a_host_workspace_fallback(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_corrupt_resumed_sandbox_fails_closed_without_a_host_workspace_fallback(monkeypatch, tmp_path: Path) -> None:
     host_root = tmp_path / "host-project"
     host_root.mkdir()
     monkeypatch.setattr(runtime_module, "DockerSandboxEnvironment", _LocalDockerSandboxEnvironment, raising=False)
@@ -238,8 +239,7 @@ def test_corrupt_resumed_sandbox_fails_closed_without_a_host_workspace_fallback(
     assert initial.execution_environment is not None
     shutil.rmtree(initial.execution_environment.filesystem.resolve("."), onerror=_clear_readonly)
 
-    with pytest.raises(Exception, match="Sandbox is unavailable"):
-        build_rova_runtime(
+    resumed = build_rova_runtime(
             model=Model(provider="mock"),
             stream_fn=_stream_done,
             workspace_root=host_root,
@@ -251,9 +251,13 @@ def test_corrupt_resumed_sandbox_fails_closed_without_a_host_workspace_fallback(
             session_root=tmp_path / "sessions",
             artifact_root=tmp_path / "artifacts",
         )
+    assert resumed.sandbox_unavailable_state is not None
+    with pytest.raises(Exception, match="Sandbox is unavailable"):
+        await resumed.prompt("continue")
 
 
-def test_lost_sandbox_closes_an_interrupted_tool_protocol_before_failing_closed(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_lost_sandbox_closes_an_interrupted_tool_protocol_before_failing_closed(monkeypatch, tmp_path: Path) -> None:
     host_root = tmp_path / "host-project"
     host_root.mkdir()
     monkeypatch.setattr(runtime_module, "DockerSandboxEnvironment", _LocalDockerSandboxEnvironment, raising=False)
@@ -278,13 +282,14 @@ def test_lost_sandbox_closes_an_interrupted_tool_protocol_before_failing_closed(
     )
     shutil.rmtree(initial.execution_environment.filesystem.resolve("."), onerror=_clear_readonly)
 
-    with pytest.raises(Exception, match="Sandbox is unavailable"):
-        build_rova_runtime(
+    resumed = build_rova_runtime(
             model=Model(provider="mock"), stream_fn=_stream_done, workspace_root=host_root,
             terminal_backend="docker", docker_image="rova-test:latest", isolated_sandbox=True,
             sandbox_root=tmp_path / "rova-data" / "sandboxes", session_id=durable.session_id,
             session_root=tmp_path / "sessions", artifact_root=tmp_path / "artifacts",
         )
+    with pytest.raises(Exception, match="Sandbox is unavailable"):
+        await resumed.prompt("continue")
 
     restored = JsonlSessionStore(tmp_path / "sessions").load(durable.session_id)
     result = next(message for message in restored.messages if isinstance(message, ToolResultMessage))
@@ -357,7 +362,7 @@ async def test_ready_sandbox_blocks_branch_switch_but_terminal_state_allows_it(m
     )
     await runtime.session.prompt("first")
     root_entry = runtime.session._durable_session.entries[0].entry_id
-    with pytest.raises(SessionBranchError, match="active Sandbox"):
+    with pytest.raises(SessionBranchError, match="Apply or Discard"):
         runtime.session.branch(root_entry)
 
     store = SandboxStore(tmp_path / "rova-data" / "sandboxes")
@@ -388,13 +393,13 @@ def test_non_ready_sandbox_cannot_resume_coding(monkeypatch, tmp_path: Path, ter
     assert metadata is not None
     store._write_metadata(replace(metadata, state=SandboxState(terminal_state)))
 
-    with pytest.raises(Exception, match=f"state {terminal_state}"):
-        build_rova_runtime(
+    resumed = build_rova_runtime(
             model=Model(provider="mock"), stream_fn=_stream_done, workspace_root=host_root,
             terminal_backend="docker", docker_image="rova-test:latest", isolated_sandbox=True,
             sandbox_root=tmp_path / "rova-data" / "sandboxes", session_id=session_id,
             session_root=tmp_path / "sessions", artifact_root=tmp_path / "artifacts",
         )
+    assert resumed.sandbox_unavailable_state is SandboxState(terminal_state)
 
 
 def _clear_readonly(function, path, _exc_info) -> None:
