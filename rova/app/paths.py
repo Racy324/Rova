@@ -46,3 +46,7 @@ class RovaDataPaths:
     @property
     def experience(self) -> Path:
         return self.root / "experience"
+
+    @property
+    def sandboxes(self) -> Path:
+        return self.root / "sandboxes"
