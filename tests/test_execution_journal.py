@@ -5,7 +5,7 @@ import json
 import pytest
 
 from rova.agent_core.events import AgentEvent
-from rova.agent_session.execution_journal import ToolExecutionJournal
+from rova.agent_session.execution_journal import ExecutionEnvironmentIdentity, ToolExecutionJournal
 
 
 def _completed_event() -> AgentEvent:
@@ -76,6 +76,16 @@ def test_legacy_state_line_loads_without_a_completion_receipt(tmp_path) -> None:
     assert record.receipt is None
 
 
+def test_v2_record_without_environment_identity_remains_readable(tmp_path) -> None:
+    journal = ToolExecutionJournal(tmp_path, "session1")
+    journal.append(_completed_event(), assistant_entry_id="assistant-entry-1")
+
+    record = journal.load()[0]
+    assert record.is_legacy is False
+    assert record.environment_kind is None
+    assert record.sandbox_id is None
+
+
 def test_completed_receipt_preserves_an_empty_canonical_result(tmp_path) -> None:
     journal = ToolExecutionJournal(tmp_path, "session1")
     event = _completed_event()
@@ -86,3 +96,19 @@ def test_completed_receipt_preserves_an_empty_canonical_result(tmp_path) -> None
     record = journal.load()[0]
     assert record.receipt is not None
     assert record.receipt.content == ""
+
+
+def test_v3_records_persist_the_execution_environment_identity(tmp_path) -> None:
+    journal = ToolExecutionJournal(tmp_path, "session1")
+
+    journal.append(
+        _completed_event(),
+        assistant_entry_id="assistant-entry-1",
+        environment_identity=ExecutionEnvironmentIdentity("docker_sandbox", "sandbox-1"),
+    )
+
+    record = journal.load()[0]
+    assert record.environment_kind == "docker_sandbox"
+    assert record.sandbox_id == "sandbox-1"
+    assert record.is_legacy is False
+    assert "container" not in journal.path.read_text(encoding="utf-8")

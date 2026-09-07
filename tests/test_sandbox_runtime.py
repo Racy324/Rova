@@ -1,11 +1,15 @@
-from pathlib import Path
 import shutil
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from rova.ai.events import StreamDone
-from rova.ai.messages import AssistantMessage, TextBlock, ToolCall
+from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage, UserMessage
 from rova.ai.models import Model
+from rova.agent_core.events import AgentEvent
+from rova.agent_session.execution_journal import ExecutionEnvironmentIdentity, ToolExecutionJournal
+from rova.agent_session.session_store import JsonlSessionStore
 from rova.app import runtime as runtime_module
 from rova.app.runtime import build_rova_runtime
 from rova.app.workspace.environment import (
@@ -28,7 +32,15 @@ class _VisionClient:
 class _LocalDockerSandboxEnvironment:
     """Test double: Docker logical paths with a local executor over the Sandbox tree."""
 
-    def __init__(self, *, host_workspace: Workspace, sandbox_workspace: Workspace, image: str, **_kwargs) -> None:
+    def __init__(
+        self,
+        *,
+        host_workspace: Workspace,
+        sandbox_workspace: Workspace,
+        image: str,
+        resumed: bool = False,
+        **_kwargs,
+    ) -> None:
         self.filesystem = LocalWorkspaceFileSystem(sandbox_workspace)
         self.terminal = LocalTerminalBackend(sandbox_workspace)
         self.descriptor = ExecutionEnvironmentDescriptor(
@@ -36,6 +48,12 @@ class _LocalDockerSandboxEnvironment:
             logical_workspace="/workspace",
             host_workspace=str(host_workspace.root),
             host_workspace_isolated=True,
+            resume_note=(
+                "Sandbox workspace was resumed; a fresh execution container was created. "
+                "Workspace files persisted; container-local packages, processes and temporary state may have been lost."
+                if resumed
+                else None
+            ),
         )
 
     async def close(self) -> None:
@@ -232,6 +250,150 @@ def test_corrupt_resumed_sandbox_fails_closed_without_a_host_workspace_fallback(
             session_id=initial.session.session_id,
             session_root=tmp_path / "sessions",
             artifact_root=tmp_path / "artifacts",
+        )
+
+
+def test_lost_sandbox_closes_an_interrupted_tool_protocol_before_failing_closed(monkeypatch, tmp_path: Path) -> None:
+    host_root = tmp_path / "host-project"
+    host_root.mkdir()
+    monkeypatch.setattr(runtime_module, "DockerSandboxEnvironment", _LocalDockerSandboxEnvironment, raising=False)
+    initial = build_rova_runtime(
+        model=Model(provider="mock"), stream_fn=_stream_done, workspace_root=host_root,
+        terminal_backend="docker", docker_image="rova-test:latest", isolated_sandbox=True,
+        sandbox_root=tmp_path / "rova-data" / "sandboxes", session_root=tmp_path / "sessions",
+        artifact_root=tmp_path / "artifacts",
+    )
+    durable = initial.session._durable_session
+    assert durable is not None and initial.execution_environment is not None
+    durable.append(UserMessage("resume"))
+    assistant_entry_id = durable.append(AssistantMessage([ToolCall("call-1", "write", {})], stop_reason="tool_calls"))
+    sandbox_id = initial.execution_environment.filesystem.resolve(".").parent.name
+    ToolExecutionJournal(tmp_path / "sessions", durable.session_id).append(
+        AgentEvent(
+            "tool_execution_state", tool_call_id="call-1", tool_name="write", batch_id="batch",
+            call_index=0, batch_mode="sequential", execution_mode="sequential", execution_state="started",
+        ),
+        assistant_entry_id=assistant_entry_id,
+        environment_identity=ExecutionEnvironmentIdentity("docker_sandbox", sandbox_id),
+    )
+    shutil.rmtree(initial.execution_environment.filesystem.resolve("."), onerror=_clear_readonly)
+
+    with pytest.raises(Exception, match="Sandbox is unavailable"):
+        build_rova_runtime(
+            model=Model(provider="mock"), stream_fn=_stream_done, workspace_root=host_root,
+            terminal_backend="docker", docker_image="rova-test:latest", isolated_sandbox=True,
+            sandbox_root=tmp_path / "rova-data" / "sandboxes", session_id=durable.session_id,
+            session_root=tmp_path / "sessions", artifact_root=tmp_path / "artifacts",
+        )
+
+    restored = JsonlSessionStore(tmp_path / "sessions").load(durable.session_id)
+    result = next(message for message in restored.messages if isinstance(message, ToolResultMessage))
+    assert result.metadata["outcome"] == "execution_interrupted"
+    assert result.metadata["environment"]["available"] is False
+    assert result.metadata["environment"]["environment_lost"] is True
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runtime_resume_reuses_b0_files_and_reports_fresh_container(monkeypatch, tmp_path: Path) -> None:
+    from rova.app.workspace.sandbox import SandboxDiffService, SandboxStore, workspace_identity
+
+    host_root = tmp_path / "host-project"
+    host_root.mkdir()
+    (host_root / "source.py").write_text("baseline", encoding="utf-8")
+    captured_prompts: list[str] = []
+
+    async def stream(_model, context, _options):
+        captured_prompts.append(context.system_prompt)
+        yield StreamDone(AssistantMessage([TextBlock("done")]))
+
+    monkeypatch.setattr(runtime_module, "DockerSandboxEnvironment", _LocalDockerSandboxEnvironment, raising=False)
+    initial = build_rova_runtime(
+        model=Model(provider="mock"), stream_fn=stream, workspace_root=host_root,
+        terminal_backend="docker", docker_image="rova-test:latest", isolated_sandbox=True,
+        sandbox_root=tmp_path / "rova-data" / "sandboxes", session_root=tmp_path / "sessions",
+        artifact_root=tmp_path / "artifacts",
+    )
+    assert initial.execution_environment is not None
+    initial.execution_environment.filesystem.resolve("source.py").write_text("sandbox edit", encoding="utf-8")
+    session_id = initial.session.session_id
+    assert session_id is not None
+    await initial.close()
+    (host_root / "source.py").write_text("later Host change", encoding="utf-8")
+
+    resumed = build_rova_runtime(
+        model=Model(provider="mock"), stream_fn=stream, workspace_root=host_root,
+        terminal_backend="docker", docker_image="rova-test:latest", isolated_sandbox=True,
+        sandbox_root=tmp_path / "rova-data" / "sandboxes", session_id=session_id,
+        session_root=tmp_path / "sessions", artifact_root=tmp_path / "artifacts",
+    )
+    assert resumed.execution_environment is not None
+    assert resumed.execution_environment.filesystem.resolve("source.py").read_text(encoding="utf-8") == "sandbox edit"
+    assert (host_root / "source.py").read_text(encoding="utf-8") == "later Host change"
+    store = SandboxStore(tmp_path / "rova-data" / "sandboxes")
+    metadata = store.load_for_session(session_id, workspace_identity(host_root))
+    assert metadata is not None
+    changed = SandboxDiffService(store).compute_changed_set(metadata.sandbox_id)
+    assert [change.path for change in changed.changes] == ["source.py"]
+    await resumed.session.prompt("resume")
+    prompt = captured_prompts[-1]
+    assert "fresh execution container was created" in prompt
+    assert str(resumed.execution_environment.filesystem.resolve(".")) not in prompt
+    await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_ready_sandbox_blocks_branch_switch_but_terminal_state_allows_it(monkeypatch, tmp_path: Path) -> None:
+    from rova.agent_session.agent_session import SessionBranchError
+    from rova.app.workspace.sandbox import SandboxState, SandboxStore, workspace_identity
+
+    host_root = tmp_path / "host-project"
+    host_root.mkdir()
+    monkeypatch.setattr(runtime_module, "DockerSandboxEnvironment", _LocalDockerSandboxEnvironment, raising=False)
+    runtime = build_rova_runtime(
+        model=Model(provider="mock"), stream_fn=_stream_done, workspace_root=host_root,
+        terminal_backend="docker", docker_image="rova-test:latest", isolated_sandbox=True,
+        sandbox_root=tmp_path / "rova-data" / "sandboxes", session_root=tmp_path / "sessions",
+        artifact_root=tmp_path / "artifacts",
+    )
+    await runtime.session.prompt("first")
+    root_entry = runtime.session._durable_session.entries[0].entry_id
+    with pytest.raises(SessionBranchError, match="active Sandbox"):
+        runtime.session.branch(root_entry)
+
+    store = SandboxStore(tmp_path / "rova-data" / "sandboxes")
+    metadata = store.load_for_session(runtime.session.session_id, workspace_identity(host_root))
+    assert metadata is not None
+    store._write_metadata(replace(metadata, state=SandboxState.APPLIED))
+    runtime.session.branch(root_entry)
+    await runtime.close()
+
+
+@pytest.mark.parametrize("terminal_state", ["applied", "discarded", "applying"])
+def test_non_ready_sandbox_cannot_resume_coding(monkeypatch, tmp_path: Path, terminal_state: str) -> None:
+    from rova.app.workspace.sandbox import SandboxState, SandboxStore, workspace_identity
+
+    host_root = tmp_path / "host-project"
+    host_root.mkdir()
+    monkeypatch.setattr(runtime_module, "DockerSandboxEnvironment", _LocalDockerSandboxEnvironment, raising=False)
+    initial = build_rova_runtime(
+        model=Model(provider="mock"), stream_fn=_stream_done, workspace_root=host_root,
+        terminal_backend="docker", docker_image="rova-test:latest", isolated_sandbox=True,
+        sandbox_root=tmp_path / "rova-data" / "sandboxes", session_root=tmp_path / "sessions",
+        artifact_root=tmp_path / "artifacts",
+    )
+    session_id = initial.session.session_id
+    assert session_id is not None
+    store = SandboxStore(tmp_path / "rova-data" / "sandboxes")
+    metadata = store.load_for_session(session_id, workspace_identity(host_root))
+    assert metadata is not None
+    store._write_metadata(replace(metadata, state=SandboxState(terminal_state)))
+
+    with pytest.raises(Exception, match=f"state {terminal_state}"):
+        build_rova_runtime(
+            model=Model(provider="mock"), stream_fn=_stream_done, workspace_root=host_root,
+            terminal_backend="docker", docker_image="rova-test:latest", isolated_sandbox=True,
+            sandbox_root=tmp_path / "rova-data" / "sandboxes", session_id=session_id,
+            session_root=tmp_path / "sessions", artifact_root=tmp_path / "artifacts",
         )
 
 

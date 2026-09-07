@@ -136,6 +136,7 @@ class DockerSandboxEnvironment:
         image: str,
         skill_root: Path | None = None,
         docker_executable: str = "docker",
+        resumed: bool = False,
     ) -> None:
         self._filesystem = LocalWorkspaceFileSystem(sandbox_workspace)
         self._terminal = DockerTerminalBackend(
@@ -150,8 +151,11 @@ class DockerSandboxEnvironment:
             host_workspace=str(host_workspace.root),
             host_workspace_isolated=True,
             resume_note=(
-                "Sandbox workspace files persist across Runtime resume; container-local packages, "
-                "processes, /tmp, and writable-layer state do not."
+                "Sandbox workspace was resumed; a fresh execution container was created. "
+                "Workspace files persisted; container-local packages, processes and temporary state may have been lost."
+                if resumed
+                else "Sandbox workspace files persist independently from this Runtime; container-local packages, "
+                "processes and temporary state persist only while the current execution container exists."
             ),
         )
 

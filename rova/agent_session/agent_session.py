@@ -30,7 +30,13 @@ from .compaction import (
 )
 from .context_builder import build_session_messages, build_session_projection
 from .events import SessionMaintenanceEvent
-from .execution_journal import ExecutionJournalError, JournalRecord, ToolExecutionJournal
+from .execution_journal import (
+    ExecutionEnvironmentIdentity,
+    ExecutionEnvironmentStatus,
+    ExecutionJournalError,
+    JournalRecord,
+    ToolExecutionJournal,
+)
 from .session_store import CompactionEntry, DurableSession, JsonlSessionStore, SessionStoreError
 from .summarization import SUMMARIZATION_SYSTEM_PROMPT, SummaryFn, summarize_with_stream
 
@@ -97,6 +103,9 @@ class AgentSession:
         token_estimator: TokenEstimator | None = None,
         summary_fn: SummaryFn | None = None,
         provider_context_estimator: Callable[[Context], int] | None = None,
+        branch_guard: Callable[[], str | None] | None = None,
+        execution_environment_identity_resolver: Callable[[], ExecutionEnvironmentIdentity] | None = None,
+        environment_status_resolver: Callable[[ExecutionEnvironmentIdentity], ExecutionEnvironmentStatus] | None = None,
     ) -> None:
         self.agent = agent
         self._durable_session = durable_session
@@ -106,6 +115,9 @@ class AgentSession:
         self._token_estimator = token_estimator or ConservativeTokenEstimator()
         self._summary_fn = summary_fn or self._summarize_with_agent_stream
         self._provider_context_estimator = provider_context_estimator
+        self._branch_guard = branch_guard
+        self._execution_environment_identity_resolver = execution_environment_identity_resolver
+        self._environment_status_resolver = environment_status_resolver
         self.persisted_message_count = len(agent.messages) if durable_session is not None else 0
         self._faulted = False
         self._incomplete_tail = False
@@ -117,6 +129,7 @@ class AgentSession:
         self._unsubscribe: Callable[[], None] | None = None
         self._execution_journal: ToolExecutionJournal | None = None
         self._assistant_entry_ids: dict[str, str] = {}
+        self._batch_environment_identities: dict[tuple[str, str], ExecutionEnvironmentIdentity] = {}
         self.recovery_report = RecoveryReport()
         if durable_session is not None:
             _ensure_agent_has_no_durable_session(agent)
@@ -135,6 +148,9 @@ class AgentSession:
         token_estimator: TokenEstimator | None = None,
         summary_fn: SummaryFn | None = None,
         provider_context_estimator: Callable[[Context], int] | None = None,
+        branch_guard: Callable[[], str | None] | None = None,
+        execution_environment_identity_resolver: Callable[[], ExecutionEnvironmentIdentity] | None = None,
+        environment_status_resolver: Callable[[ExecutionEnvironmentIdentity], ExecutionEnvironmentStatus] | None = None,
     ) -> AgentSession:
         if agent.messages:
             raise ValueError("a new durable session requires an empty Agent; use load() to restore history")
@@ -147,6 +163,9 @@ class AgentSession:
             token_estimator=token_estimator,
             summary_fn=summary_fn,
             provider_context_estimator=provider_context_estimator,
+            branch_guard=branch_guard,
+            execution_environment_identity_resolver=execution_environment_identity_resolver,
+            environment_status_resolver=environment_status_resolver,
         )
 
     @classmethod
@@ -161,6 +180,9 @@ class AgentSession:
         token_estimator: TokenEstimator | None = None,
         summary_fn: SummaryFn | None = None,
         provider_context_estimator: Callable[[Context], int] | None = None,
+        branch_guard: Callable[[], str | None] | None = None,
+        execution_environment_identity_resolver: Callable[[], ExecutionEnvironmentIdentity] | None = None,
+        environment_status_resolver: Callable[[ExecutionEnvironmentIdentity], ExecutionEnvironmentStatus] | None = None,
     ) -> AgentSession:
         if agent.messages:
             raise ValueError("load requires a fresh Agent with no runtime history")
@@ -175,6 +197,9 @@ class AgentSession:
             token_estimator=token_estimator,
             summary_fn=summary_fn,
             provider_context_estimator=provider_context_estimator,
+            branch_guard=branch_guard,
+            execution_environment_identity_resolver=execution_environment_identity_resolver,
+            environment_status_resolver=environment_status_resolver,
         )
         try:
             session._reconcile_selected_branch()
@@ -225,6 +250,10 @@ class AgentSession:
             raise SessionBranchError("branch requires a durable session")
         if entry_id not in self._durable_session.by_id:
             raise SessionBranchError(f"unknown branch entry: {entry_id}")
+        if self._branch_guard is not None:
+            reason = self._branch_guard()
+            if reason:
+                raise SessionBranchError(reason)
         previous_leaf_id = self._durable_session.leaf_id
         self._durable_session.branch(entry_id)
         try:
@@ -352,11 +381,35 @@ class AgentSession:
                 assistant_entry_id = self._assistant_entry_ids.get(event.tool_call_id or "")
                 if assistant_entry_id is None:
                     raise SessionStoreError("tool execution state has no durable Assistant ToolCall entry")
-                self._execution_journal.append(event, assistant_entry_id=assistant_entry_id)
-            except (OSError, ValueError, SessionStoreError) as error:
+                identity = self._journal_environment_identity(event, assistant_entry_id)
+                self._execution_journal.append(
+                    event,
+                    assistant_entry_id=assistant_entry_id,
+                    environment_identity=identity,
+                )
+            except Exception as error:
                 self._fault(SessionStoreError(f"failed to append execution journal: {error}"))
         if event.type == "message_end":
             self._persist_committed_suffix()
+
+    def _journal_environment_identity(
+        self,
+        event: AgentEvent,
+        assistant_entry_id: str,
+    ) -> ExecutionEnvironmentIdentity | None:
+        if event.batch_id is None:
+            raise SessionStoreError("tool execution state has no batch id")
+        key = (assistant_entry_id, event.batch_id)
+        if event.execution_state == "started":
+            if self._execution_environment_identity_resolver is None:
+                return None
+            identity = self._execution_environment_identity_resolver()
+            existing = self._batch_environment_identities.get(key)
+            if existing is not None and existing != identity:
+                raise SessionStoreError("a Tool batch cannot span execution environments")
+            self._batch_environment_identities[key] = identity
+            return identity
+        return self._batch_environment_identities.get(key)
 
     def _persist_committed_suffix(self) -> None:
         assert self._durable_session is not None
@@ -624,6 +677,7 @@ class AgentSession:
             projection = build_session_projection(self._durable_session.path_to_leaf())
             pending = _pending_tool_calls(projection)
             records_by_call = _records_by_call(records, pending)
+            _validate_batch_environment_identities(records, pending)
             legacy_records = [record for record in records if record.is_legacy]
             reports: list[RecoveryItem] = []
             for assistant_entry_id, call_index, call in pending:
@@ -635,7 +689,8 @@ class AgentSession:
                     ]
                     if candidates:
                         record = candidates[-1]
-                result, report = _recovery_result(call, record, call_index=call_index)
+                environment_status = self._environment_status(record)
+                result, report = _recovery_result(call, record, call_index=call_index, environment_status=environment_status)
                 self._durable_session.append(result)
                 reports.append(report)
             messages = build_session_messages(self._durable_session.path_to_leaf())
@@ -646,6 +701,17 @@ class AgentSession:
             self.recovery_report = RecoveryReport(tuple(reports))
         except (ExecutionJournalError, SessionStoreError, ValueError) as error:
             raise SessionRecoveryError(f"could not reconcile interrupted tool calls: {error}") from error
+
+    def _environment_status(self, record: JournalRecord | None) -> ExecutionEnvironmentStatus | None:
+        if (
+            record is None
+            or record.environment_kind is None
+            or self._environment_status_resolver is None
+        ):
+            return None
+        return self._environment_status_resolver(
+            ExecutionEnvironmentIdentity(record.environment_kind, record.sandbox_id)
+        )
 
     def _summary_token_limit(self) -> int | None:
         if self._compaction_policy is None:
@@ -684,6 +750,25 @@ def _records_by_call(
     return result
 
 
+def _validate_batch_environment_identities(
+    records: list[JournalRecord],
+    pending: list[tuple[str, int, ToolCall]],
+) -> None:
+    selected = {
+        (assistant_entry_id, call.id, call_index)
+        for assistant_entry_id, call_index, call in pending
+    }
+    identities_by_batch: dict[tuple[str, str], set[tuple[str, str | None]]] = {}
+    for record in records:
+        key = (record.assistant_entry_id, record.tool_call_id, record.call_index)
+        if key not in selected or record.environment_kind is None or record.assistant_entry_id is None:
+            continue
+        batch_key = (record.assistant_entry_id, record.batch_id)
+        identities_by_batch.setdefault(batch_key, set()).add((record.environment_kind, record.sandbox_id))
+    if any(len(identities) > 1 for identities in identities_by_batch.values()):
+        raise ExecutionJournalError("execution journal batch has inconsistent environment identities")
+
+
 def _pending_tool_calls(projection) -> list[tuple[str, int, ToolCall]]:
     pending: list[tuple[str, int, ToolCall]] = []
     for projected in projection:
@@ -713,6 +798,7 @@ def _recovery_result(
     record: JournalRecord | None,
     *,
     call_index: int,
+    environment_status: ExecutionEnvironmentStatus | None = None,
 ) -> tuple[ToolResultMessage, RecoveryItem]:
     if record is not None and record.state == "completed" and record.receipt is not None:
         receipt = record.receipt
@@ -736,6 +822,20 @@ def _recovery_result(
     metadata = {"outcome": outcome, "recovered": True, "side_effects_unknown": unknown}
     if unknown:
         metadata["recovery_state"] = "orphaned" if record is None or record.state in {"started", "executor_completed", "completed"} else record.state
+    if environment_status is not None:
+        environment = {
+            "kind": environment_status.identity.kind,
+            "sandbox_id": environment_status.identity.sandbox_id,
+            "available": environment_status.available,
+            "state": environment_status.state,
+        }
+        if unknown:
+            environment["workspace_side_effects_may_exist"] = True
+        if environment_status.environment_lost:
+            environment["environment_lost"] = True
+        if environment_status.lifecycle_contradiction:
+            environment["lifecycle_contradiction"] = True
+        metadata["environment"] = environment
     report_call_index = record.call_index if record is not None else call_index
     return ToolResultMessage(call.id, call.name, [TextBlock(text)], True, metadata), RecoveryItem(call.name, report_call_index, outcome, unknown)
 

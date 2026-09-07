@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -29,6 +30,10 @@ class SandboxImportError(SandboxError):
 
 class SandboxDiffError(SandboxError):
     """A ChangedSet could not be computed completely and safely."""
+
+
+class SandboxApplyError(SandboxError):
+    """A Host Apply or its durable repair record could not be completed safely."""
 
 
 class SandboxState(str, Enum):
@@ -55,6 +60,25 @@ class ChangeKind(str, Enum):
     MODE_CHANGED = "mode_changed"
     SYMLINK_CHANGED = "symlink_changed"
     TYPE_CHANGED = "type_changed"
+
+
+class ApplyAction(str, Enum):
+    CREATE = "create"
+    WRITE = "write"
+    DELETE = "delete"
+    SET_MODE = "set_mode"
+    CREATE_SYMLINK = "create_symlink"
+    CREATE_DIRECTORY = "create_directory"
+    DELETE_DIRECTORY = "delete_directory"
+    REPLACE_TYPE = "replace_type"
+
+
+class ApplyState(str, Enum):
+    APPLYING = "applying"
+    APPLIED = "applied"
+    RECOVERY_REQUIRED = "recovery_required"
+    RESTORING = "restoring"
+    RESTORED = "restored"
 
 
 @dataclass(frozen=True)
@@ -107,6 +131,70 @@ class SandboxDiffLimits:
             self.max_single_file_bytes,
         )):
             raise ValueError("Sandbox diff limits must be positive integers")
+
+
+@dataclass(frozen=True)
+class HostConflict:
+    path: str
+    reason: str
+    baseline: FileState | None
+    host_current: FileState | None
+
+
+@dataclass(frozen=True)
+class ApplyOperation:
+    path: str
+    action: ApplyAction
+    expected_baseline: FileState | None
+    desired: FileState | None
+
+
+@dataclass(frozen=True)
+class ApplyPlan:
+    sandbox_id: str
+    baseline_oid: str
+    generated_at: str
+    changed_set: ChangedSet
+    operations: tuple[ApplyOperation, ...]
+    conflicts: tuple[HostConflict, ...]
+
+
+@dataclass(frozen=True)
+class ApplyReport:
+    sandbox_id: str
+    state: ApplyState | None
+    applied: bool
+    confirmed: bool
+    operation_id: str | None
+    conflicts: tuple[HostConflict, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class DiscardPlan:
+    sandbox_id: str
+    changed_set: ChangedSet
+
+    @property
+    def changed_path_count(self) -> int:
+        return len(self.changed_set.changes)
+
+
+@dataclass(frozen=True)
+class DiscardReport:
+    sandbox_id: str
+    state: SandboxState
+    discarded: bool
+    confirmed: bool
+    plan: DiscardPlan | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class SandboxCleanupReport:
+    sandbox_id: str
+    state: SandboxState
+    cleaned: bool
 
 
 @dataclass(frozen=True)
@@ -243,6 +331,16 @@ class SandboxStore:
         metadata = self._load_metadata(sandbox_id)
         if metadata.session_id != session_id or metadata.workspace_id != workspace_id:
             raise SandboxError("Sandbox metadata does not match the Session pointer")
+        if metadata.state is SandboxState.DISCARDING:
+            if not metadata.sandbox_root.exists():
+                metadata = replace(metadata, state=SandboxState.DISCARDED, updated_at=_utc_now())
+                self._write_metadata(metadata)
+            return metadata
+        return self.load_for_execution(sandbox_id)
+
+    def load_for_execution(self, sandbox_id: str) -> SandboxMetadata:
+        """Resolve durable Sandbox availability without exposing physical paths to callers."""
+        metadata = self._load_metadata(sandbox_id)
         if metadata.state is SandboxState.READY and (
             not metadata.sandbox_root.is_dir()
             or metadata.baseline_commit_oid is None
@@ -251,6 +349,65 @@ class SandboxStore:
             metadata = replace(metadata, state=SandboxState.ABANDONED, updated_at=_utc_now())
             self._write_metadata(metadata)
         return metadata
+
+    def plan_discard(self, sandbox_id: str) -> DiscardPlan:
+        metadata = self._load_metadata(sandbox_id)
+        if metadata.state is not SandboxState.READY:
+            raise SandboxApplyError(f"Sandbox cannot discard from state {metadata.state.value}")
+        if _has_unfinished_apply(metadata):
+            raise SandboxApplyError("Sandbox has an unfinished Apply; resolve it before discard")
+        return DiscardPlan(metadata.sandbox_id, SandboxDiffService(self).compute_changed_set(sandbox_id))
+
+    def discard(self, sandbox_id: str, *, confirm: Callable[[DiscardPlan], bool]) -> DiscardReport:
+        plan = self.plan_discard(sandbox_id)
+        if not confirm(plan):
+            return DiscardReport(sandbox_id, SandboxState.READY, False, False, plan)
+        metadata = self._load_metadata(sandbox_id)
+        discarding = replace(metadata, state=SandboxState.DISCARDING, updated_at=_utc_now())
+        self._write_metadata(discarding)
+        try:
+            self._remove_disposable_workspace(discarding)
+        except SandboxError as error:
+            return DiscardReport(sandbox_id, SandboxState.DISCARDING, False, True, plan, str(error))
+        if discarding.sandbox_root.exists():
+            return DiscardReport(sandbox_id, SandboxState.DISCARDING, False, True, plan, "Sandbox workspace cleanup is incomplete")
+        discarded = replace(discarding, state=SandboxState.DISCARDED, updated_at=_utc_now())
+        self._write_metadata(discarded)
+        return DiscardReport(sandbox_id, SandboxState.DISCARDED, True, True, plan)
+
+    def cleanup_terminal(self, sandbox_id: str) -> SandboxCleanupReport:
+        metadata = self._load_metadata(sandbox_id)
+        if metadata.state not in {SandboxState.APPLIED, SandboxState.DISCARDED, SandboxState.FAILED, SandboxState.ABANDONED}:
+            raise SandboxApplyError("cleanup refuses an active Sandbox")
+        if _has_unfinished_apply(metadata):
+            raise SandboxApplyError("cleanup refuses Sandbox with unfinished Apply evidence")
+        self._remove_disposable_workspace(metadata)
+        return SandboxCleanupReport(metadata.sandbox_id, metadata.state, not metadata.sandbox_root.exists())
+
+    def _remove_disposable_workspace(self, metadata: SandboxMetadata) -> None:
+        expected_root = self.root / metadata.sandbox_id / "workspace"
+        try:
+            if metadata.sandbox_root.resolve(strict=False) != expected_root.resolve(strict=False):
+                raise SandboxError("Sandbox workspace metadata is not owned by this store")
+            workspace_stat = metadata.sandbox_root.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise SandboxError(f"could not inspect Sandbox workspace for cleanup: {error}") from error
+        if stat.S_ISLNK(workspace_stat.st_mode) or not stat.S_ISDIR(workspace_stat.st_mode):
+            raise SandboxError("Sandbox workspace is not a removable owned directory")
+
+        def clear_readonly(function, failed_path, _exception) -> None:
+            try:
+                os.chmod(failed_path, stat.S_IWRITE)
+                function(failed_path)
+            except OSError as error:
+                raise SandboxError(f"could not remove Sandbox workspace: {error}") from error
+
+        try:
+            shutil.rmtree(metadata.sandbox_root, onerror=clear_readonly)
+        except OSError as error:
+            raise SandboxError(f"could not remove Sandbox workspace: {error}") from error
 
     def _mark_import_failed(self, metadata: SandboxMetadata) -> None:
         if metadata.state is SandboxState.CREATING:
@@ -382,6 +539,364 @@ class SandboxDiffService:
             changes=changes,
             summary=_summarize_changes(changes),
         )
+
+
+class SandboxApplyService:
+    """The only Phase-6 boundary permitted to mutate a Sandbox Host Workspace.
+
+    This service is deliberately not an Agent tool.  It treats B0, the Sandbox
+    ChangedSet and the current Host state as three independent authorities and
+    fails the whole Apply before any Host write if one changed path has drifted.
+    """
+
+    def __init__(self, store: SandboxStore, *, limits: SandboxDiffLimits | None = None) -> None:
+        self._store = store
+        self._limits = limits or SandboxDiffLimits()
+        self._diff = SandboxDiffService(store, limits=self._limits)
+        self._active_operation_id: str | None = None
+        self._active_metadata: SandboxMetadata | None = None
+
+    def build_plan(self, sandbox_id: str) -> ApplyPlan:
+        metadata = self._store._load_metadata(sandbox_id)
+        if metadata.state is not SandboxState.READY:
+            raise SandboxApplyError(f"Sandbox cannot Apply from state {metadata.state.value}")
+        if _has_unfinished_apply(metadata):
+            raise SandboxApplyError("Sandbox has an unfinished Apply; restore its preimages before another Apply")
+        changed_set = self._diff.compute_changed_set(sandbox_id)
+        baseline = _scan_baseline_tree(metadata)
+        operations = _ordered_apply_operations(changed_set.changes)
+        conflicts = self._find_host_conflicts(metadata, baseline, operations)
+        return ApplyPlan(
+            sandbox_id=metadata.sandbox_id,
+            baseline_oid=changed_set.baseline_oid,
+            generated_at=_utc_now(),
+            changed_set=changed_set,
+            operations=operations,
+            conflicts=conflicts,
+        )
+
+    def apply(self, sandbox_id: str, *, confirm: Callable[[ApplyPlan], bool]) -> ApplyReport:
+        plan = self.build_plan(sandbox_id)
+        if plan.conflicts:
+            return ApplyReport(sandbox_id, None, False, False, None, plan.conflicts)
+        if not confirm(plan):
+            return ApplyReport(sandbox_id, None, False, False, None)
+
+        metadata = self._store._load_metadata(sandbox_id)
+        # Confirmation cannot make a stale plan safe.  Re-check before durable
+        # preparation, then re-check each exact operation before mutation.
+        baseline = _scan_baseline_tree(metadata)
+        conflicts = self._find_host_conflicts(metadata, baseline, plan.operations)
+        if conflicts:
+            return ApplyReport(sandbox_id, None, False, True, None, conflicts)
+
+        operation_id = uuid4().hex
+        self._active_operation_id = operation_id
+        self._active_metadata = metadata
+        try:
+            backup_ref = self._create_preimage_backup(metadata, operation_id, plan.operations)
+            manifest = self._new_manifest(operation_id, plan, backup_ref)
+            self._write_manifest(metadata, operation_id, manifest)
+            self._store._write_metadata(
+                replace(metadata, state=SandboxState.APPLYING, active_apply_id=operation_id, updated_at=_utc_now())
+            )
+
+            for index, operation in enumerate(plan.operations):
+                conflict = self._revalidate_operation(operation, metadata.host_root)
+                if conflict is not None:
+                    self._set_manifest_state(metadata, operation_id, ApplyState.RECOVERY_REQUIRED, index, str(conflict))
+                    return ApplyReport(sandbox_id, ApplyState.RECOVERY_REQUIRED, False, True, operation_id, (conflict,))
+                try:
+                    self._mutate_operation(operation, metadata.host_root)
+                except (OSError, SandboxError) as error:
+                    self._set_manifest_state(metadata, operation_id, ApplyState.RECOVERY_REQUIRED, index, str(error))
+                    return ApplyReport(sandbox_id, ApplyState.RECOVERY_REQUIRED, False, True, operation_id, error=str(error))
+                self._mark_operation_completed(metadata, operation_id, index)
+
+            self._set_manifest_state(metadata, operation_id, ApplyState.APPLIED, None, None)
+            self._store._write_metadata(
+                replace(metadata, state=SandboxState.APPLIED, active_apply_id=operation_id, updated_at=_utc_now())
+            )
+            return ApplyReport(sandbox_id, ApplyState.APPLIED, True, True, operation_id)
+        finally:
+            self._active_operation_id = None
+            self._active_metadata = None
+
+    def restore_preimages(
+        self,
+        sandbox_id: str,
+        operation_id: str,
+        *,
+        confirm: Callable[[ApplyReport], bool],
+    ) -> ApplyReport:
+        metadata = self._store._load_metadata(sandbox_id)
+        manifest = self._read_manifest(metadata, operation_id)
+        state = _manifest_state(manifest)
+        if state is ApplyState.RESTORED:
+            return ApplyReport(sandbox_id, ApplyState.RESTORED, False, True, operation_id)
+        if state not in {ApplyState.APPLYING, ApplyState.RECOVERY_REQUIRED, ApplyState.RESTORING}:
+            raise SandboxApplyError("Apply preimages are only available for an unfinished Apply")
+        report = ApplyReport(sandbox_id, state, False, False, operation_id)
+        if not confirm(report):
+            return report
+
+        try:
+            preimages = self._read_backup(metadata, operation_id)
+            restore_entries, conflicts = self._validate_restore_preimages(manifest, preimages, metadata.host_root)
+            if conflicts:
+                self._set_manifest_state(metadata, operation_id, ApplyState.RECOVERY_REQUIRED, None, "Host changed after Apply")
+                return ApplyReport(sandbox_id, ApplyState.RECOVERY_REQUIRED, False, True, operation_id, conflicts)
+            self._set_manifest_state(metadata, operation_id, ApplyState.RESTORING, None, None)
+            for preimage in _ordered_preimages_for_restore(restore_entries):
+                self._restore_preimage(preimage, metadata.host_root, metadata, operation_id)
+        except (OSError, SandboxError) as error:
+            self._set_manifest_state(metadata, operation_id, ApplyState.RECOVERY_REQUIRED, None, str(error))
+            return ApplyReport(sandbox_id, ApplyState.RECOVERY_REQUIRED, False, True, operation_id, error=str(error))
+
+        self._set_manifest_state(metadata, operation_id, ApplyState.RESTORED, None, None)
+        self._store._write_metadata(
+            replace(metadata, state=SandboxState.READY, active_apply_id=None, updated_at=_utc_now())
+        )
+        return ApplyReport(sandbox_id, ApplyState.RESTORED, False, True, operation_id)
+
+    def _find_host_conflicts(
+        self,
+        metadata: SandboxMetadata,
+        baseline: dict[str, FileState],
+        operations: tuple[ApplyOperation, ...],
+    ) -> tuple[HostConflict, ...]:
+        conflicts: dict[str, HostConflict] = {}
+        for operation in operations:
+            ancestor = _first_unsafe_host_ancestor(
+                metadata.host_root,
+                baseline,
+                operation.path,
+                operations,
+                self._limits,
+            )
+            if ancestor is not None:
+                conflicts.setdefault(ancestor.path, ancestor)
+                continue
+            host_state = _file_state_at(metadata.host_root, operation.path, self._limits)
+            if host_state != operation.expected_baseline:
+                conflicts[operation.path] = HostConflict(
+                    operation.path,
+                    "host_state_differs_from_baseline",
+                    operation.expected_baseline,
+                    host_state,
+                )
+            if _operation_replaces_or_deletes_directory(operation):
+                conflict = _subtree_conflict(metadata.host_root, baseline, operation.path, self._limits)
+                if conflict is not None:
+                    conflicts.setdefault(conflict.path, conflict)
+        return tuple(conflicts[path] for path in sorted(conflicts))
+
+    def _create_preimage_backup(
+        self,
+        metadata: SandboxMetadata,
+        operation_id: str,
+        operations: tuple[ApplyOperation, ...],
+    ) -> str:
+        backup_root = metadata.sandbox_root.parent / "apply-backups" / operation_id
+        if backup_root.exists():
+            raise SandboxApplyError("Apply backup id already exists")
+        entries: list[dict[str, object]] = []
+        for index, operation in enumerate(operations):
+            state = _file_state_at(metadata.host_root, operation.path, self._limits)
+            if state != operation.expected_baseline:
+                raise SandboxApplyError(f"Host drifted before Apply backup: {operation.path}")
+            entry: dict[str, object] = {"path": operation.path, "state": _file_state_to_json(state)}
+            if state is not None and state.kind is FileStateKind.REGULAR:
+                content = _read_regular_bytes_at(metadata.host_root, operation.path, self._limits)
+                relative = f"files/{index:08d}.bin"
+                _write_durable_bytes(backup_root / relative, content)
+                entry["content_ref"] = relative
+            entries.append(entry)
+        SandboxStore._write_json(
+            backup_root / "manifest.json",
+            {"version": 1, "operation_id": operation_id, "created_at": _utc_now(), "entries": entries},
+        )
+        return str(backup_root.relative_to(metadata.sandbox_root.parent).as_posix())
+
+    def _new_manifest(self, operation_id: str, plan: ApplyPlan, backup_ref: str) -> dict[str, object]:
+        return {
+            "version": 1,
+            "operation_id": operation_id,
+            "sandbox_id": plan.sandbox_id,
+            "baseline_oid": plan.baseline_oid,
+            "state": ApplyState.APPLYING.value,
+            "started_at": _utc_now(),
+            "backup_ref": backup_ref,
+            "operations": [
+                {
+                    "path": operation.path,
+                    "action": operation.action.value,
+                    "expected_baseline": _file_state_to_json(operation.expected_baseline),
+                    "desired": _file_state_to_json(operation.desired),
+                    "state": "pending",
+                }
+                for operation in plan.operations
+            ],
+        }
+
+    def _write_manifest(self, metadata: SandboxMetadata, operation_id: str, manifest: dict[str, object]) -> None:
+        SandboxStore._write_json(_manifest_path(metadata, operation_id), manifest)
+
+    def _read_manifest(self, metadata: SandboxMetadata, operation_id: str) -> dict:
+        value = SandboxStore._read_json(_manifest_path(metadata, operation_id))
+        if value.get("operation_id") != operation_id or value.get("sandbox_id") != metadata.sandbox_id:
+            raise SandboxApplyError("Apply manifest does not belong to this Sandbox")
+        return value
+
+    def _set_manifest_state(
+        self,
+        metadata: SandboxMetadata,
+        operation_id: str,
+        state: ApplyState,
+        failed_index: int | None,
+        error: str | None,
+    ) -> None:
+        manifest = self._read_manifest(metadata, operation_id)
+        manifest["state"] = state.value
+        manifest["updated_at"] = _utc_now()
+        if failed_index is not None:
+            operations = manifest.get("operations")
+            if isinstance(operations, list) and 0 <= failed_index < len(operations) and isinstance(operations[failed_index], dict):
+                operations[failed_index]["state"] = "failed"
+        if error is not None:
+            manifest["error"] = error
+        self._write_manifest(metadata, operation_id, manifest)
+
+    def _mark_operation_completed(self, metadata: SandboxMetadata, operation_id: str, index: int) -> None:
+        manifest = self._read_manifest(metadata, operation_id)
+        operations = manifest.get("operations")
+        if not isinstance(operations, list) or not isinstance(operations[index], dict):
+            raise SandboxApplyError("Apply manifest operations are invalid")
+        operations[index]["state"] = "completed"
+        operations[index]["completed_at"] = _utc_now()
+        self._write_manifest(metadata, operation_id, manifest)
+
+    def _revalidate_operation(self, operation: ApplyOperation, host_root: Path) -> HostConflict | None:
+        try:
+            _ensure_safe_parent(host_root, _host_target(host_root, operation.path))
+            current = _file_state_at(host_root, operation.path, self._limits)
+        except SandboxApplyError:
+            return HostConflict(operation.path, "host_parent_is_not_safe", operation.expected_baseline, None)
+        if current != operation.expected_baseline:
+            return HostConflict(operation.path, "host_state_changed_before_mutation", operation.expected_baseline, current)
+        return None
+
+    def _mutate_operation(self, operation: ApplyOperation, host_root: Path) -> None:
+        target = _host_target(host_root, operation.path)
+        _ensure_safe_parent(host_root, target)
+        if operation.action is ApplyAction.CREATE_DIRECTORY:
+            target.mkdir()
+            return
+        if operation.action is ApplyAction.DELETE_DIRECTORY:
+            _remove_existing_path(target, directory_only=True)
+            return
+        if operation.action is ApplyAction.DELETE:
+            _remove_existing_path(target, directory_only=False)
+            return
+        if operation.action is ApplyAction.SET_MODE:
+            if operation.desired is None or operation.desired.kind is not FileStateKind.REGULAR:
+                raise SandboxApplyError("mode operation has no regular-file destination")
+            _copy_mode(target, 0o755 if operation.desired.executable else 0o644)
+            return
+        if operation.action is ApplyAction.REPLACE_TYPE:
+            _remove_existing_path(target, directory_only=False)
+        elif operation.action is ApplyAction.CREATE_SYMLINK and operation.expected_baseline is not None:
+            _remove_existing_path(target, directory_only=False)
+        if operation.desired is None:
+            raise SandboxApplyError("Apply operation has no destination state")
+        metadata = self._active_metadata
+        if metadata is None:
+            raise SandboxApplyError("Apply mutation is not active")
+        if operation.desired.kind is FileStateKind.DIRECTORY:
+            target.mkdir()
+        elif operation.desired.kind is FileStateKind.SYMLINK:
+            _create_symlink_from_sandbox(metadata.sandbox_root, operation.path, target, operation.desired)
+        else:
+            content = _read_regular_bytes_at(metadata.sandbox_root, operation.path, self._limits)
+            _write_regular_atomically(target, content, operation.desired)
+
+    def _read_backup(self, metadata: SandboxMetadata, operation_id: str) -> list[dict]:
+        manifest = SandboxStore._read_json(metadata.sandbox_root.parent / "apply-backups" / operation_id / "manifest.json")
+        if manifest.get("operation_id") != operation_id:
+            raise SandboxApplyError("Apply preimage manifest is invalid")
+        entries = manifest.get("entries")
+        if not isinstance(entries, list):
+            raise SandboxApplyError("Apply preimage entries are invalid")
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    def _validate_restore_preimages(
+        self,
+        manifest: dict,
+        preimages: list[dict],
+        host_root: Path,
+    ) -> tuple[list[dict], tuple[HostConflict, ...]]:
+        operations = manifest.get("operations")
+        if not isinstance(operations, list):
+            raise SandboxApplyError("Apply manifest operations are invalid")
+        desired_by_path: dict[str, FileState | None] = {}
+        for operation in operations:
+            if not isinstance(operation, dict):
+                raise SandboxApplyError("Apply manifest operations are invalid")
+            desired_by_path[_logical_path(operation.get("path"))] = _file_state_from_json(operation.get("desired"))
+
+        restore_entries: list[dict] = []
+        conflicts: list[HostConflict] = []
+        for preimage in preimages:
+            path = _logical_path(preimage.get("path"))
+            if path not in desired_by_path:
+                raise SandboxApplyError("Apply backup does not match its manifest")
+            before_apply = _file_state_from_json(preimage.get("state"))
+            desired = desired_by_path[path]
+            current = _file_state_at(host_root, path, self._limits)
+            if current == before_apply:
+                continue
+            if current == desired:
+                restore_entries.append(preimage)
+                continue
+            conflicts.append(
+                HostConflict(path, "host_state_changed_after_apply", before_apply, current)
+            )
+        return restore_entries, tuple(conflicts)
+
+    def _restore_preimage(
+        self,
+        preimage: dict,
+        host_root: Path,
+        metadata: SandboxMetadata,
+        operation_id: str,
+    ) -> None:
+        path = _logical_path(preimage.get("path"))
+        state = _file_state_from_json(preimage.get("state"))
+        target = _host_target(host_root, path)
+        _ensure_safe_parent(host_root, target)
+        if state is None:
+            _remove_existing_path(target, directory_only=False)
+            return
+        if state.kind is FileStateKind.DIRECTORY:
+            current = _file_state_at(host_root, path, self._limits)
+            if current is None:
+                target.mkdir()
+            elif current.kind is not FileStateKind.DIRECTORY:
+                _remove_existing_path(target, directory_only=False)
+                target.mkdir()
+            return
+        _remove_existing_path(target, directory_only=False)
+        if state.kind is FileStateKind.SYMLINK:
+            if state.symlink_target is None:
+                raise SandboxApplyError("symlink preimage has no target")
+            os.symlink(state.symlink_target, target)
+            return
+        content_ref = preimage.get("content_ref")
+        if not isinstance(content_ref, str):
+            raise SandboxApplyError("regular-file preimage has no content")
+        content_path = metadata.sandbox_root.parent / "apply-backups" / operation_id / content_ref
+        _ensure_within(content_path, metadata.sandbox_root.parent / "apply-backups" / operation_id)
+        _write_regular_atomically(target, content_path.read_bytes(), state)
 
 
 def workspace_identity(root: Path) -> str:
@@ -761,6 +1276,390 @@ def _summarize_changes(changes: tuple[PathChange, ...]) -> ChangedSetSummary:
         symlink_changed=counts[ChangeKind.SYMLINK_CHANGED],
         type_changed=counts[ChangeKind.TYPE_CHANGED],
     )
+
+
+def _ordered_apply_operations(changes: tuple[PathChange, ...]) -> tuple[ApplyOperation, ...]:
+    operations = tuple(_apply_operation_for(change) for change in changes)
+
+    def sort_key(operation: ApplyOperation) -> tuple[int, int, str]:
+        depth = operation.path.count("/") + 1
+        desired_directory = operation.desired is not None and operation.desired.kind is FileStateKind.DIRECTORY
+        replaces_directory = _operation_replaces_or_deletes_directory(operation)
+        if desired_directory:
+            return (0, depth, operation.path)
+        if operation.action is ApplyAction.DELETE and not replaces_directory:
+            return (2, -depth, operation.path)
+        if replaces_directory:
+            return (3, -depth, operation.path)
+        if operation.action is ApplyAction.DELETE_DIRECTORY:
+            return (4, -depth, operation.path)
+        return (1, depth, operation.path)
+
+    return tuple(sorted(operations, key=sort_key))
+
+
+def _apply_operation_for(change: PathChange) -> ApplyOperation:
+    if change.kind is ChangeKind.ADDED:
+        assert change.current is not None
+        action = {
+            FileStateKind.DIRECTORY: ApplyAction.CREATE_DIRECTORY,
+            FileStateKind.SYMLINK: ApplyAction.CREATE_SYMLINK,
+            FileStateKind.REGULAR: ApplyAction.CREATE,
+        }[change.current.kind]
+    elif change.kind is ChangeKind.DELETED:
+        assert change.baseline is not None
+        action = ApplyAction.DELETE_DIRECTORY if change.baseline.kind is FileStateKind.DIRECTORY else ApplyAction.DELETE
+    elif change.kind is ChangeKind.MODE_CHANGED:
+        action = ApplyAction.SET_MODE
+    elif change.kind is ChangeKind.SYMLINK_CHANGED:
+        action = ApplyAction.CREATE_SYMLINK
+    elif change.kind is ChangeKind.TYPE_CHANGED:
+        action = ApplyAction.REPLACE_TYPE
+    else:
+        action = ApplyAction.WRITE
+    return ApplyOperation(change.path, action, change.baseline, change.current)
+
+
+def _operation_replaces_or_deletes_directory(operation: ApplyOperation) -> bool:
+    return (
+        operation.expected_baseline is not None
+        and operation.expected_baseline.kind is FileStateKind.DIRECTORY
+        and (operation.desired is None or operation.desired.kind is not FileStateKind.DIRECTORY)
+    )
+
+
+def _file_state_to_json(state_value: FileState | None) -> dict[str, object] | None:
+    if state_value is None:
+        return None
+    return {
+        "kind": state_value.kind.value,
+        "content_digest": state_value.content_digest,
+        "size_bytes": state_value.size_bytes,
+        "executable": state_value.executable,
+        "symlink_target": state_value.symlink_target,
+        "binary": state_value.binary,
+    }
+
+
+def _file_state_from_json(value: object) -> FileState | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise SandboxApplyError("stored FileState is invalid")
+    try:
+        return FileState(
+            kind=FileStateKind(value["kind"]),
+            content_digest=value.get("content_digest"),
+            size_bytes=value.get("size_bytes"),
+            executable=value.get("executable"),
+            symlink_target=value.get("symlink_target"),
+            binary=bool(value.get("binary", False)),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SandboxApplyError("stored FileState is invalid") from error
+
+
+def _manifest_path(metadata: SandboxMetadata, operation_id: str) -> Path:
+    if not isinstance(operation_id, str) or not operation_id or any(char not in "0123456789abcdef" for char in operation_id):
+        raise SandboxApplyError("Apply operation id is invalid")
+    return metadata.sandbox_root.parent / "apply" / f"{operation_id}.json"
+
+
+def _manifest_state(manifest: dict) -> ApplyState:
+    try:
+        return ApplyState(manifest["state"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise SandboxApplyError("Apply manifest state is invalid") from error
+
+
+def _has_unfinished_apply(metadata: SandboxMetadata) -> bool:
+    apply_root = metadata.sandbox_root.parent / "apply"
+    if not apply_root.is_dir():
+        return False
+    for manifest_path in apply_root.glob("*.json"):
+        manifest = SandboxStore._read_json(manifest_path)
+        if manifest.get("sandbox_id") != metadata.sandbox_id:
+            continue
+        if _manifest_state(manifest) in {ApplyState.APPLYING, ApplyState.RECOVERY_REQUIRED, ApplyState.RESTORING}:
+            return True
+    return False
+
+
+def _host_target(root: Path, path: str) -> Path:
+    logical = _logical_path(path)
+    target = Path(root).joinpath(*logical.split("/"))
+    _ensure_within(target, Path(root))
+    return target
+
+
+def _ensure_within(path: Path, root: Path) -> None:
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise SandboxApplyError("path escapes its managed root") from error
+
+
+def _file_state_at(root: Path, path: str, limits: SandboxDiffLimits) -> FileState | None:
+    target = _host_target(root, path)
+    try:
+        entry_stat = _lstat_without_following_parents(root, target)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SandboxApplyError(f"could not inspect managed path {path}: {error}") from error
+    if stat.S_ISLNK(entry_stat.st_mode):
+        target_value = os.readlink(target)
+        target_bytes = os.fsencode(target_value)
+        return FileState(FileStateKind.SYMLINK, _sha256(target_bytes), len(target_bytes), None, target_value)
+    if stat.S_ISDIR(entry_stat.st_mode):
+        return FileState(FileStateKind.DIRECTORY, None, None, None, None)
+    if stat.S_ISREG(entry_stat.st_mode):
+        digest, size_bytes, binary = _regular_file_facts(target, limits.max_single_file_bytes)
+        return FileState(
+            FileStateKind.REGULAR,
+            digest,
+            size_bytes,
+            None if os.name == "nt" else bool(entry_stat.st_mode & stat.S_IXUSR),
+            None,
+            binary,
+        )
+    raise SandboxApplyError(f"unsupported managed path type: {path}")
+
+
+def _read_regular_bytes_at(root: Path, path: str, limits: SandboxDiffLimits) -> bytes:
+    target = _host_target(root, path)
+    try:
+        before = _lstat_without_following_parents(root, target)
+    except OSError as error:
+        raise SandboxApplyError(f"could not inspect regular file {path}: {error}") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise SandboxApplyError(f"managed path is not a regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+        try:
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limits.max_single_file_bytes:
+                    raise SandboxApplyError("regular file exceeds Sandbox Apply resource limit")
+                chunks.append(chunk)
+            content = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+        after = _lstat_without_following_parents(root, target)
+    except SandboxApplyError:
+        raise
+    except OSError as error:
+        raise SandboxApplyError(f"could not read regular file {path}: {error}") from error
+    if not stat.S_ISREG(after.st_mode) or after.st_size != before.st_size:
+        raise SandboxApplyError(f"regular file changed while it was read: {path}")
+    return content
+
+
+def _lstat_without_following_parents(root: Path, target: Path) -> os.stat_result:
+    """Inspect a logical child without traversing an intermediate symlink."""
+    root = Path(root)
+    try:
+        root_stat = root.lstat()
+    except OSError as error:
+        raise SandboxApplyError(f"managed root is unavailable: {error}") from error
+    if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+        raise SandboxApplyError("managed root is not a safe directory")
+    parent = root
+    for part in target.relative_to(root).parts[:-1]:
+        parent = parent / part
+        try:
+            parent_stat = parent.lstat()
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            raise SandboxApplyError(f"could not inspect managed parent: {error}") from error
+        if stat.S_ISLNK(parent_stat.st_mode):
+            raise SandboxApplyError("managed parent is a symlink")
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            raise FileNotFoundError(str(parent))
+    return target.lstat()
+
+
+def _first_unsafe_host_ancestor(
+    host_root: Path,
+    baseline: dict[str, FileState],
+    path: str,
+    operations: tuple[ApplyOperation, ...],
+    limits: SandboxDiffLimits,
+) -> HostConflict | None:
+    planned_directories = {
+        operation.path
+        for operation in operations
+        if operation.desired is not None and operation.desired.kind is FileStateKind.DIRECTORY
+    }
+    parts = path.split("/")[:-1]
+    for index in range(1, len(parts) + 1):
+        ancestor_path = "/".join(parts[:index])
+        expected = baseline.get(ancestor_path)
+        current = _file_state_at(host_root, ancestor_path, limits)
+        if ancestor_path in planned_directories:
+            # This ancestor is itself a validated operation.  Its B0 state may
+            # be missing or non-directory; the ordered plan creates the
+            # directory before any descendant operation.
+            continue
+        if expected is not None and expected.kind is FileStateKind.DIRECTORY:
+            if current != expected:
+                return HostConflict(ancestor_path, "host_ancestor_differs_from_baseline", expected, current)
+        elif current is not None and current.kind is not FileStateKind.DIRECTORY:
+            return HostConflict(ancestor_path, "host_ancestor_is_not_directory", expected, current)
+    return None
+
+
+def _subtree_conflict(
+    host_root: Path,
+    baseline: dict[str, FileState],
+    root_path: str,
+    limits: SandboxDiffLimits,
+) -> HostConflict | None:
+    host_root_state = _file_state_at(host_root, root_path, limits)
+    expected_root = baseline.get(root_path)
+    if host_root_state != expected_root:
+        return HostConflict(root_path, "host_subtree_root_differs_from_baseline", expected_root, host_root_state)
+    if host_root_state is None or host_root_state.kind is not FileStateKind.DIRECTORY:
+        return None
+    expected = {
+        path: state for path, state in baseline.items() if path == root_path or path.startswith(root_path + "/")
+    }
+    current = _scan_subtree(host_root, root_path, limits)
+    if current != expected:
+        return HostConflict(root_path, "host_subtree_differs_from_baseline", expected_root, host_root_state)
+    return None
+
+
+def _scan_subtree(root: Path, root_path: str, limits: SandboxDiffLimits) -> dict[str, FileState]:
+    states: dict[str, FileState] = {}
+    file_count = 0
+    total_bytes = 0
+
+    def visit(path: str) -> None:
+        nonlocal file_count, total_bytes
+        state_value = _file_state_at(root, path, limits)
+        if state_value is None:
+            return
+        file_count += 1
+        if file_count > limits.max_files:
+            raise SandboxApplyError("Host drift scan exceeded max_files")
+        if state_value.size_bytes is not None:
+            total_bytes += state_value.size_bytes
+            if total_bytes > limits.max_total_bytes:
+                raise SandboxApplyError("Host drift scan exceeded max_total_bytes")
+        states[path] = state_value
+        if state_value.kind is FileStateKind.DIRECTORY:
+            directory = _host_target(root, path)
+            try:
+                entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
+            except OSError as error:
+                raise SandboxApplyError(f"could not scan Host subtree {path}: {error}") from error
+            for entry in entries:
+                visit(f"{path}/{entry.name}")
+
+    visit(root_path)
+    return states
+
+
+def _ensure_safe_parent(root: Path, target: Path) -> None:
+    root = Path(root)
+    try:
+        root_stat = root.lstat()
+    except OSError as error:
+        raise SandboxApplyError(f"Host Workspace is unavailable: {error}") from error
+    if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+        raise SandboxApplyError("Host Workspace root is not a safe directory")
+    relative_parts = target.relative_to(root).parts[:-1]
+    parent = root
+    for part in relative_parts:
+        parent = parent / part
+        try:
+            parent_stat = parent.lstat()
+        except FileNotFoundError as error:
+            raise SandboxApplyError(f"Host parent directory is missing: {parent}") from error
+        except OSError as error:
+            raise SandboxApplyError(f"could not inspect Host parent directory: {error}") from error
+        if not stat.S_ISDIR(parent_stat.st_mode) or stat.S_ISLNK(parent_stat.st_mode):
+            raise SandboxApplyError("Host parent path is not a safe directory")
+
+
+def _remove_existing_path(target: Path, *, directory_only: bool) -> None:
+    try:
+        state_value = target.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(state_value.st_mode) and not stat.S_ISLNK(state_value.st_mode):
+        target.rmdir()  # Intentionally never recursive: unknown Host content must survive.
+        return
+    if directory_only:
+        raise SandboxApplyError("expected an empty Host directory")
+    if stat.S_ISLNK(state_value.st_mode) or stat.S_ISREG(state_value.st_mode):
+        target.unlink()
+        return
+    raise SandboxApplyError("unsupported Host path type for removal")
+
+
+def _write_durable_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise SandboxApplyError(f"could not persist Apply preimage: {error}") from error
+
+
+def _write_regular_atomically(target: Path, content: bytes, state_value: FileState) -> None:
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if state_value.executable is not None:
+            _copy_mode(temporary, 0o755 if state_value.executable else 0o644)
+        temporary.replace(target)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise SandboxApplyError(f"could not atomically write Host file: {error}") from error
+
+
+def _create_symlink_from_sandbox(sandbox_root: Path, path: str, target: Path, desired: FileState) -> None:
+    source = _host_target(sandbox_root, path)
+    try:
+        source_stat = source.lstat()
+    except OSError as error:
+        raise SandboxApplyError(f"could not inspect Sandbox symlink: {error}") from error
+    if not stat.S_ISLNK(source_stat.st_mode):
+        raise SandboxApplyError("Sandbox desired symlink changed after confirmation")
+    link_target = os.readlink(source)
+    if desired.symlink_target != link_target:
+        raise SandboxApplyError("Sandbox desired symlink changed after confirmation")
+    os.symlink(link_target, target)
+
+
+def _ordered_preimages_for_restore(entries: list[dict]) -> list[dict]:
+    def key(entry: dict) -> tuple[int, int, str]:
+        path = _logical_path(entry.get("path"))
+        state_value = _file_state_from_json(entry.get("state"))
+        depth = path.count("/") + 1
+        if state_value is not None and state_value.kind is FileStateKind.DIRECTORY:
+            return (0, depth, path)
+        if state_value is None:
+            return (2, -depth, path)
+        return (1, depth, path)
+    return sorted(entries, key=key)
 
 
 def _logical_path(value: object) -> str:

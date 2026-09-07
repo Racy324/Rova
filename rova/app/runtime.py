@@ -17,6 +17,7 @@ from rova.agent_core.tools import ToolExecutionMode
 from rova.agent_core.tool_output import ToolOutputProcessor
 from rova.agent_core.types import StreamFn
 from rova.agent_session.agent_session import AgentSession
+from rova.agent_session.execution_journal import ExecutionEnvironmentIdentity, ExecutionEnvironmentStatus
 from rova.agent_session.compaction import CompactionPolicy
 from rova.artifacts import FileArtifactStore
 
@@ -282,6 +283,10 @@ def build_rova_runtime(
     execution_environment: ExecutionEnvironment | None = None
     pending_sandbox_store: SandboxStore | None = None
     pending_sandbox_id: str | None = None
+    active_sandbox_store: SandboxStore | None = None
+    active_sandbox_id: str | None = None
+    unavailable_sandbox: SandboxState | None = None
+    sandbox_resumed = False
     if workspace is not None:
         if isolated_sandbox:
             sandbox_store = SandboxStore(sandbox_root or RovaDataPaths.resolve().sandboxes)
@@ -295,15 +300,20 @@ def build_rova_runtime(
                 pending_sandbox_store = sandbox_store
                 pending_sandbox_id = imported.sandbox_id
             else:
-                if existing.state is not SandboxState.READY:
-                    raise SandboxError(f"Sandbox is unavailable in state {existing.state.value}; create a new Sandbox explicitly")
                 imported = existing
-            execution_environment = DockerSandboxEnvironment(
-                host_workspace=workspace,
-                sandbox_workspace=Workspace(imported.sandbox_root),
-                image=docker_image or "",
-                skill_root=effective_skill_store.root,
-            )
+                sandbox_resumed = True
+            active_sandbox_store = sandbox_store
+            active_sandbox_id = imported.sandbox_id
+            if imported.state is SandboxState.READY or pending_sandbox_store is not None:
+                execution_environment = DockerSandboxEnvironment(
+                    host_workspace=workspace,
+                    sandbox_workspace=Workspace(imported.sandbox_root),
+                    image=docker_image or "",
+                    skill_root=effective_skill_store.root,
+                    resumed=sandbox_resumed,
+                )
+            else:
+                unavailable_sandbox = imported.state
         else:
             effective_terminal_backend = (
                 LocalTerminalBackend(workspace)
@@ -336,12 +346,11 @@ def build_rova_runtime(
     effective_approval_handler: ApprovalHandler | None = approval_handler
     if permission_mode == "full" and effective_approval_handler is None:
         effective_approval_handler = AlwaysApprove()
-    if workspace is not None:
+    if execution_environment is not None:
         assert effective_terminal_backend is not None
         effective_approval_handler = effective_approval_handler or _approval_handler_for_mode(
             permission_mode, effective_terminal_backend
         )
-        assert execution_environment is not None
         tools.extend(build_coding_tools(execution_environment))
         if vision_client is not None:
             tools.append(create_vision_analyze_tool(execution_environment.filesystem, vision_client))
@@ -410,6 +419,21 @@ def build_rova_runtime(
         )
         agent.subscribe(_isolated_experience_event_handler(experience_review_service))
     provider_context_estimator = lambda context: estimate_provider_input_tokens(model, context)
+    branch_guard = (
+        _sandbox_branch_guard(active_sandbox_store, active_sandbox_id)
+        if active_sandbox_store is not None and active_sandbox_id is not None
+        else None
+    )
+    environment_identity_resolver = (
+        _sandbox_execution_identity_resolver(active_sandbox_store, active_sandbox_id)
+        if active_sandbox_store is not None and active_sandbox_id is not None and unavailable_sandbox is None
+        else (_local_execution_identity if not isolated_sandbox else None)
+    )
+    environment_status_resolver = (
+        _sandbox_environment_status_resolver(active_sandbox_store)
+        if active_sandbox_store is not None
+        else _local_environment_status
+    )
     session = (
         AgentSession.load(
             agent,
@@ -417,6 +441,9 @@ def build_rova_runtime(
             session_root=session_root,
             compaction_policy=compaction_policy,
             provider_context_estimator=provider_context_estimator,
+            branch_guard=branch_guard,
+            execution_environment_identity_resolver=environment_identity_resolver,
+            environment_status_resolver=environment_status_resolver,
         )
         if session_id is not None
         else AgentSession.create(
@@ -424,12 +451,20 @@ def build_rova_runtime(
             session_root=session_root,
             compaction_policy=compaction_policy,
             provider_context_estimator=provider_context_estimator,
+            branch_guard=branch_guard,
+            execution_environment_identity_resolver=environment_identity_resolver,
+            environment_status_resolver=environment_status_resolver,
         )
     )
     if pending_sandbox_store is not None and pending_sandbox_id is not None:
         assert session.session_id is not None
         pending_sandbox_store.bind_session(pending_sandbox_id, session.session_id)
         pending_sandbox_store.mark_ready(pending_sandbox_id)
+    if unavailable_sandbox is not None:
+        session.close()
+        raise SandboxError(
+            f"Sandbox is unavailable in state {unavailable_sandbox.value}; create a new Sandbox explicitly"
+        )
 
     async def prepare_runtime_context(base_context: Context) -> Context:
         provider_context = _assemble_runtime_context(
@@ -661,7 +696,7 @@ def _runtime_facts_section(
                 "- Host workspace is isolated from Docker Sandbox tool changes in this Runtime.",
             ])
             if execution_environment.descriptor.resume_note:
-                lines.append(f"- Sandbox resume: {execution_environment.descriptor.resume_note}")
+                lines.append(f"- Sandbox environment: {execution_environment.descriptor.resume_note}")
         else:
             lines.extend([
                 f"- Terminal backend: {terminal_backend.environment.kind}",
@@ -680,6 +715,61 @@ def _web_tool_guidance_section() -> str:
         "- Only fetch_webpage results with status=fetched may support factual citations using their [S#] labels.",
         "- Distinguish sourced facts from your synthesis, and state uncertainty when fetched evidence is insufficient.",
     ])
+
+
+def _sandbox_branch_guard(store: SandboxStore, sandbox_id: str) -> Callable[[], str | None]:
+    def guard() -> str | None:
+        metadata = store._load_metadata(sandbox_id)
+        if metadata.state is SandboxState.READY:
+            return "cannot branch while an active Sandbox owns the mutable workspace"
+        return None
+
+    return guard
+
+
+def _local_execution_identity() -> ExecutionEnvironmentIdentity:
+    return ExecutionEnvironmentIdentity("local")
+
+
+def _local_environment_status(identity: ExecutionEnvironmentIdentity) -> ExecutionEnvironmentStatus:
+    if identity.kind != "local":
+        return ExecutionEnvironmentStatus(identity, False, "unknown", environment_lost=True)
+    return ExecutionEnvironmentStatus(identity, True, "local")
+
+
+def _sandbox_execution_identity_resolver(
+    store: SandboxStore,
+    sandbox_id: str,
+) -> Callable[[], ExecutionEnvironmentIdentity]:
+    def resolve() -> ExecutionEnvironmentIdentity:
+        metadata = store.load_for_execution(sandbox_id)
+        if metadata.state is not SandboxState.READY:
+            raise SandboxError(f"Sandbox is unavailable in state {metadata.state.value}; coding execution is blocked")
+        return ExecutionEnvironmentIdentity("docker_sandbox", sandbox_id)
+
+    return resolve
+
+
+def _sandbox_environment_status_resolver(
+    store: SandboxStore,
+) -> Callable[[ExecutionEnvironmentIdentity], ExecutionEnvironmentStatus]:
+    def resolve(identity: ExecutionEnvironmentIdentity) -> ExecutionEnvironmentStatus:
+        if identity.kind != "docker_sandbox" or identity.sandbox_id is None:
+            return ExecutionEnvironmentStatus(identity, False, "unknown", environment_lost=True)
+        try:
+            metadata = store.load_for_execution(identity.sandbox_id)
+        except SandboxError:
+            return ExecutionEnvironmentStatus(identity, False, "abandoned", environment_lost=True)
+        available = metadata.state is SandboxState.READY
+        return ExecutionEnvironmentStatus(
+            identity,
+            available,
+            metadata.state.value,
+            environment_lost=metadata.state is SandboxState.ABANDONED,
+            lifecycle_contradiction=metadata.state in {SandboxState.APPLIED, SandboxState.DISCARDED},
+        )
+
+    return resolve
 
 
 def _isolated_experience_event_handler(service: ExperienceReviewService):

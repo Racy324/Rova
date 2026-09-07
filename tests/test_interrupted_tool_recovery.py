@@ -10,7 +10,11 @@ from rova.agent_core.agent import Agent
 from rova.agent_core.events import AgentEvent
 from rova.agent_core.tools import AgentTool, AgentToolResult
 from rova.agent_session.agent_session import AgentSession, SessionPersistenceError, SessionRecoveryError
-from rova.agent_session.execution_journal import ToolExecutionJournal
+from rova.agent_session.execution_journal import (
+    ExecutionEnvironmentIdentity,
+    ExecutionEnvironmentStatus,
+    ToolExecutionJournal,
+)
 from rova.agent_session.session_store import JsonlSessionStore, SessionStoreError
 
 
@@ -36,11 +40,18 @@ async def test_started_record_is_durable_before_executor_launch(tmp_path) -> Non
         return AgentToolResult([TextBlock("ok")])
 
     agent = Agent(Model("mock"), "", [AgentTool(Tool("sample", "sample", {}), execute)], _tool_stream())
-    session = AgentSession.create(agent, session_root=tmp_path)
+    session = AgentSession.create(
+        agent,
+        session_root=tmp_path,
+        execution_environment_identity_resolver=lambda: ExecutionEnvironmentIdentity("local"),
+    )
 
     await session.prompt("run")
 
     assert observed_states == ["started"]
+    record = session._execution_journal.load()[0]
+    assert record.environment_kind == "local"
+    assert record.sandbox_id is None
 
 
 @pytest.mark.asyncio
@@ -49,7 +60,11 @@ async def test_completed_receipt_is_durable_before_tool_result_commit(tmp_path, 
         return AgentToolResult([TextBlock("canonical result")], {"outcome": "success"})
 
     agent = Agent(Model("mock"), "", [AgentTool(Tool("sample", "sample", {}), execute)], _tool_stream())
-    session = AgentSession.create(agent, session_root=tmp_path)
+    session = AgentSession.create(
+        agent,
+        session_root=tmp_path,
+        execution_environment_identity_resolver=lambda: ExecutionEnvironmentIdentity("docker_sandbox", "sandbox-1"),
+    )
     original_append = session._durable_session.store.append_message
 
     def fail_tool_result(session_id, parent_id, message):
@@ -67,6 +82,8 @@ async def test_completed_receipt_is_durable_before_tool_result_commit(tmp_path, 
     assert len(completed) == 1
     assert completed[0].receipt is not None
     assert completed[0].receipt.content == "canonical result"
+    assert {record.environment_kind for record in records} == {"docker_sandbox"}
+    assert {record.sandbox_id for record in records} == {"sandbox-1"}
     assert JsonlSessionStore(tmp_path).load(session.session_id).messages == [
         UserMessage("run"),
         AssistantMessage([ToolCall("call-1", "sample", {})], stop_reason="tool_calls"),
@@ -277,3 +294,173 @@ def test_existing_session_tool_result_skips_irrelevant_journal_state(tmp_path) -
 
     assert session.recovery_report.recovered_count == 0
     assert [message.text for message in agent.messages if isinstance(message, ToolResultMessage)] == ["session authority"]
+
+
+def test_started_sandbox_call_recovers_with_available_environment_facts(tmp_path) -> None:
+    store = JsonlSessionStore(tmp_path)
+    durable = store.create()
+    durable.append(UserMessage("run"))
+    assistant_entry_id = durable.append(AssistantMessage([ToolCall("call-1", "sample", {})], stop_reason="tool_calls"))
+    journal = ToolExecutionJournal(tmp_path, durable.session_id)
+    journal.append(
+        AgentEvent(
+            "tool_execution_state", tool_call_id="call-1", tool_name="sample", batch_id="batch",
+            call_index=0, batch_mode="sequential", execution_mode="sequential", execution_state="started",
+        ),
+        assistant_entry_id=assistant_entry_id,
+        environment_identity=ExecutionEnvironmentIdentity("docker_sandbox", "sandbox-1"),
+    )
+
+    agent = Agent(Model("mock"), "", [], _tool_stream())
+    AgentSession.load(
+        agent,
+        durable.session_id,
+        session_root=tmp_path,
+        environment_status_resolver=lambda identity: ExecutionEnvironmentStatus(identity, True, "ready"),
+    )
+
+    result = next(message for message in agent.messages if isinstance(message, ToolResultMessage))
+    assert result.metadata["outcome"] == "execution_interrupted"
+    assert result.metadata["side_effects_unknown"] is True
+    assert result.metadata["environment"] == {
+        "kind": "docker_sandbox",
+        "sandbox_id": "sandbox-1",
+        "available": True,
+        "state": "ready",
+        "workspace_side_effects_may_exist": True,
+    }
+
+
+def test_lost_sandbox_closes_protocol_without_fabricating_a_host_fallback(tmp_path) -> None:
+    store = JsonlSessionStore(tmp_path)
+    durable = store.create()
+    durable.append(UserMessage("run"))
+    assistant_entry_id = durable.append(AssistantMessage([ToolCall("call-1", "sample", {})], stop_reason="tool_calls"))
+    journal = ToolExecutionJournal(tmp_path, durable.session_id)
+    journal.append(
+        AgentEvent(
+            "tool_execution_state", tool_call_id="call-1", tool_name="sample", batch_id="batch",
+            call_index=0, batch_mode="sequential", execution_mode="sequential", execution_state="started",
+        ),
+        assistant_entry_id=assistant_entry_id,
+        environment_identity=ExecutionEnvironmentIdentity("docker_sandbox", "sandbox-1"),
+    )
+
+    agent = Agent(Model("mock"), "", [], _tool_stream())
+    AgentSession.load(
+        agent,
+        durable.session_id,
+        session_root=tmp_path,
+        environment_status_resolver=lambda identity: ExecutionEnvironmentStatus(identity, False, "abandoned", environment_lost=True),
+    )
+
+    result = next(message for message in agent.messages if isinstance(message, ToolResultMessage))
+    assert result.metadata["environment"]["available"] is False
+    assert result.metadata["environment"]["environment_lost"] is True
+    assert "host_workspace" not in repr(result.metadata)
+
+
+def test_terminal_sandbox_state_marks_unresolved_tool_as_a_lifecycle_contradiction(tmp_path) -> None:
+    store = JsonlSessionStore(tmp_path)
+    durable = store.create()
+    durable.append(UserMessage("run"))
+    assistant_entry_id = durable.append(AssistantMessage([ToolCall("call-1", "sample", {})], stop_reason="tool_calls"))
+    journal = ToolExecutionJournal(tmp_path, durable.session_id)
+    journal.append(
+        AgentEvent(
+            "tool_execution_state", tool_call_id="call-1", tool_name="sample", batch_id="batch",
+            call_index=0, batch_mode="sequential", execution_mode="sequential", execution_state="started",
+        ),
+        assistant_entry_id=assistant_entry_id,
+        environment_identity=ExecutionEnvironmentIdentity("docker_sandbox", "sandbox-1"),
+    )
+
+    agent = Agent(Model("mock"), "", [], _tool_stream())
+    AgentSession.load(
+        agent,
+        durable.session_id,
+        session_root=tmp_path,
+        environment_status_resolver=lambda identity: ExecutionEnvironmentStatus(
+            identity, False, "applied", lifecycle_contradiction=True
+        ),
+    )
+
+    result = next(message for message in agent.messages if isinstance(message, ToolResultMessage))
+    assert result.metadata["outcome"] == "execution_interrupted"
+    assert result.metadata["environment"]["lifecycle_contradiction"] is True
+
+
+def test_completed_receipt_remains_exact_when_its_sandbox_is_lost(tmp_path) -> None:
+    store = JsonlSessionStore(tmp_path)
+    durable = store.create()
+    durable.append(UserMessage("run"))
+    assistant_entry_id = durable.append(AssistantMessage([ToolCall("call-1", "sample", {})], stop_reason="tool_calls"))
+    journal = ToolExecutionJournal(tmp_path, durable.session_id)
+    journal.append(
+        AgentEvent(
+            "tool_execution_state", tool_call_id="call-1", tool_name="sample", batch_id="batch",
+            call_index=0, batch_mode="sequential", execution_mode="sequential", execution_state="completed",
+            outcome="success", result="canonical", is_error=False, metadata={"outcome": "success", "answer": 42},
+        ),
+        assistant_entry_id=assistant_entry_id,
+        environment_identity=ExecutionEnvironmentIdentity("docker_sandbox", "sandbox-1"),
+    )
+
+    agent = Agent(Model("mock"), "", [], _tool_stream())
+    AgentSession.load(
+        agent,
+        durable.session_id,
+        session_root=tmp_path,
+        environment_status_resolver=lambda identity: ExecutionEnvironmentStatus(identity, False, "abandoned", environment_lost=True),
+    )
+
+    result = next(message for message in agent.messages if isinstance(message, ToolResultMessage))
+    assert result.text == "canonical"
+    assert result.metadata == {"outcome": "success", "answer": 42}
+
+
+def test_recovery_rejects_mixed_environment_identities_in_one_batch(tmp_path) -> None:
+    store = JsonlSessionStore(tmp_path)
+    durable = store.create()
+    durable.append(UserMessage("run"))
+    assistant_entry_id = durable.append(AssistantMessage([
+        ToolCall("first", "sample", {}), ToolCall("second", "sample", {}),
+    ], stop_reason="tool_calls"))
+    journal = ToolExecutionJournal(tmp_path, durable.session_id)
+    for index, sandbox_id in enumerate(("sandbox-1", "sandbox-2")):
+        journal.append(
+            AgentEvent(
+                "tool_execution_state", tool_call_id=("first", "second")[index], tool_name="sample", batch_id="batch",
+                call_index=index, batch_mode="parallel", execution_mode="parallel", execution_state="started",
+            ),
+            assistant_entry_id=assistant_entry_id,
+            environment_identity=ExecutionEnvironmentIdentity("docker_sandbox", sandbox_id),
+        )
+
+    with pytest.raises(SessionRecoveryError, match="environment identities"):
+        AgentSession.load(Agent(Model("mock"), "", [], _tool_stream()), durable.session_id, session_root=tmp_path)
+
+
+def test_recovery_rejects_changed_environment_within_one_tool_lifecycle(tmp_path) -> None:
+    store = JsonlSessionStore(tmp_path)
+    durable = store.create()
+    durable.append(UserMessage("run"))
+    assistant_entry_id = durable.append(AssistantMessage([ToolCall("call-1", "sample", {})], stop_reason="tool_calls"))
+    journal = ToolExecutionJournal(tmp_path, durable.session_id)
+    for state, sandbox_id in (("started", "sandbox-1"), ("completed", "sandbox-2")):
+        event = AgentEvent(
+            "tool_execution_state", tool_call_id="call-1", tool_name="sample", batch_id="batch",
+            call_index=0, batch_mode="sequential", execution_mode="sequential", execution_state=state,
+            outcome="success" if state == "completed" else None,
+            result="canonical" if state == "completed" else None,
+            is_error=False,
+            metadata={"outcome": "success"} if state == "completed" else None,
+        )
+        journal.append(
+            event,
+            assistant_entry_id=assistant_entry_id,
+            environment_identity=ExecutionEnvironmentIdentity("docker_sandbox", sandbox_id),
+        )
+
+    with pytest.raises(SessionRecoveryError, match="environment identities"):
+        AgentSession.load(Agent(Model("mock"), "", [], _tool_stream()), durable.session_id, session_root=tmp_path)

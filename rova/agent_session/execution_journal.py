@@ -22,6 +22,43 @@ class CompletionReceipt:
 
 
 @dataclass(frozen=True)
+class ExecutionEnvironmentIdentity:
+    """Durable logical identity of the environment used for one ToolCall."""
+
+    kind: str
+    sandbox_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, str) or not self.kind:
+            raise ValueError("execution environment kind must be a non-empty string")
+        if self.sandbox_id is not None and (not isinstance(self.sandbox_id, str) or not self.sandbox_id):
+            raise ValueError("sandbox_id must be a non-empty string or None")
+        if self.kind == "local" and self.sandbox_id is not None:
+            raise ValueError("local execution environment cannot have a sandbox_id")
+
+
+@dataclass(frozen=True)
+class ExecutionEnvironmentStatus:
+    """Current availability of a previously recorded execution environment."""
+
+    identity: ExecutionEnvironmentIdentity
+    available: bool
+    state: str
+    environment_lost: bool = False
+    lifecycle_contradiction: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.available, bool):
+            raise ValueError("execution environment availability must be a bool")
+        if not isinstance(self.state, str) or not self.state:
+            raise ValueError("execution environment state must be a non-empty string")
+        if self.environment_lost and self.available:
+            raise ValueError("an available execution environment cannot be lost")
+        if self.lifecycle_contradiction and self.available:
+            raise ValueError("an available execution environment cannot have a lifecycle contradiction")
+
+
+@dataclass(frozen=True)
 class JournalRecord:
     assistant_entry_id: str | None
     batch_id: str
@@ -35,6 +72,8 @@ class JournalRecord:
     timestamp: str
     receipt: CompletionReceipt | None = None
     is_legacy: bool = False
+    environment_kind: str | None = None
+    sandbox_id: str | None = None
 
 
 class ToolExecutionJournal:
@@ -43,7 +82,13 @@ class ToolExecutionJournal:
     def __init__(self, root: Path, session_id: str) -> None:
         self.path = Path(root) / f"{session_id}.executions.jsonl"
 
-    def append(self, event: AgentEvent, *, assistant_entry_id: str | None = None) -> None:
+    def append(
+        self,
+        event: AgentEvent,
+        *,
+        assistant_entry_id: str | None = None,
+        environment_identity: ExecutionEnvironmentIdentity | None = None,
+    ) -> None:
         if event.type != "tool_execution_state":
             raise ValueError("execution journal only accepts tool_execution_state events")
         payload = {
@@ -63,11 +108,14 @@ class ToolExecutionJournal:
             if not isinstance(assistant_entry_id, str) or not assistant_entry_id:
                 raise ValueError("assistant_entry_id must be a non-empty string or None")
             payload = {
-                "version": 2,
+                "version": 3 if environment_identity is not None else 2,
                 "record_type": "state",
                 "assistant_entry_id": assistant_entry_id,
                 **payload,
             }
+            if environment_identity is not None:
+                payload["environment_kind"] = environment_identity.kind
+                payload["sandbox_id"] = environment_identity.sandbox_id
             if event.execution_state == "completed":
                 if event.result is None:
                     raise ValueError("completed journal record requires canonical result text")
@@ -108,7 +156,8 @@ def _record_from_dict(value: object, line_number: int) -> JournalRecord:
         raise ExecutionJournalError(f"execution journal line {line_number} must be an object")
     if value.get("version") is None:
         return _record_from_payload(value, line_number, assistant_entry_id=None, receipt=None, is_legacy=True)
-    if value.get("version") != 2 or value.get("record_type") != "state":
+    version = value.get("version")
+    if version not in {2, 3} or value.get("record_type") != "state":
         raise ExecutionJournalError(f"execution journal line {line_number} has an unsupported version or record type")
     assistant_entry_id = _string(value.get("assistant_entry_id"), "assistant_entry_id", line_number)
     receipt_data = value.get("completion_receipt")
@@ -117,7 +166,24 @@ def _record_from_dict(value: object, line_number: int) -> JournalRecord:
         raise ExecutionJournalError(f"execution journal line {line_number} completed record has no receipt")
     if value.get("state") != "completed" and receipt is not None:
         raise ExecutionJournalError(f"execution journal line {line_number} non-completed record has a receipt")
-    return _record_from_payload(value, line_number, assistant_entry_id=assistant_entry_id, receipt=receipt, is_legacy=False)
+    environment_kind: str | None = None
+    sandbox_id: str | None = None
+    if version == 3:
+        environment_kind = _string(value.get("environment_kind"), "environment_kind", line_number)
+        sandbox_id = _optional_string(value.get("sandbox_id"), "sandbox_id", line_number)
+        try:
+            ExecutionEnvironmentIdentity(environment_kind, sandbox_id)
+        except ValueError as error:
+            raise ExecutionJournalError(f"execution journal line {line_number} has invalid environment identity: {error}") from error
+    return _record_from_payload(
+        value,
+        line_number,
+        assistant_entry_id=assistant_entry_id,
+        receipt=receipt,
+        is_legacy=False,
+        environment_kind=environment_kind,
+        sandbox_id=sandbox_id,
+    )
 
 
 def _record_from_payload(
@@ -127,6 +193,8 @@ def _record_from_payload(
     assistant_entry_id: str | None,
     receipt: CompletionReceipt | None,
     is_legacy: bool,
+    environment_kind: str | None = None,
+    sandbox_id: str | None = None,
 ) -> JournalRecord:
     state = _string(value.get("state"), "state", line_number)
     if state not in {"started", "executor_completed", "completed", "cancelled", "interrupted"}:
@@ -150,6 +218,8 @@ def _record_from_payload(
         timestamp=_string(value.get("timestamp"), "timestamp", line_number),
         receipt=receipt,
         is_legacy=is_legacy,
+        environment_kind=environment_kind,
+        sandbox_id=sandbox_id,
     )
 
 
@@ -169,6 +239,12 @@ def _string(value: object, name: str, line_number: int) -> str:
     if not isinstance(value, str) or not value:
         raise ExecutionJournalError(f"execution journal line {line_number} has invalid {name}")
     return value
+
+
+def _optional_string(value: object, name: str, line_number: int) -> str | None:
+    if value is None:
+        return None
+    return _string(value, name, line_number)
 
 
 def _json_object(value: object, name: str) -> dict[str, Any]:
