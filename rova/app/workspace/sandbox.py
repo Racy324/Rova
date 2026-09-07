@@ -27,6 +27,10 @@ class SandboxImportError(SandboxError):
     """The Host Workspace could not be imported as a complete Sandbox baseline."""
 
 
+class SandboxDiffError(SandboxError):
+    """A ChangedSet could not be computed completely and safely."""
+
+
 class SandboxState(str, Enum):
     CREATING = "creating"
     READY = "ready"
@@ -36,6 +40,73 @@ class SandboxState(str, Enum):
     DISCARDED = "discarded"
     FAILED = "failed"
     ABANDONED = "abandoned"
+
+
+class FileStateKind(str, Enum):
+    REGULAR = "regular"
+    SYMLINK = "symlink"
+    DIRECTORY = "directory"
+
+
+class ChangeKind(str, Enum):
+    ADDED = "added"
+    MODIFIED = "modified"
+    DELETED = "deleted"
+    MODE_CHANGED = "mode_changed"
+    SYMLINK_CHANGED = "symlink_changed"
+    TYPE_CHANGED = "type_changed"
+
+
+@dataclass(frozen=True)
+class FileState:
+    kind: FileStateKind
+    content_digest: str | None
+    size_bytes: int | None
+    executable: bool | None
+    symlink_target: str | None
+    binary: bool = False
+
+
+@dataclass(frozen=True)
+class PathChange:
+    path: str
+    kind: ChangeKind
+    baseline: FileState | None
+    current: FileState | None
+
+
+@dataclass(frozen=True)
+class ChangedSetSummary:
+    added: int = 0
+    modified: int = 0
+    deleted: int = 0
+    mode_changed: int = 0
+    symlink_changed: int = 0
+    type_changed: int = 0
+
+
+@dataclass(frozen=True)
+class ChangedSet:
+    sandbox_id: str
+    baseline_oid: str
+    generated_at: str
+    changes: tuple[PathChange, ...]
+    summary: ChangedSetSummary
+
+
+@dataclass(frozen=True)
+class SandboxDiffLimits:
+    max_files: int = 100_000
+    max_total_bytes: int = 1_073_741_824
+    max_single_file_bytes: int = 268_435_456
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in (
+            self.max_files,
+            self.max_total_bytes,
+            self.max_single_file_bytes,
+        )):
+            raise ValueError("Sandbox diff limits must be positive integers")
 
 
 @dataclass(frozen=True)
@@ -284,6 +355,35 @@ class SandboxStore:
         return self.root / "by-session" / f"{session_id}.json"
 
 
+class SandboxDiffService:
+    """Compute the Sandbox-owned B0 -> current-tree domain ChangedSet."""
+
+    def __init__(self, store: SandboxStore, *, limits: SandboxDiffLimits | None = None) -> None:
+        self._store = store
+        self._limits = limits or SandboxDiffLimits()
+
+    def compute_changed_set(self, sandbox_id: str) -> ChangedSet:
+        metadata = self._store._load_metadata(sandbox_id)
+        if metadata.baseline_commit_oid is None or not _private_commit_exists(metadata.sandbox_root, metadata.baseline_commit_oid):
+            raise SandboxDiffError("Sandbox immutable baseline is unavailable")
+        if not metadata.sandbox_root.is_dir():
+            raise SandboxDiffError("Sandbox workspace is unavailable")
+        baseline = _scan_baseline_tree(metadata)
+        current = _scan_workspace_tree(metadata.sandbox_root, self._limits)
+        changes = tuple(
+            change
+            for path in sorted(set(baseline) | set(current))
+            if (change := _path_change(path, baseline.get(path), current.get(path))) is not None
+        )
+        return ChangedSet(
+            sandbox_id=metadata.sandbox_id,
+            baseline_oid=metadata.baseline_commit_oid,
+            generated_at=_utc_now(),
+            changes=changes,
+            summary=_summarize_changes(changes),
+        )
+
+
 def workspace_identity(root: Path) -> str:
     normalized = str(Path(root).resolve())
     if os.name == "nt":
@@ -402,22 +502,55 @@ def _manifest_fingerprint(entries: list[dict[str, str | int]]) -> str:
 
 
 def _initialize_private_baseline(workspace_root: Path) -> str:
+    """Create B0 with Git plumbing so attributes and filters cannot alter bytes."""
     _run_git(workspace_root, "init", "--quiet", "--initial-branch=rova-baseline")
-    _run_git(workspace_root, "add", "--all", "--force")
-    _run_git(
+    index_entries: list[tuple[int, str, str]] = []
+
+    def add_directory(directory: Path) -> None:
+        for entry in sorted(directory.iterdir(), key=lambda value: value.name):
+            if entry.name == ".git":
+                continue
+            relative = entry.relative_to(workspace_root).as_posix()
+            entry_stat = entry.lstat()
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raw = os.fsencode(os.readlink(entry))
+                mode = 0o120000
+            elif stat.S_ISDIR(entry_stat.st_mode):
+                add_directory(entry)
+                continue
+            elif stat.S_ISREG(entry_stat.st_mode):
+                raw = entry.read_bytes()
+                mode = 0o100755 if entry_stat.st_mode & stat.S_IXUSR else 0o100644
+            else:
+                raise SandboxImportError(f"unsupported workspace entry: {relative}")
+            oid = _run_git_bytes(workspace_root, "hash-object", "-w", "--stdin", input_bytes=raw).decode("ascii").strip()
+            if not oid:
+                raise SandboxImportError("private Sandbox Git did not return a blob id")
+            index_entries.append((mode, oid, relative))
+
+    add_directory(workspace_root)
+    _run_git_bytes(
+        workspace_root,
+        "update-index",
+        "-z",
+        "--index-info",
+        input_bytes=b"".join(
+            f"{mode:o} {oid}\t{path}".encode("utf-8") + b"\0" for mode, oid, path in index_entries
+        ),
+    )
+    tree_oid = _run_git(workspace_root, "write-tree").strip()
+    baseline_commit_oid = _run_git(
         workspace_root,
         "-c",
         "user.name=Rova Sandbox",
         "-c",
         "user.email=rova-sandbox@local.invalid",
-        "commit",
-        "--quiet",
-        "--no-gpg-sign",
-        "--allow-empty",
+        "commit-tree",
+        tree_oid,
         "-m",
         "Rova Sandbox Baseline",
-    )
-    baseline_commit_oid = _run_git(workspace_root, "rev-parse", "HEAD").strip()
+    ).strip()
+    _run_git(workspace_root, "update-ref", "refs/heads/rova-baseline", baseline_commit_oid)
     if _run_git(workspace_root, "rev-list", "--count", "HEAD").strip() != "1":
         raise SandboxImportError("private Sandbox Git must contain exactly one baseline commit")
     return baseline_commit_oid
@@ -434,23 +567,211 @@ def _private_commit_exists(workspace_root: Path, commit_oid: str) -> bool:
 
 
 def _run_git(workspace_root: Path, *arguments: str) -> str:
-    environment = {
-        "PATH": os.environ.get("PATH", ""),
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_TERMINAL_PROMPT": "0",
-    }
+    output = _run_git_bytes(workspace_root, *arguments)
+    try:
+        return output.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SandboxImportError("private Sandbox Git returned invalid text output") from error
+
+
+def _run_git_bytes(workspace_root: Path, *arguments: str, input_bytes: bytes | None = None) -> bytes:
+    environment = _private_git_environment()
     try:
         process = subprocess.run(
             ["git", "-C", str(workspace_root), *arguments],
             check=False,
             capture_output=True,
-            text=True,
+            input=input_bytes,
             env=environment,
         )
     except OSError as error:
         raise SandboxImportError(f"private Sandbox Git is unavailable: {error}") from error
     if process.returncode != 0:
-        detail = process.stderr.strip() or process.stdout.strip() or "unknown Git error"
+        detail = process.stderr.decode("utf-8", errors="replace").strip() or process.stdout.decode("utf-8", errors="replace").strip() or "unknown Git error"
         raise SandboxImportError(f"private Sandbox Git command failed: {detail}")
     return process.stdout
+
+
+def _private_git_environment() -> dict[str, str]:
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def _scan_baseline_tree(metadata: SandboxMetadata) -> dict[str, FileState]:
+    try:
+        manifest_value = SandboxStore._read_json(metadata.sandbox_root.parent / "baseline.manifest.json")
+        manifest_entries = manifest_value["entries"]
+    except (KeyError, TypeError, SandboxError) as error:
+        raise SandboxDiffError("Sandbox baseline manifest is unavailable") from error
+    if not isinstance(manifest_entries, list):
+        raise SandboxDiffError("Sandbox baseline manifest is invalid")
+    states: dict[str, FileState] = {}
+    for entry in manifest_entries:
+        if not isinstance(entry, dict):
+            raise SandboxDiffError("Sandbox baseline manifest is invalid")
+        path = _logical_path(entry.get("path"))
+        if entry.get("kind") == "directory":
+            states[path] = FileState(FileStateKind.DIRECTORY, None, None, None, None)
+    output = _run_git_bytes(metadata.sandbox_root, "ls-tree", "-r", "-z", metadata.baseline_commit_oid or "")
+    for raw_entry in output.split(b"\0"):
+        if not raw_entry:
+            continue
+        try:
+            header, raw_path = raw_entry.split(b"\t", 1)
+            raw_mode, object_type, raw_oid = header.split(b" ", 2)
+            mode = int(raw_mode, 8)
+            oid = raw_oid.decode("ascii")
+            path = _logical_path(os.fsdecode(raw_path))
+        except (ValueError, UnicodeDecodeError) as error:
+            raise SandboxDiffError("private Sandbox Git tree is invalid") from error
+        if object_type != b"blob":
+            raise SandboxDiffError("private Sandbox Git baseline contains an unsupported tree entry")
+        content = _run_git_bytes(metadata.sandbox_root, "cat-file", "blob", oid)
+        if mode == 0o120000:
+            states[path] = FileState(
+                FileStateKind.SYMLINK,
+                _sha256(content),
+                len(content),
+                None,
+                os.fsdecode(content),
+            )
+        elif mode in {0o100644, 0o100755}:
+            states[path] = FileState(
+                FileStateKind.REGULAR,
+                _sha256(content),
+                len(content),
+                None if os.name == "nt" else mode == 0o100755,
+                None,
+                b"\0" in content,
+            )
+        else:
+            raise SandboxDiffError("private Sandbox Git baseline contains an unsupported file mode")
+    return states
+
+
+def _scan_workspace_tree(root: Path, limits: SandboxDiffLimits) -> dict[str, FileState]:
+    states: dict[str, FileState] = {}
+    file_count = 0
+    total_bytes = 0
+
+    def register(path: str, state: FileState) -> None:
+        nonlocal file_count, total_bytes
+        file_count += 1
+        if file_count > limits.max_files:
+            raise SandboxDiffError("Sandbox ChangedSet resource limit exceeded: max_files")
+        if state.size_bytes is not None:
+            if state.size_bytes > limits.max_single_file_bytes:
+                raise SandboxDiffError("Sandbox ChangedSet resource limit exceeded: max_single_file_bytes")
+            total_bytes += state.size_bytes
+            if total_bytes > limits.max_total_bytes:
+                raise SandboxDiffError("Sandbox ChangedSet resource limit exceeded: max_total_bytes")
+        states[path] = state
+
+    def visit(directory: Path, relative: Path) -> None:
+        try:
+            entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
+        except OSError as error:
+            raise SandboxDiffError(f"could not scan Sandbox workspace: {error}") from error
+        for entry in entries:
+            if entry.name == ".git":
+                continue
+            entry_relative = relative / entry.name
+            path = _logical_path(entry_relative.as_posix())
+            try:
+                entry_stat = entry.lstat()
+            except OSError as error:
+                raise SandboxDiffError(f"could not inspect Sandbox entry: {path}") from error
+            if stat.S_ISLNK(entry_stat.st_mode):
+                target = os.readlink(entry)
+                target_bytes = os.fsencode(target)
+                register(path, FileState(FileStateKind.SYMLINK, _sha256(target_bytes), len(target_bytes), None, target))
+            elif stat.S_ISDIR(entry_stat.st_mode):
+                register(path, FileState(FileStateKind.DIRECTORY, None, None, None, None))
+                visit(entry, entry_relative)
+            elif stat.S_ISREG(entry_stat.st_mode):
+                digest, size_bytes, binary = _regular_file_facts(entry, limits.max_single_file_bytes)
+                register(
+                    path,
+                    FileState(
+                        FileStateKind.REGULAR,
+                        digest,
+                        size_bytes,
+                        None if os.name == "nt" else bool(entry_stat.st_mode & stat.S_IXUSR),
+                        None,
+                        binary,
+                    ),
+                )
+            else:
+                raise SandboxDiffError(f"unsupported Sandbox entry: {path}")
+
+    visit(root, Path())
+    return states
+
+
+def _regular_file_facts(path: Path, max_size: int) -> tuple[str, int, bool]:
+    digest = hashlib.sha256()
+    size_bytes = 0
+    binary = False
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                size_bytes += len(chunk)
+                if size_bytes > max_size:
+                    raise SandboxDiffError("Sandbox ChangedSet resource limit exceeded: max_single_file_bytes")
+                digest.update(chunk)
+                binary = binary or b"\0" in chunk
+    except SandboxDiffError:
+        raise
+    except OSError as error:
+        raise SandboxDiffError(f"could not read Sandbox file: {path.name}") from error
+    return digest.hexdigest(), size_bytes, binary
+
+
+def _path_change(path: str, baseline: FileState | None, current: FileState | None) -> PathChange | None:
+    if baseline is None and current is not None:
+        return PathChange(path, ChangeKind.ADDED, None, current)
+    if baseline is not None and current is None:
+        return PathChange(path, ChangeKind.DELETED, baseline, None)
+    assert baseline is not None and current is not None
+    if baseline.kind is not current.kind:
+        return PathChange(path, ChangeKind.TYPE_CHANGED, baseline, current)
+    if baseline.kind is FileStateKind.SYMLINK and baseline.symlink_target != current.symlink_target:
+        return PathChange(path, ChangeKind.SYMLINK_CHANGED, baseline, current)
+    if baseline.kind is FileStateKind.REGULAR:
+        if baseline.content_digest != current.content_digest:
+            return PathChange(path, ChangeKind.MODIFIED, baseline, current)
+        if baseline.executable is not None and current.executable is not None and baseline.executable != current.executable:
+            return PathChange(path, ChangeKind.MODE_CHANGED, baseline, current)
+    return None
+
+
+def _summarize_changes(changes: tuple[PathChange, ...]) -> ChangedSetSummary:
+    counts = {kind: 0 for kind in ChangeKind}
+    for change in changes:
+        counts[change.kind] += 1
+    return ChangedSetSummary(
+        added=counts[ChangeKind.ADDED],
+        modified=counts[ChangeKind.MODIFIED],
+        deleted=counts[ChangeKind.DELETED],
+        mode_changed=counts[ChangeKind.MODE_CHANGED],
+        symlink_changed=counts[ChangeKind.SYMLINK_CHANGED],
+        type_changed=counts[ChangeKind.TYPE_CHANGED],
+    )
+
+
+def _logical_path(value: object) -> str:
+    if not isinstance(value, str) or not value or value.startswith("/"):
+        raise SandboxDiffError("Sandbox path is invalid")
+    normalized = value.replace("\\", "/")
+    parts = normalized.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise SandboxDiffError("Sandbox path is invalid")
+    return "/".join(parts)
+
+
+def _sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
