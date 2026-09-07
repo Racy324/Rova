@@ -6,12 +6,15 @@ from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
 from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
+from ..environment import WorkspaceFileSystem, workspace_filesystem
 from ..workspace import CodingToolError, Workspace
 
 
-def create_list_dir_tool(workspace: Workspace) -> AgentTool:
+def create_list_dir_tool(workspace: Workspace | WorkspaceFileSystem) -> AgentTool:
+    filesystem = workspace_filesystem(workspace)
+
     def list_dir(path: str) -> str:
-        resolved = workspace.resolve(path)
+        resolved = filesystem.resolve(path)
         if not resolved.exists():
             raise CodingToolError("directory not found")
         if not resolved.is_dir():

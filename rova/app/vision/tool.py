@@ -8,6 +8,7 @@ from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
 from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionError, ToolExecutionMode
 from rova.app.workspace import Workspace
+from rova.app.workspace.environment import WorkspaceFileSystem, workspace_filesystem
 
 from .client import VisionClient
 
@@ -26,13 +27,15 @@ class VisionToolError(ToolExecutionError):
 
 
 def create_vision_analyze_tool(
-    workspace: Workspace,
+    workspace: Workspace | WorkspaceFileSystem,
     vision_client: VisionClient,
     *,
     max_image_bytes: int = MAX_IMAGE_BYTES,
 ) -> AgentTool:
+    filesystem = workspace_filesystem(workspace)
+
     async def execute(_tool_call_id: str, params: dict) -> AgentToolResult:
-        image_data_url = await asyncio.to_thread(_load_image_data_url, workspace, params["image_path"], max_image_bytes)
+        image_data_url = await _load_image_data_url(filesystem, params["image_path"], max_image_bytes)
         observation = await vision_client.analyze(question=params["question"], image_data_url=image_data_url)
         return AgentToolResult([TextBlock(observation)])
 
@@ -48,10 +51,10 @@ def create_vision_analyze_tool(
     )
 
 
-def _load_image_data_url(workspace: Workspace, image_path: str, max_image_bytes: int) -> str:
+async def _load_image_data_url(filesystem: WorkspaceFileSystem, image_path: str, max_image_bytes: int) -> str:
     if image_path.lower().startswith(("http://", "https://")):
         raise VisionToolError("remote image URLs are not supported")
-    resolved = workspace.resolve(image_path)
+    resolved = filesystem.resolve(image_path)
     if not resolved.exists():
         raise VisionToolError("image file not found")
     if not resolved.is_file():
@@ -62,18 +65,12 @@ def _load_image_data_url(workspace: Workspace, image_path: str, max_image_bytes:
     try:
         if resolved.stat().st_size > max_image_bytes:
             raise VisionToolError("image is too large")
-        image_bytes = _read_image_bytes(resolved, max_image_bytes)
+        image_bytes = await filesystem.read_bytes(image_path, max_bytes=max_image_bytes)
+        if len(image_bytes) > max_image_bytes:
+            raise VisionToolError("image is too large")
     except VisionToolError:
         raise
     except OSError as error:
         raise VisionToolError("unable to read image") from error
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
-
-
-def _read_image_bytes(path: Path, max_image_bytes: int) -> bytes:
-    with path.open("rb") as image_file:
-        image_bytes = image_file.read(max_image_bytes + 1)
-    if len(image_bytes) > max_image_bytes:
-        raise VisionToolError("image is too large")
-    return image_bytes

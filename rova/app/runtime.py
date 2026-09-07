@@ -27,8 +27,10 @@ from .web.tools import WebFetchBackend, WebSearchBackend, create_fetch_webpage_t
 from .workspace.approval import AlwaysApprove, ApprovalHandler, ConsoleApprovalHandler
 from .workspace.context import WorkspaceContext
 from .workspace.controlled_tool import RovaToolGovernance, build_coding_tools
+from .workspace.environment import DockerSandboxEnvironment, ExecutionEnvironment, LocalExecutionEnvironment
 from .workspace.instructions import WorkspaceInstructionSnapshot, load_workspace_instruction
 from .workspace.policy import DefaultRovaToolPolicy, ToolPolicy
+from .workspace.sandbox import SandboxError, SandboxState, SandboxStore, workspace_identity
 from .workspace.terminal import DockerTerminalBackend, LocalTerminalBackend, TerminalBackend
 from .workspace.workspace import Workspace
 from .memory import (
@@ -71,6 +73,7 @@ class RovaRuntime:
     session: AgentSession
     artifact_store: FileArtifactStore
     workspace: Workspace | None
+    execution_environment: ExecutionEnvironment | None
     terminal_backend: TerminalBackend | None
     workspace_context: WorkspaceContext | None
     source_store: ResearchSourceStore | None
@@ -133,7 +136,9 @@ class RovaRuntime:
                 await self.mcp_manager.close()
         finally:
             try:
-                if self.terminal_backend is not None:
+                if self.execution_environment is not None:
+                    await self.execution_environment.close()
+                elif self.terminal_backend is not None:
                     await self.terminal_backend.close()
             finally:
                 self.session.close()
@@ -224,6 +229,8 @@ def build_rova_runtime(
     extension_roots: Sequence[Path] | None = None,
     terminal_backend: str = "local",
     docker_image: str | None = None,
+    isolated_sandbox: bool = False,
+    sandbox_root: Path | None = None,
     mcp_config_path: Path | None = None,
     tool_execution_mode: ToolExecutionMode = ToolExecutionMode.PARALLEL,
 ) -> RovaRuntime:
@@ -253,9 +260,12 @@ def build_rova_runtime(
         raise ValueError("docker_image is required when terminal_backend='docker'")
     if terminal_backend == "local" and docker_image is not None:
         raise ValueError("docker_image requires terminal_backend='docker'")
+    if not isinstance(isolated_sandbox, bool):
+        raise ValueError("isolated_sandbox must be a boolean")
+    if isolated_sandbox and terminal_backend != "docker":
+        raise ValueError("isolated_sandbox requires terminal_backend='docker'")
 
     workspace = Workspace(workspace_root) if workspace_root is not None else None
-    workspace_context = WorkspaceContext(workspace) if workspace is not None else None
     effective_memory_store = memory_store or FileMemoryStore(memory_root)
     try:
         memory_snapshot = effective_memory_store.load_snapshot()
@@ -269,13 +279,47 @@ def build_rova_runtime(
     except SkillStoreError as error:
         warnings.warn(f"Skill catalog unavailable: {error}", RuntimeWarning, stacklevel=2)
         skill_catalog_snapshot = SkillCatalogSnapshot()
-    effective_terminal_backend: TerminalBackend | None = None
+    execution_environment: ExecutionEnvironment | None = None
+    pending_sandbox_store: SandboxStore | None = None
+    pending_sandbox_id: str | None = None
     if workspace is not None:
-        effective_terminal_backend = (
-            LocalTerminalBackend(workspace)
-            if terminal_backend == "local"
-            else DockerTerminalBackend(workspace, image=docker_image or "", skill_root=effective_skill_store.root)
-        )
+        if isolated_sandbox:
+            sandbox_store = SandboxStore(sandbox_root or RovaDataPaths.resolve().sandboxes)
+            existing = (
+                sandbox_store.load_for_session(session_id, workspace_identity(workspace.root))
+                if session_id is not None
+                else None
+            )
+            if existing is None:
+                imported = sandbox_store.import_baseline(sandbox_store.create_unbound(workspace).sandbox_id)
+                pending_sandbox_store = sandbox_store
+                pending_sandbox_id = imported.sandbox_id
+            else:
+                if existing.state is not SandboxState.READY:
+                    raise SandboxError(f"Sandbox is unavailable in state {existing.state.value}; create a new Sandbox explicitly")
+                imported = existing
+            execution_environment = DockerSandboxEnvironment(
+                host_workspace=workspace,
+                sandbox_workspace=Workspace(imported.sandbox_root),
+                image=docker_image or "",
+                skill_root=effective_skill_store.root,
+            )
+        else:
+            effective_terminal_backend = (
+                LocalTerminalBackend(workspace)
+                if terminal_backend == "local"
+                else DockerTerminalBackend(workspace, image=docker_image or "", skill_root=effective_skill_store.root)
+            )
+            execution_environment = LocalExecutionEnvironment(workspace, terminal=effective_terminal_backend)
+    effective_terminal_backend = execution_environment.terminal if execution_environment is not None else None
+    agent_workspace: Workspace | None = None
+    if workspace is not None and execution_environment is not None:
+        if execution_environment.descriptor.kind == "docker_sandbox":
+            # Docker Sandbox paths remain a Runtime detail; use its filesystem resolver only internally.
+            agent_workspace = Workspace(execution_environment.filesystem.resolve("."))
+        else:
+            agent_workspace = workspace
+    workspace_context = WorkspaceContext(agent_workspace) if agent_workspace is not None else None
     source_store = ResearchSourceStore() if web_search_backend is not None else None
     tools = [
         *create_skill_tools(
@@ -297,9 +341,10 @@ def build_rova_runtime(
         effective_approval_handler = effective_approval_handler or _approval_handler_for_mode(
             permission_mode, effective_terminal_backend
         )
-        tools.extend(build_coding_tools(workspace, terminal_backend=effective_terminal_backend))
+        assert execution_environment is not None
+        tools.extend(build_coding_tools(execution_environment))
         if vision_client is not None:
-            tools.append(create_vision_analyze_tool(workspace, vision_client))
+            tools.append(create_vision_analyze_tool(execution_environment.filesystem, vision_client))
     if source_store is not None:
         assert web_search_backend is not None
         assert webpage_fetcher is not None
@@ -319,7 +364,7 @@ def build_rova_runtime(
     tool_governance = RovaToolGovernance(
         effective_policy,
         effective_approval_handler,
-        workspace.root if workspace is not None else None,
+        agent_workspace.root if agent_workspace is not None else None,
         workspace_context,
         effective_terminal_backend.environment if effective_terminal_backend is not None else None,
     )
@@ -381,12 +426,16 @@ def build_rova_runtime(
             provider_context_estimator=provider_context_estimator,
         )
     )
+    if pending_sandbox_store is not None and pending_sandbox_id is not None:
+        assert session.session_id is not None
+        pending_sandbox_store.bind_session(pending_sandbox_id, session.session_id)
+        pending_sandbox_store.mark_ready(pending_sandbox_id)
 
     async def prepare_runtime_context(base_context: Context) -> Context:
         provider_context = _assemble_runtime_context(
             base_context,
             workspace,
-            effective_terminal_backend,
+            execution_environment,
             memory_snapshot,
             workspace_instruction_snapshot,
             skill_catalog_snapshot,
@@ -398,7 +447,7 @@ def build_rova_runtime(
             rebuild_context=lambda: _assemble_runtime_context(
                 agent.create_context_snapshot(),
                 workspace,
-                effective_terminal_backend,
+                execution_environment,
                 memory_snapshot,
                 workspace_instruction_snapshot,
                 skill_catalog_snapshot,
@@ -411,7 +460,7 @@ def build_rova_runtime(
         return _assemble_runtime_context(
             agent.create_context_snapshot(),
             workspace,
-            effective_terminal_backend,
+            execution_environment,
             memory_snapshot,
             workspace_instruction_snapshot,
             skill_catalog_snapshot,
@@ -435,6 +484,7 @@ def build_rova_runtime(
         session=session,
         artifact_store=artifact_store,
         workspace=workspace,
+        execution_environment=execution_environment,
         terminal_backend=effective_terminal_backend,
         workspace_context=workspace_context,
         source_store=source_store,
@@ -476,7 +526,7 @@ def _approval_handler_for_mode(permission_mode: str, terminal_backend: TerminalB
 def _with_runtime_context(
     stream_fn: StreamFn,
     workspace: Workspace | None,
-    terminal_backend: TerminalBackend | None,
+    execution_environment: ExecutionEnvironment | None,
     memory_snapshot: MemorySnapshot,
     workspace_instruction_snapshot: WorkspaceInstructionSnapshot,
     skill_catalog_snapshot: SkillCatalogSnapshot,
@@ -488,7 +538,7 @@ def _with_runtime_context(
         provider_context = _assemble_runtime_context(
             context,
             workspace,
-            terminal_backend,
+            execution_environment,
             memory_snapshot,
             workspace_instruction_snapshot,
             skill_catalog_snapshot,
@@ -504,7 +554,7 @@ def _with_runtime_context(
 def _assemble_runtime_context(
     context: Context,
     workspace: Workspace | None,
-    terminal_backend: TerminalBackend | None,
+    execution_environment: ExecutionEnvironment | None,
     memory_snapshot: MemorySnapshot,
     workspace_instruction_snapshot: WorkspaceInstructionSnapshot,
     skill_catalog_snapshot: SkillCatalogSnapshot,
@@ -514,7 +564,7 @@ def _assemble_runtime_context(
 ) -> Context:
     sections = [
         *_frozen_system_context_sections(memory_snapshot, workspace_instruction_snapshot, skill_catalog_snapshot),
-        *_dynamic_runtime_context_sections(workspace, terminal_backend, web_enabled=web_enabled),
+        *_dynamic_runtime_context_sections(workspace, execution_environment, web_enabled=web_enabled),
         *extension_api.render_context_sections(),
     ]
     if not sections:
@@ -544,11 +594,11 @@ def _frozen_system_context_sections(
 
 def _dynamic_runtime_context_sections(
     workspace: Workspace | None,
-    terminal_backend: TerminalBackend | None,
+    execution_environment: ExecutionEnvironment | None,
     *,
     web_enabled: bool,
 ) -> list[str]:
-    sections = [_runtime_facts_section(workspace, terminal_backend)]
+    sections = [_runtime_facts_section(workspace, execution_environment)]
     if web_enabled:
         sections.append(_web_tool_guidance_section())
     return sections
@@ -591,20 +641,35 @@ def _render_skill_catalog_section(snapshot: SkillCatalogSnapshot) -> str:
     return "\n".join(lines)
 
 
-def _runtime_facts_section(workspace: Workspace | None, terminal_backend: TerminalBackend | None) -> str:
+def _runtime_facts_section(
+    workspace: Workspace | None,
+    execution_environment: ExecutionEnvironment | None,
+) -> str:
     lines = [
         "Runtime facts:",
         f"- Current time: {datetime.now().astimezone().isoformat(timespec='seconds')}",
         f"- OS: {platform.system()}",
     ]
-    if workspace is not None and terminal_backend is not None:
-        lines.extend([
-            f"- Terminal backend: {terminal_backend.environment.kind}",
-            f"- Shell executor: {terminal_backend.environment.executor}",
-            f"- Workspace shell cwd: {terminal_backend.environment.cwd}",
-        ])
-        if terminal_backend.environment.kind == "docker":
-            lines.append(f"- Workspace bind mount: {workspace.root} -> {terminal_backend.environment.cwd}")
+    if workspace is not None and execution_environment is not None:
+        terminal_backend = execution_environment.terminal
+        if execution_environment.descriptor.kind == "docker_sandbox":
+            lines.extend([
+                "- Terminal backend: docker",
+                f"- Shell executor: {terminal_backend.environment.executor}",
+                "- Workspace shell cwd: /workspace",
+                "- Logical workspace: /workspace (use relative paths with workspace-aware tools)",
+                "- Host workspace is isolated from Docker Sandbox tool changes in this Runtime.",
+            ])
+            if execution_environment.descriptor.resume_note:
+                lines.append(f"- Sandbox resume: {execution_environment.descriptor.resume_note}")
+        else:
+            lines.extend([
+                f"- Terminal backend: {terminal_backend.environment.kind}",
+                f"- Shell executor: {terminal_backend.environment.executor}",
+                f"- Workspace shell cwd: {terminal_backend.environment.cwd}",
+            ])
+            if terminal_backend.environment.kind == "docker":
+                lines.append(f"- Workspace bind mount: {workspace.root} -> {terminal_backend.environment.cwd}")
     return "\n".join(lines)
 
 

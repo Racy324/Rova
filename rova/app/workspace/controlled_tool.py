@@ -24,6 +24,7 @@ from .tools import (
     create_write_tool,
 )
 from .terminal import LocalTerminalBackend, TerminalBackend, TerminalEnvironment
+from .environment import ExecutionEnvironment, LocalExecutionEnvironment
 from .workspace import Workspace
 from .context import WorkspaceContext
 
@@ -332,19 +333,23 @@ def build_controlled_coding_tools(
 
 
 def build_coding_tools(
-    workspace: Workspace,
+    workspace: Workspace | ExecutionEnvironment,
     *,
     terminal_backend: TerminalBackend | None = None,
 ) -> list[AgentTool]:
     """Build raw Workspace tools; ToolRuntime owns generic policy and approval."""
-    effective_terminal_backend = terminal_backend or LocalTerminalBackend(workspace)
+    environment = (
+        LocalExecutionEnvironment(workspace, terminal=terminal_backend or LocalTerminalBackend(workspace))
+        if isinstance(workspace, Workspace)
+        else workspace
+    )
     return [
-        create_read_tool(workspace),
-        create_list_dir_tool(workspace),
-        create_search_tool(workspace),
-        create_write_tool(workspace),
-        create_edit_tool(workspace),
-        create_shell_tool(effective_terminal_backend),
+        create_read_tool(environment.filesystem),
+        create_list_dir_tool(environment.filesystem),
+        create_search_tool(environment.filesystem),
+        create_write_tool(environment.filesystem),
+        create_edit_tool(environment.filesystem),
+        create_shell_tool(environment.terminal),
     ]
 
 

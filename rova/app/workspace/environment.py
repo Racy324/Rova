@@ -27,9 +27,15 @@ class WorkspaceFileSystem(Protocol):
     @property
     def display_root(self) -> str: ...
 
+    def resolve(self, path: str) -> Path: ...
+
+    def display_path(self, path: Path) -> str: ...
+
     async def read_text(self, path: str) -> str: ...
 
     async def write_text(self, path: str, content: str) -> None: ...
+
+    async def read_bytes(self, path: str, *, max_bytes: int) -> bytes: ...
 
 
 class ExecutionEnvironment(Protocol):
@@ -57,17 +63,36 @@ class LocalWorkspaceFileSystem:
     def display_root(self) -> str:
         return str(self._workspace.root)
 
+    def resolve(self, path: str) -> Path:
+        return self._workspace.resolve(path)
+
+    def display_path(self, path: Path) -> str:
+        return self._workspace.display_path(path)
+
     async def read_text(self, path: str) -> str:
         return await asyncio.to_thread(self._read_text, path)
 
     async def write_text(self, path: str, content: str) -> None:
         await asyncio.to_thread(self._write_text, path, content)
 
+    async def read_bytes(self, path: str, *, max_bytes: int) -> bytes:
+        return await asyncio.to_thread(self._read_bytes, path, max_bytes)
+
     def _read_text(self, path: str) -> str:
         return self._workspace.read_text(self._workspace.resolve(path))
 
     def _write_text(self, path: str, content: str) -> None:
         self._workspace.write_text(self._workspace.resolve(path), content)
+
+    def _read_bytes(self, path: str, max_bytes: int) -> bytes:
+        return self._workspace.resolve(path).read_bytes()[: max_bytes + 1]
+
+
+def workspace_filesystem(value: Workspace | WorkspaceFileSystem) -> WorkspaceFileSystem:
+    """Accept the legacy Workspace boundary only at direct Tool factory call sites."""
+    if isinstance(value, Workspace):
+        return LocalWorkspaceFileSystem(value)
+    return value
 
 
 class LocalExecutionEnvironment:

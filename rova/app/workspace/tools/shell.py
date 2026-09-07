@@ -9,6 +9,10 @@ from ..workspace import CodingToolError
 
 
 DEFAULT_TIMEOUT_SECONDS = 30
+SHELL_TOOL_DESCRIPTION = (
+    "Run an approved shell command in the current logical workspace. "
+    "Runtime facts describe the selected execution environment."
+)
 
 
 def create_shell_tool(backend: TerminalBackend) -> AgentTool:
@@ -25,7 +29,7 @@ def create_shell_tool(backend: TerminalBackend) -> AgentTool:
     return AgentTool(
         Tool(
             "shell",
-            backend.environment.tool_description,
+            SHELL_TOOL_DESCRIPTION,
             {"command": str, "timeout_seconds": int},
             required=("command",),
         ),

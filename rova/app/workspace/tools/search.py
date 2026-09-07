@@ -8,38 +8,40 @@ from rova.ai.messages import TextBlock
 from rova.ai.tools import Tool
 from rova.agent_core.tools import AgentTool, AgentToolResult, ToolExecutionMode
 
+from ..environment import WorkspaceFileSystem, workspace_filesystem
 from ..workspace import CodingToolError, Workspace
 
 
 DEFAULT_MAX_RESULTS = 100
 
 
-def create_search_tool(workspace: Workspace) -> AgentTool:
-    def search(query: str, path: str, max_results: int) -> str:
+def create_search_tool(workspace: Workspace | WorkspaceFileSystem) -> AgentTool:
+    filesystem = workspace_filesystem(workspace)
+
+    async def search(query: str, path: str, max_results: int) -> str:
         if not query:
             raise CodingToolError("query must not be empty")
         if not isinstance(max_results, int) or isinstance(max_results, bool) or max_results < 1:
             raise CodingToolError("max_results must be at least 1")
-        target = workspace.resolve(path)
+        target = filesystem.resolve(path)
         if not target.exists():
             raise CodingToolError("path not found")
         candidates = _candidate_files(target)
         matches: list[str] = []
         for candidate in candidates:
             try:
-                text = workspace.read_text(candidate)
+                text = await filesystem.read_text(str(candidate))
             except CodingToolError:
                 continue
             for line_number, line in enumerate(text.splitlines(), start=1):
                 if query in line:
-                    matches.append(f"{workspace.display_path(candidate)}:{line_number}: {line}")
+                    matches.append(f"{filesystem.display_path(candidate)}:{line_number}: {line}")
                     if len(matches) == max_results:
                         return "\n".join(matches)
         return "\n".join(matches) if matches else "no results"
 
     async def execute(tool_call_id: str, params: dict) -> AgentToolResult:
-        result = await asyncio.to_thread(
-            search,
+        result = await search(
             params["query"],
             params.get("path", "."),
             params.get("max_results", DEFAULT_MAX_RESULTS),

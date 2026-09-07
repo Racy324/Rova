@@ -197,8 +197,8 @@ def test_shell_tool_describes_workspace_as_cwd_not_filesystem_sandbox(workspace_
     tool = create_shell_tool(LocalTerminalBackend(Workspace(workspace_root)))
 
     assert tool.tool.description == (
-        "Run a local host shell command with the workspace as its working directory. "
-        "Shell commands require approval and are not filesystem sandboxed."
+        "Run an approved shell command in the current logical workspace. "
+        "Runtime facts describe the selected execution environment."
     )
 
 

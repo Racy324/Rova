@@ -91,7 +91,10 @@ def test_controlled_tool_builder_uses_the_injected_terminal_backend(tmp_path: Pa
     )
 
     shell = next(tool for tool in tools if tool.tool.name == "shell")
-    assert shell.inner.tool.description == backend.environment.tool_description
+    assert shell.inner.tool.description == (
+        "Run an approved shell command in the current logical workspace. "
+        "Runtime facts describe the selected execution environment."
+    )
 
 
 @pytest.mark.asyncio
