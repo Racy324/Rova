@@ -213,6 +213,25 @@ class AgentSession:
         return self._durable_session.session_id if self._durable_session is not None else None
 
     @property
+    def selected_branch_leaf_id(self) -> str | None:
+        """Return the durable leaf selected for read-only external references."""
+        return self._durable_session.leaf_id if self._durable_session is not None else None
+
+    def logical_messages(self) -> tuple[Message, ...]:
+        """Return the selected branch's durable logical conversation projection.
+
+        This intentionally reads the append-only durable path instead of the
+        Agent's in-memory list, so callers cannot observe streaming or other
+        uncommitted messages.
+        """
+        if self._durable_session is None:
+            raise SessionPersistenceError("logical messages require a durable session")
+        return tuple(
+            projected.message
+            for projected in build_session_projection(self._durable_session.path_to_leaf())
+        )
+
+    @property
     def faulted(self) -> bool:
         return self._faulted
 

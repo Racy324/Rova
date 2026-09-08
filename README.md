@@ -37,7 +37,7 @@ python -m rova --workspace . --web
   使用 JSONL 保存会话，支持恢复、分支与长上下文压缩。恢复时会补齐未闭合的 ToolCall；Rova 不会自动重试可能已有副作用的 Tool，并会提示先检查当前状态。
 
 - 🧠 **Memory 与 Experience Evolution**
-  保存长期信息，并从任务与工具执行轨迹中持续沉淀可复用的 Memory 或 Skill。
+  保存长期信息；自动经验审查可更新 Memory，并生成待处理的 Skill Proposal，不会直接修改已安装的 Active Skill。
 
 - 🧩 **Skills**  
   通过 Skill Catalog 发现能力，并在需要时按需读取完整 Skill 内容。
@@ -313,6 +313,7 @@ ROVA_DATA_DIR
 - `artifacts/`：运行时产物
 - `memory/`：长期 Memory
 - `skills/`：本地 Skills
+- `skill-proposals/`：Experience Evolution 生成的待处理 Skill Proposal
 - `extensions/`：用户安装的本地 Extensions
 - `experience/`：Experience Evolution 运行状态
 

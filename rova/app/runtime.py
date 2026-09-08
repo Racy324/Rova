@@ -42,7 +42,14 @@ from .memory import (
     MemoryStoreError,
     create_memory_tools,
 )
-from .experience_review import ExperienceReviewService, ExperienceReviewer, FileExperienceReviewStore
+from .experience_review import (
+    ExperienceReviewService,
+    ExperienceReviewer,
+    FileExperienceReviewStore,
+    ReviewContextBuilder,
+    ReviewWindowRef,
+)
+from .skill_proposals import FileSkillProposalStore
 from .paths import RovaDataPaths
 from .skills import FileSkillStore, SkillCatalogSnapshot, SkillStoreError, create_skill_tools
 from .vision import VisionClient, create_vision_analyze_tool
@@ -161,7 +168,7 @@ class RovaRuntime:
                 )
         self.start_mcp_discovery()
         if self.experience_review_service is not None:
-            self.experience_review_service.begin_run(text)
+            self.experience_review_service.begin_run()
         request_text = text
         if not self._local_context_attached and self.local_context is not None:
             attachment = self.local_context.render_user_attachment()
@@ -191,11 +198,16 @@ class RovaRuntime:
                 self.experience_review_service.discard_run()
             else:
                 try:
-                    state = self.experience_review_service.commit_completed_task(
-                        session_id=self.session.session_id,
-                        final_response=final.text,
-                    )
-                    await self.experience_review_service.review_if_due(state)
+                    session_id = self.session.session_id
+                    input_entry_id = self.session.last_prompt_input_entry_id
+                    leaf_id = self.session.selected_branch_leaf_id
+                    if session_id is None or input_entry_id is None or leaf_id is None:
+                        self.experience_review_service.discard_run()
+                    else:
+                        state = self.experience_review_service.commit_completed_task(
+                            ReviewWindowRef(session_id, input_entry_id, leaf_id)
+                        )
+                        await self.experience_review_service.review_if_due(state, session=self.session)
                 except Exception:
                     # Experience maintenance must not replace an already completed user response.
                     pass
@@ -425,9 +437,13 @@ def build_rova_runtime(
                 stream_fn=stream_fn,
                 skill_store=effective_skill_store,
             ),
+            review_context_builder=ReviewContextBuilder(
+                memory_store=effective_memory_store,
+                skill_store=effective_skill_store,
+            ),
             memory_store=effective_memory_store,
-            skill_store=effective_skill_store,
             memory_max_chars=memory_max_chars,
+            proposal_store=FileSkillProposalStore(),
             tool_threshold=experience_review_tool_threshold,
             task_threshold=experience_review_task_threshold,
         )

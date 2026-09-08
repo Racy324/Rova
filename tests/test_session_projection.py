@@ -11,7 +11,7 @@ from rova.agent_session.context_builder import (
 from rova.agent_session.entries import CompactionEntry, MessageEntry
 from rova.agent_session.session_store import JsonlSessionStore, SessionCorruptionError, SessionStoreError
 from rova.ai.events import StreamDone
-from rova.ai.messages import AssistantMessage, TextBlock, UserMessage
+from rova.ai.messages import AssistantMessage, TextBlock, ToolCall, ToolResultMessage, UserMessage
 from rova.ai.models import Model
 from rova.agent_core.agent import Agent
 from rova.agent_session.agent_session import AgentSession
@@ -158,6 +158,33 @@ def test_agent_session_load_and_branch_use_compacted_logical_projection(tmp_path
     assert agent.messages == [summary, UserMessage("M3"), UserMessage("M4")]
     session.branch(e6)
     assert agent.messages == [summary, UserMessage("M3"), UserMessage("M4"), UserMessage("M5")]
+
+
+def test_logical_messages_reads_only_the_selected_branch_committed_projection(tmp_path):
+    durable = JsonlSessionStore(tmp_path).create()
+    root = durable.append(UserMessage("inspect the repository"))
+    call = ToolCall("call-1", "read_file", {"path": "README.md"})
+    durable.append(AssistantMessage([call], stop_reason="tool_calls"))
+    durable.append(ToolResultMessage("call-1", "read_file", [TextBlock("contents")]))
+    leaf = durable.append(AssistantMessage([TextBlock("inspection complete")]))
+
+    durable.branch(root)
+    durable.append(UserMessage("sibling branch only"))
+    durable.branch(leaf)
+
+    async def final_stream(model, context, options):
+        yield StreamDone(AssistantMessage([TextBlock("unused")]))
+
+    agent = Agent(Model("mock"), "", [], final_stream)
+    session = AgentSession.load(agent, durable.session_id, session_root=tmp_path, leaf_id=leaf)
+    agent.messages.append(UserMessage("not yet committed"))
+
+    assert session.logical_messages() == (
+        UserMessage("inspect the repository"),
+        AssistantMessage([call], stop_reason="tool_calls"),
+        ToolResultMessage("call-1", "read_file", [TextBlock("contents")]),
+        AssistantMessage([TextBlock("inspection complete")]),
+    )
 
 
 @pytest.mark.asyncio

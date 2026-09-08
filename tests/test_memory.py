@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
+from rova.app import memory as memory_module
 from rova.app.memory import (
     FileMemoryStore,
     MemoryDocumentAction,
@@ -46,6 +49,153 @@ def test_memory_snapshot_is_data_only_and_does_not_render_provider_context() -> 
     assert snapshot.user_markdown == "## Coding\n\n- Prefer simple composition."
     assert snapshot.memory_markdown == "## Project Facts\n\n- Uses Python."
     assert not hasattr(snapshot, "render_for_provider")
+
+
+@pytest.mark.skip(reason="Deferred Hardening: Entry identity and sidecar metadata are outside V2 Core.")
+def test_entry_snapshot_uses_h2_sections_and_keeps_legacy_markdown_model_visible(tmp_path: Path) -> None:
+    root = tmp_path / "memory"
+    root.mkdir()
+    original = "## Preferences\n\n- Prefer concise reports.\n\n## Background\n\n- Studies agent systems."
+    (root / "USER.md").write_text(original, encoding="utf-8")
+
+    api = _v2_memory_api()
+    entry_snapshot = FileMemoryStore(root).load_entry_snapshot()
+
+    assert entry_snapshot.snapshot.user_markdown == original
+    assert tuple(entry.content for entry in entry_snapshot.user_entries) == (
+        "## Preferences\n\n- Prefer concise reports.",
+        "## Background\n\n- Studies agent systems.",
+    )
+    assert all(entry.entry_id.startswith("legacy:USER.md:") for entry in entry_snapshot.user_entries)
+    assert all(entry.revision == 0 for entry in entry_snapshot.user_entries)
+    assert "legacy:USER.md:" not in entry_snapshot.snapshot.user_markdown
+    assert not (root / ".memory-entries.json").exists()
+
+
+@pytest.mark.skip(reason="Deferred Hardening: manual-edit stale-write reconciliation is outside V2 Core.")
+def test_entry_snapshot_preserves_sidecar_identity_and_treats_manual_edit_as_stale(tmp_path: Path) -> None:
+    root = tmp_path / "memory"
+    root.mkdir()
+    original = "## Preferences\n\n- Prefer concise reports."
+    (root / "USER.md").write_text(original, encoding="utf-8")
+    digest = hashlib.sha256(original.encode("utf-8")).hexdigest()
+    (root / ".memory-entries.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "documents": {
+                    "USER.md": [
+                        {
+                            "entry_id": "user-pref-1",
+                            "revision": 4,
+                            "content_sha256": digest,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = FileMemoryStore(root)
+
+    api = _v2_memory_api()
+    before = store.load_entry_snapshot()
+    assert before.user_entries[0].entry_id == "user-pref-1"
+    assert before.user_entries[0].revision == 4
+
+    (root / "USER.md").write_text("## Preferences\n\n- Prefer detailed reports.", encoding="utf-8")
+    after = store.load_entry_snapshot()
+
+    assert after.snapshot.user_markdown == "## Preferences\n\n- Prefer detailed reports."
+    assert after.user_entries[0].entry_id.startswith("manual:USER.md:")
+    assert after.user_entries[0].revision == 0
+    with pytest.raises(api.MemoryOperationError, match="unknown or stale"):
+        api.validate_memory_operations(
+            after,
+            [
+                api.MemoryOperation(
+                    document=api.MemoryDocument.USER,
+                    action=MemoryDocumentAction.UPDATE,
+                    target_entry_id="user-pref-1",
+                    expected_revision=4,
+                    content="## Preferences\n\n- Prefer short reports.",
+                )
+            ],
+            max_chars=200,
+        )
+
+
+@pytest.mark.skip(reason="Deferred Hardening: Entry target/revision CAS is outside V2 Core.")
+def test_entry_operations_require_a_precise_target_and_expected_revision(tmp_path: Path) -> None:
+    api = _v2_memory_api()
+    store = FileMemoryStore(tmp_path / "memory")
+    entry_snapshot = store.load_entry_snapshot()
+
+    for operation in (
+        api.MemoryOperation(
+            document=api.MemoryDocument.MEMORY,
+            action=MemoryDocumentAction.UPDATE,
+            content="## Environment\n\n- Uses Python.",
+        ),
+        api.MemoryOperation(
+            document=api.MemoryDocument.MEMORY,
+            action=MemoryDocumentAction.DELETE,
+            target_entry_id="missing-revision",
+        ),
+    ):
+        with pytest.raises(api.MemoryOperationError, match="target_entry_id and expected_revision"):
+            api.validate_memory_operations(entry_snapshot, [operation], max_chars=200)
+
+
+@pytest.mark.skip(reason="Deferred Hardening: Entry duplicate and capacity validation is outside V2 Core.")
+def test_entry_operations_reject_duplicate_add_workspace_scope_and_capacity_without_writing(tmp_path: Path) -> None:
+    api = _v2_memory_api()
+    root = tmp_path / "memory"
+    root.mkdir()
+    original = "## Environment\n\n- Uses Python."
+    (root / "MEMORY.md").write_text(original, encoding="utf-8")
+    entry_snapshot = FileMemoryStore(root).load_entry_snapshot()
+
+    duplicate = api.MemoryOperation(
+        document=api.MemoryDocument.MEMORY,
+        action=MemoryDocumentAction.ADD,
+        content=original,
+    )
+    with pytest.raises(api.MemoryOperationError, match="duplicate"):
+        api.validate_memory_operations(entry_snapshot, [duplicate], max_chars=200)
+
+    workspace_scoped = api.MemoryOperation(
+        document=api.MemoryDocument.MEMORY,
+        action=MemoryDocumentAction.ADD,
+        content="## Repository\n\n- Uses a private package index.",
+        scope=api.MemoryEntryScope.WORKSPACE,
+    )
+    with pytest.raises(api.MemoryOperationError, match="workspace-specific"):
+        api.validate_memory_operations(entry_snapshot, [workspace_scoped], max_chars=200)
+
+    oversized = api.MemoryOperation(
+        document=api.MemoryDocument.MEMORY,
+        action=MemoryDocumentAction.ADD,
+        content="## Long\n\n" + "x" * 200,
+    )
+    with pytest.raises(api.MemoryOperationError, match="maximum length"):
+        api.validate_memory_operations(entry_snapshot, [oversized], max_chars=40)
+
+    assert (root / "MEMORY.md").read_text(encoding="utf-8") == original
+    assert not (root / ".memory-entries.json").exists()
+
+
+def _v2_memory_api():
+    required = (
+        "MemoryDocument",
+        "MemoryEntryScope",
+        "MemoryOperation",
+        "MemoryOperationError",
+        "validate_memory_operations",
+    )
+    missing = [name for name in required if not hasattr(memory_module, name)]
+    assert not missing, f"Task 1 Memory V2 contract API is missing: {', '.join(missing)}"
+    return memory_module
 
 
 def test_workspace_instruction_uses_strict_single_file_precedence(tmp_path: Path) -> None:
