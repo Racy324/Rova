@@ -44,6 +44,9 @@ function App(): React.ReactNode {
 			case 'assistant.delta':
 				setStreaming(current => current + value(payload, 'text'));
 				break;
+			case 'assistant.discard':
+				setStreaming('');
+				break;
 			case 'assistant.end': {
 				const completed = value(payload, 'text');
 				setStreaming(current => {

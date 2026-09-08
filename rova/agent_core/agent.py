@@ -13,6 +13,7 @@ from rova.ai.messages import AssistantMessage, TextBlock, ToolResultMessage, Use
 from rova.ai.models import Model
 from .events import AgentEvent, AgentTerminationReason
 from .hooks import HookRegistry
+from .retry import ProviderRetryPolicy
 from .tools import AgentTool, PreparedToolCall, ToolExecutionMode, ToolGovernance, ToolRegistry, ToolRuntime, resolve_batch_mode
 from .tool_output import ToolOutputProcessor, ToolOutputScope
 from .types import StreamFn
@@ -21,6 +22,18 @@ from .types import StreamFn
 Listener = Callable[[AgentEvent], object]
 ContextPreparer = Callable[[Context], Awaitable[Context]]
 ContextOverflowRecovery = Callable[[Context], Awaitable[Context]]
+
+
+class _TransientProviderFailure(Exception):
+    def __init__(self, event: StreamError, started: bool) -> None:
+        self.event = event
+        self.started = started
+
+
+class _ContextOverflowFailure(Exception):
+    def __init__(self, event: StreamError, started: bool) -> None:
+        self.event = event
+        self.started = started
 
 
 class Agent:
@@ -38,6 +51,7 @@ class Agent:
         hook_registry: HookRegistry | None = None,
         context_preparer: ContextPreparer | None = None,
         context_overflow_recovery: ContextOverflowRecovery | None = None,
+        provider_retry_policy: ProviderRetryPolicy | None = None,
     ) -> None:
         if not isinstance(tool_execution_mode, ToolExecutionMode):
             raise TypeError("tool_execution_mode must be a ToolExecutionMode")
@@ -60,6 +74,7 @@ class Agent:
         self.last_context: Context | None = None
         self._context_preparer = context_preparer
         self._context_overflow_recovery = context_overflow_recovery
+        self.provider_retry_policy = provider_retry_policy or ProviderRetryPolicy()
 
     def subscribe(self, listener: Listener) -> Callable[[], None]:
         self.listeners.append(listener)
@@ -263,67 +278,111 @@ class Agent:
         *,
         overflow_retried: bool = False,
     ) -> tuple[AssistantMessage, bool, AgentTerminationReason | None]:
+        transient_retries = 0
+        overflow_recovery_used = overflow_retried
+        attempts = 0
+        max_attempts = 1 + self.provider_retry_policy.max_retries + 1
+        current_context = context
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                return await self._stream_assistant_once(current_context)
+            except _TransientProviderFailure as transient:
+                await self._emit(AgentEvent("provider_attempt_discarded"))
+                if transient_retries >= self.provider_retry_policy.max_retries or attempts >= max_attempts:
+                    return await self._finalize_stream_error(transient.event, transient.started)
+                transient_retries += 1
+                await self.provider_retry_policy.wait(transient_retries)
+            except _ContextOverflowFailure as overflow:
+                await self._emit(AgentEvent("provider_attempt_discarded"))
+                if (
+                    overflow_recovery_used
+                    or self._context_overflow_recovery is None
+                    or attempts >= max_attempts
+                ):
+                    return await self._finalize_stream_error(overflow.event, overflow.started)
+                overflow_recovery_used = True
+                try:
+                    current_context = await self._context_overflow_recovery(current_context)
+                except Exception as error:
+                    failure = AssistantMessage(
+                        [TextBlock(f"Context overflow recovery failed: {error}")],
+                        stop_reason="error",
+                    )
+                    await self._emit(AgentEvent(
+                        "provider_error",
+                        message=failure,
+                        error_type=type(error).__name__,
+                        error_message=str(error),
+                    ))
+                    return failure, overflow.started, AgentTerminationReason.CONTEXT_OVERFLOW
+        raise RuntimeError("provider attempt limit exhausted without a terminal result")
+
+    async def _stream_assistant_once(
+        self,
+        context: Context,
+    ) -> tuple[AssistantMessage, bool, AgentTerminationReason | None]:
         started = False
         try:
             iterator = self.stream_fn(self.model, context, None).__aiter__()
         except Exception as error:
             await self._emit(AgentEvent("provider_error", error_type=type(error).__name__, error_message=str(error)))
             raise
-        while True:
-            try:
-                event = await iterator.__anext__()
-            except StopAsyncIteration:
-                break
-            except Exception as error:
-                await self._emit(AgentEvent("provider_error", error_type=type(error).__name__, error_message=str(error)))
-                raise
-            if isinstance(event, Start):
-                if not started:
-                    started = True
-                    await self._emit(AgentEvent("message_start", message=event.partial, assistant_message_event=event))
-                continue
-            if isinstance(event, (TextDelta, ToolCallDelta)):
-                if not started:
-                    started = True
-                    await self._emit(AgentEvent("message_start", message=event.partial, assistant_message_event=event))
-                await self._emit(AgentEvent("message_update", message=event.partial, assistant_message_event=event))
-                continue
-            if isinstance(event, StreamDone):
-                event.message.partial = False
-                return event.message, started, None
-            if isinstance(event, StreamError):
-                if (
-                    event.failure is not None
-                    and event.failure.classification == "context_overflow"
-                    and self._context_overflow_recovery is not None
-                    and not overflow_retried
-                ):
-                    try:
-                        recovered_context = await self._context_overflow_recovery(context)
-                    except Exception as error:
-                        failure = AssistantMessage(
-                            [TextBlock(f"Context overflow recovery failed: {error}")],
-                            stop_reason="error",
-                        )
-                        await self._emit(AgentEvent(
-                            "provider_error",
-                            message=failure,
-                            error_type=type(error).__name__,
-                            error_message=str(error),
-                        ))
-                        return failure, started, AgentTerminationReason.CONTEXT_OVERFLOW
-                    return await self._stream_assistant(recovered_context, overflow_retried=True)
-                event.error.stop_reason = event.reason
-                event.error.partial = False
-                await self._emit(AgentEvent("provider_error", message=event.error, error_type="StreamError", error_message=event.error.text))
-                if event.failure is not None and event.failure.classification == "context_overflow":
-                    reason = AgentTerminationReason.CONTEXT_OVERFLOW
-                else:
-                    reason = AgentTerminationReason.PROVIDER_ERROR if event.reason == "error" else AgentTerminationReason.ABORTED
-                return event.error, started, reason
-        error = AssistantMessage(content=[TextBlock("Provider ended without a final message")], stop_reason="error")
-        await self._emit(AgentEvent("provider_error", message=error, error_type="ProviderStreamEnded", error_message=error.text))
-        return error, started, AgentTerminationReason.PROVIDER_ERROR
+        try:
+            while True:
+                try:
+                    event = await iterator.__anext__()
+                except StopAsyncIteration:
+                    break
+                except Exception as error:
+                    await self._emit(AgentEvent("provider_error", error_type=type(error).__name__, error_message=str(error)))
+                    raise
+                if isinstance(event, Start):
+                    if not started:
+                        started = True
+                        await self._emit(AgentEvent("message_start", message=event.partial, assistant_message_event=event))
+                    continue
+                if isinstance(event, (TextDelta, ToolCallDelta)):
+                    if not started:
+                        started = True
+                        await self._emit(AgentEvent("message_start", message=event.partial, assistant_message_event=event))
+                    await self._emit(AgentEvent("message_update", message=event.partial, assistant_message_event=event))
+                    continue
+                if isinstance(event, StreamDone):
+                    event.message.partial = False
+                    return event.message, started, None
+                if isinstance(event, StreamError):
+                    if (
+                        event.failure is not None
+                        and event.failure.category == "transient"
+                        and event.failure.retryable
+                    ):
+                        raise _TransientProviderFailure(event, started)
+                    if (
+                        event.failure is not None
+                        and event.failure.classification == "context_overflow"
+                    ):
+                        raise _ContextOverflowFailure(event, started)
+                    return await self._finalize_stream_error(event, started)
+            error = AssistantMessage(content=[TextBlock("Provider ended without a final message")], stop_reason="error")
+            await self._emit(AgentEvent("provider_error", message=error, error_type="ProviderStreamEnded", error_message=error.text))
+            return error, started, AgentTerminationReason.PROVIDER_ERROR
+        finally:
+            await _close_if_supported(iterator)
+
+    async def _finalize_stream_error(
+        self,
+        event: StreamError,
+        started: bool,
+    ) -> tuple[AssistantMessage, bool, AgentTerminationReason | None]:
+        event.error.stop_reason = event.reason
+        event.error.partial = False
+        await self._emit(AgentEvent("provider_error", message=event.error, error_type="StreamError", error_message=event.error.text))
+        if event.failure is not None and event.failure.classification == "context_overflow":
+            reason = AgentTerminationReason.CONTEXT_OVERFLOW
+        else:
+            reason = AgentTerminationReason.PROVIDER_ERROR if event.reason == "error" else AgentTerminationReason.ABORTED
+        return event.error, started, reason
 
     async def _emit(self, event: AgentEvent) -> None:
         self.events.append(event)
@@ -331,3 +390,11 @@ class Agent:
             outcome = listener(event)
             if inspect.isawaitable(outcome):
                 await outcome
+
+
+async def _close_if_supported(iterator: object) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is not None:
+        outcome = close()
+        if inspect.isawaitable(outcome):
+            await outcome

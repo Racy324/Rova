@@ -305,6 +305,108 @@ async def test_streaming_translator_does_not_leak_httpx_errors():
     assert "503" in events[-1].error.text
 
 
+def _http_status_error(status_code: int, *, provider_code: str | None = None) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+    payload = {"error": {"code": provider_code}} if provider_code is not None else None
+    response = httpx.Response(status_code, request=request, json=payload)
+    return httpx.HTTPStatusError(str(status_code), request=request, response=response)
+
+
+async def _terminal_stream_error(error: BaseException | None = None, *, lines=None) -> StreamError:
+    client = FakeStreamingHttpClient([] if lines is None else lines, error)
+    events = [
+        event
+        async for event in OpenAICompatibleProvider("key", client).stream(
+            Model(provider="openai_compatible"),
+            context(),
+        )
+    ]
+    assert isinstance(events[-1], StreamError)
+    return events[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [429, 529, 500, 503])
+async def test_streaming_translator_classifies_retryable_http_statuses_as_transient(status_code):
+    event = await _terminal_stream_error(_http_status_error(status_code))
+
+    assert event.failure is not None
+    assert event.failure.classification == "transient"
+    assert event.failure.category == "transient"
+    assert event.failure.retryable is True
+    assert event.failure.status_code == status_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [httpx.ReadTimeout("timed out"), httpx.ConnectError("connection reset")])
+async def test_streaming_translator_classifies_timeout_and_connection_as_transient(error):
+    event = await _terminal_stream_error(error)
+
+    assert event.failure is not None
+    assert event.failure.classification == "transient"
+    assert event.failure.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_translator_classifies_incomplete_stream_as_transient():
+    event = await _terminal_stream_error()
+
+    assert event.failure is not None
+    assert event.failure.classification == "transient"
+    assert event.failure.code == "stream_interrupted"
+    assert event.failure.retryable is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 400, 422])
+async def test_streaming_translator_classifies_auth_and_invalid_requests_as_permanent(status_code):
+    event = await _terminal_stream_error(_http_status_error(status_code))
+
+    assert event.failure is not None
+    assert event.failure.classification == "permanent"
+    assert event.failure.retryable is False
+    assert event.failure.status_code == status_code
+
+
+@pytest.mark.asyncio
+async def test_streaming_translator_preserves_typed_context_overflow():
+    event = await _terminal_stream_error(
+        _http_status_error(400, provider_code="context_length_exceeded")
+    )
+
+    assert event.failure is not None
+    assert event.failure.classification == "context_overflow"
+    assert event.failure.retryable is False
+    assert event.failure.code == "context_length_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_streaming_translator_classifies_invalid_sse_as_permanent():
+    event = await _terminal_stream_error(lines=["data: {bad json", ""])
+
+    assert event.failure is not None
+    assert event.failure.classification == "permanent"
+    assert event.failure.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_streaming_translator_classifies_unknown_stream_error_as_unclassified():
+    class UnknownStreamError(Exception):
+        pass
+
+    event = await _terminal_stream_error(UnknownStreamError("unexpected"))
+
+    assert event.failure is not None
+    assert event.failure.classification == "unclassified"
+    assert event.failure.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_streaming_translator_propagates_cancellation_without_provider_failure():
+    with pytest.raises(asyncio.CancelledError):
+        await _terminal_stream_error(asyncio.CancelledError())
+
+
 async def text_stream(model, provider_context, options):
     yield Start(AssistantMessage([], partial=True))
     yield TextDelta(chr(0x4F60), AssistantMessage([TextBlock(chr(0x4F60))], partial=True))

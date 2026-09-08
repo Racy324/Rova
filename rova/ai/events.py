@@ -10,9 +10,20 @@ from .messages import AssistantMessage
 class ProviderFailure:
     """Sanitized, typed Provider failure facts available to the Runtime."""
 
-    classification: Literal["context_overflow"] | None = None
+    classification: Literal["context_overflow", "transient", "permanent", "unclassified"] | None = None
     status_code: int | None = None
     code: str | None = None
+    message: str | None = None
+
+    @property
+    def category(self) -> Literal["context_overflow", "transient", "permanent", "unclassified"] | None:
+        """Stable alias for callers that describe failures by category."""
+        return self.classification
+
+    @property
+    def retryable(self) -> bool:
+        """Classification fact only; retry policy remains a Runtime concern."""
+        return self.classification == "transient"
 
 
 @dataclass

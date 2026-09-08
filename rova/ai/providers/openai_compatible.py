@@ -18,6 +18,10 @@ from ..tools import Tool
 class ProviderRequestError(Exception):
     """An external HTTP failure represented by the AI event contract."""
 
+    def __init__(self, message: str, *, failure: ProviderFailure | None = None) -> None:
+        super().__init__(message)
+        self.failure = failure
+
 
 class ContextOverflowError(ProviderRequestError):
     """A Provider adapter verified a context-length rejection structurally."""
@@ -43,7 +47,10 @@ class HttpxStreamingHttpClient:
         try:
             body = json.dumps(payload).encode("utf-8")
         except (TypeError, ValueError, OverflowError) as error:
-            raise ProviderRequestError(f"Provider request serialization failed: {error}") from error
+            raise ProviderRequestError(
+                f"Provider request serialization failed: {error}",
+                failure=ProviderFailure("permanent", code="invalid_request", message="Provider request serialization failed"),
+            ) from error
         try:
             async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
                 async with client.stream("POST", url, content=body, headers=headers) as response:
@@ -51,12 +58,12 @@ class HttpxStreamingHttpClient:
                     async for line in response.aiter_lines():
                         yield line
         except httpx.HTTPStatusError as error:
-            code = _structured_context_overflow_code(error.response)
-            if code is not None:
-                raise ContextOverflowError(status_code=error.response.status_code, code=code) from error
-            raise ProviderRequestError(str(error)) from error
+            failure = _provider_failure_for_exception(error)
+            if failure.classification == "context_overflow":
+                raise ContextOverflowError(status_code=error.response.status_code, code=failure.code or "context_overflow") from error
+            raise ProviderRequestError(str(error), failure=failure) from error
         except httpx.HTTPError as error:
-            raise ProviderRequestError(str(error)) from error
+            raise ProviderRequestError(str(error), failure=_provider_failure_for_exception(error)) from error
 
 
 class OpenAICompatibleProvider:
@@ -76,12 +83,18 @@ class OpenAICompatibleProvider:
         try:
             payload = to_provider_request(model, context)
         except (KeyError, TypeError, ValueError, OverflowError) as error:
-            yield _stream_error(f"Invalid provider request: {error}")
+            yield _stream_error(
+                f"Invalid provider request: {error}",
+                failure=ProviderFailure("permanent", code="invalid_request", message="Invalid provider request"),
+            )
             return
         try:
             json.dumps(payload)
         except (TypeError, ValueError, OverflowError) as error:
-            yield _stream_error(f"Provider request serialization failed: {error}")
+            yield _stream_error(
+                f"Provider request serialization failed: {error}",
+                failure=ProviderFailure("permanent", code="invalid_request", message="Provider request serialization failed"),
+            )
             return
 
         accumulator = _StreamingAccumulator()
@@ -97,28 +110,40 @@ class OpenAICompatibleProvider:
                     try:
                         terminal_event = StreamDone(accumulator.finalize())
                     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-                        terminal_event = _stream_error(f"Invalid provider response: {error}")
+                        terminal_event = _stream_error(
+                            f"Invalid provider response: {error}",
+                            failure=ProviderFailure("permanent", code="invalid_response", message="Invalid provider response"),
+                        )
                     break
                 try:
                     for event in accumulator.consume(data):
                         yield event
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-                    terminal_event = _stream_error(f"Invalid provider response: {error}")
+                    terminal_event = _stream_error(
+                        f"Invalid provider response: {error}",
+                        failure=ProviderFailure("permanent", code="invalid_response", message="Invalid provider response"),
+                    )
                     break
         except (ProviderRequestError, httpx.HTTPError) as error:
             terminal_event = _stream_error(
                 _provider_error_summary(error, self._api_key),
-                failure=(
-                    ProviderFailure("context_overflow", error.status_code, error.code)
-                    if isinstance(error, ContextOverflowError)
-                    else None
-                ),
+                failure=_provider_failure_for_exception(error),
+            )
+        except (TypeError, AttributeError, AssertionError):
+            raise
+        except Exception as error:
+            terminal_event = _stream_error(
+                _provider_error_summary(error, self._api_key),
+                failure=ProviderFailure("unclassified", code="stream_error", message=type(error).__name__),
             )
         finally:
             await _close_if_supported(sse_stream)
 
         if terminal_event is None:
-            terminal_event = _stream_error("Provider stream ended before [DONE]")
+            terminal_event = _stream_error(
+                "Provider stream ended before [DONE]",
+                failure=ProviderFailure("transient", code="stream_interrupted", message="Provider stream ended before completion"),
+            )
         yield terminal_event
 
 
@@ -256,7 +281,10 @@ async def _sse_data(lines: AsyncIterator[str]) -> AsyncIterator[str]:
                 continue
             if line.startswith(("event:", "id:", "retry:")):
                 continue
-            raise ProviderRequestError(f"Provider SSE protocol error: invalid SSE line: {line!r}")
+            raise ProviderRequestError(
+                f"Provider SSE protocol error: invalid SSE line: {line!r}",
+                failure=ProviderFailure("permanent", code="invalid_sse", message="Invalid provider SSE response"),
+            )
         if data_lines:
             yield "\n".join(data_lines)
     finally:
@@ -433,6 +461,45 @@ def _json_schema_type(value_type: type) -> str:
     return {str: "string", int: "integer", float: "number", bool: "boolean"}.get(value_type, "string")
 
 
+_RETRYABLE_HTTP_STATUS_CODES = {408, 429, 500, 502, 503, 504, 529}
+
+
+def _provider_failure_for_exception(error: BaseException) -> ProviderFailure:
+    """Map only structurally known transport failures to stable adapter facts."""
+    if isinstance(error, ContextOverflowError):
+        return ProviderFailure(
+            "context_overflow",
+            error.status_code,
+            error.code,
+            "Provider rejected the request context",
+        )
+    if isinstance(error, ProviderRequestError) and error.failure is not None:
+        return error.failure
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+        overflow_code = _structured_context_overflow_code(error.response)
+        if overflow_code is not None:
+            return ProviderFailure(
+                "context_overflow",
+                status_code,
+                overflow_code,
+                "Provider rejected the request context",
+            )
+        code = _structured_provider_error_code(error.response) or f"http_{status_code}"
+        if status_code in _RETRYABLE_HTTP_STATUS_CODES:
+            return ProviderFailure("transient", status_code, code, f"Provider returned HTTP {status_code}")
+        if 400 <= status_code < 500:
+            return ProviderFailure("permanent", status_code, code, f"Provider returned HTTP {status_code}")
+        return ProviderFailure("unclassified", status_code, code, f"Provider returned HTTP {status_code}")
+    if isinstance(error, httpx.TimeoutException):
+        return ProviderFailure("transient", code="timeout", message="Provider request timed out")
+    if isinstance(error, (httpx.NetworkError, httpx.ProtocolError)):
+        return ProviderFailure("transient", code="network_interruption", message="Provider network stream interrupted")
+    if isinstance(error, ProviderRequestError):
+        return ProviderFailure("unclassified", code="provider_request_error", message="Unclassified provider request failure")
+    return ProviderFailure("unclassified", code="stream_error", message=type(error).__name__)
+
+
 def _structured_context_overflow_code(response: httpx.Response) -> str | None:
     """Recognize only documented structured codes, never free-form error text."""
     if response.status_code not in {400, 413}:
@@ -448,6 +515,22 @@ def _structured_context_overflow_code(response: httpx.Response) -> str | None:
         return None
     code = error.get("code")
     if code in {"context_length_exceeded", "context_window_exceeded"}:
+        return str(code)
+    return None
+
+
+def _structured_provider_error_code(response: httpx.Response) -> str | None:
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    if isinstance(code, (str, int)) and not isinstance(code, bool):
         return str(code)
     return None
 

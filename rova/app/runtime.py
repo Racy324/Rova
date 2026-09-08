@@ -13,6 +13,7 @@ from rova.ai.models import Model
 from rova.ai.providers.openai_compatible import estimate_provider_input_tokens
 from rova.agent_core.agent import Agent
 from rova.agent_core.hooks import HookRegistry
+from rova.agent_core.retry import ProviderRetryPolicy
 from rova.agent_core.tools import ToolExecutionMode
 from rova.agent_core.tool_output import ToolOutputProcessor
 from rova.agent_core.types import StreamFn
@@ -260,6 +261,7 @@ def build_rova_runtime(
     sandbox_root: Path | None = None,
     mcp_config_path: Path | None = None,
     tool_execution_mode: ToolExecutionMode = ToolExecutionMode.PARALLEL,
+    provider_max_retries: int = 2,
 ) -> RovaRuntime:
     if (web_search_backend is None) != (webpage_fetcher is None):
         raise ValueError("web_search_backend and webpage_fetcher must be provided together")
@@ -289,6 +291,8 @@ def build_rova_runtime(
         raise ValueError("docker_image requires terminal_backend='docker'")
     if not isinstance(isolated_sandbox, bool):
         raise ValueError("isolated_sandbox must be a boolean")
+    if not isinstance(provider_max_retries, int) or isinstance(provider_max_retries, bool) or provider_max_retries < 0:
+        raise ValueError("provider_max_retries must be a non-negative integer")
     if isolated_sandbox and terminal_backend != "docker":
         raise ValueError("isolated_sandbox requires terminal_backend='docker'")
 
@@ -417,6 +421,7 @@ def build_rova_runtime(
         tool_execution_mode=tool_execution_mode,
         tool_governance=tool_governance,
         hook_registry=hook_registry,
+        provider_retry_policy=ProviderRetryPolicy(max_retries=provider_max_retries),
     )
     extension_api.bind_event_hooks(agent)
     mcp_manager = (

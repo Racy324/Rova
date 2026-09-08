@@ -155,6 +155,19 @@ def test_gateway_does_not_render_committed_tool_results_as_assistant_messages(tm
     assert frames == []
 
 
+def test_gateway_discards_attempt_local_streaming_presentation(tmp_path):
+    frames = []
+    gateway = TuiGateway(
+        runtime_factory=lambda session_id, approval_handler: FakeRuntime(session_id or "session-1"),
+        session_store=JsonlSessionStore(tmp_path),
+        emit_frame=frames.append,
+    )
+
+    gateway._on_agent_event(AgentEvent("provider_attempt_discarded"))
+
+    assert frames[-1]["params"] == {"type": "assistant.discard", "payload": {}}
+
+
 @pytest.mark.asyncio
 async def test_gateway_lists_persisted_session_summaries_and_resumes_through_runtime_factory(tmp_path):
     store = JsonlSessionStore(tmp_path)

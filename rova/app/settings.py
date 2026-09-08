@@ -35,6 +35,7 @@ class AppSettings:
     sandbox_image: str | None = None
     mcp_config_path: Path | None = None
     provider_timeout: float = 60.0
+    provider_max_retries: int = 2
 
     @classmethod
     def from_env(
@@ -62,6 +63,11 @@ class AppSettings:
         if execution_environment not in {None, "local", "sandbox"}:
             raise ValueError("ROVA_EXECUTION_ENVIRONMENT must be 'local' or 'sandbox'")
         provider_timeout = _parse_positive_float(source.get("ROVA_PROVIDER_TIMEOUT"), "ROVA_PROVIDER_TIMEOUT", default=60.0)
+        provider_max_retries = _parse_non_negative_int(
+            source.get("ROVA_PROVIDER_MAX_RETRIES"),
+            "ROVA_PROVIDER_MAX_RETRIES",
+            default=2,
+        )
         return cls(
             provider=source.get("ROVA_PROVIDER", "mock"),
             model=source.get("ROVA_MODEL", "mock"),
@@ -90,6 +96,7 @@ class AppSettings:
             sandbox_image=source.get("ROVA_SANDBOX_IMAGE") or None,
             mcp_config_path=(Path(source["ROVA_MCP_CONFIG"]).expanduser() if source.get("ROVA_MCP_CONFIG") else None),
             provider_timeout=provider_timeout,
+            provider_max_retries=provider_max_retries,
         )
 
     def to_model(self) -> Model:
@@ -145,4 +152,16 @@ def _parse_positive_float(value: str | None, name: str, *, default: float) -> fl
         raise ValueError(f"{name} must be a positive number") from error
     if parsed <= 0:
         raise ValueError(f"{name} must be a positive number")
+    return parsed
+
+
+def _parse_non_negative_int(value: str | None, name: str, *, default: int) -> int:
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a non-negative integer") from error
+    if parsed < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
     return parsed

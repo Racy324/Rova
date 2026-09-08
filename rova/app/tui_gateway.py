@@ -314,6 +314,8 @@ class TuiGateway:
             self._emit_event("assistant.start", {})
         elif event.type == "message_update" and isinstance(event.assistant_message_event, TextDelta):
             self._emit_event("assistant.delta", {"text": event.assistant_message_event.delta})
+        elif event.type == "provider_attempt_discarded":
+            self._emit_event("assistant.discard", {})
         elif event.type == "message_end" and isinstance(event.message, AssistantMessage):
             self._emit_event("assistant.end", {"text": event.message.text})
         elif event.type == "tool_execution_start":

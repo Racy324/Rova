@@ -394,6 +394,7 @@ def _build_runtime_from_args(
             if getattr(args, "mcp_config", None) is not None
             else getattr(app_settings, "mcp_config_path", None)
         ),
+        provider_max_retries=getattr(app_settings, "provider_max_retries", 2),
     )
     return runtime
 

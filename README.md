@@ -115,6 +115,17 @@ OPENAI_API_KEY=<api-key>
 
 更多配置项见 `.env.example`。
 
+### Provider 超时与重试
+
+```dotenv
+ROVA_PROVIDER_TIMEOUT=60
+ROVA_PROVIDER_MAX_RETRIES=2
+```
+
+`ROVA_PROVIDER_MAX_RETRIES` 是额外 transient 重试次数，必须为非负整数；默认值 `2` 代表连续 transient 情况下最多三次 Provider attempt。Rova 只会对可明确识别的短暂 Provider 故障（例如限流、临时服务端错误、超时或连接中断）以指数退避加随机抖动重试整个 Model Step。明确的上下文溢出会触发一次已有的 Context Compaction 后重试；它不重置 transient 预算，因此单个 Model Step 的总 attempts 仍有界。认证、无效请求和未知 Provider 错误不会自动重试。
+
+流式响应在完整结束前不会提交到 Session 或执行其中的 ToolCall；连接中断会丢弃该次部分语义输出后重新请求。Rova 不承诺 Provider 请求 exactly-once：Provider 可能已完成请求但客户端在收到完整响应前断流，因此重试可能产生重复计费。普通 CLI 已写入终端 scrollback 的部分字符也无法回滚，但它不属于会话语义状态。
+
 ### 4. 启动 Rova
 
 进入交互模式：
