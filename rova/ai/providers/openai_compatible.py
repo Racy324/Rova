@@ -371,7 +371,11 @@ class _StreamingAccumulator:
         if not isinstance(index, int) or isinstance(index, bool):
             raise ValueError("stream tool call delta is missing integer index")
         fragments = self.tool_calls.setdefault(index, _ToolCallFragments())
+        # Some OpenAI-compatible streams send null for an omitted continuation
+        # id rather than omitting the field.  It carries no new fragment.
         id_fragment = raw_delta.get("id", "")
+        if id_fragment is None:
+            id_fragment = ""
         if not isinstance(id_fragment, str):
             raise ValueError("stream tool call id fragment must be text")
         function = raw_delta.get("function", {})
@@ -379,6 +383,10 @@ class _StreamingAccumulator:
             raise ValueError("stream tool call function must be an object")
         name_fragment = function.get("name", "")
         arguments_fragment = function.get("arguments", "")
+        if name_fragment is None:
+            name_fragment = ""
+        if arguments_fragment is None:
+            arguments_fragment = ""
         if not isinstance(name_fragment, str) or not isinstance(arguments_fragment, str):
             raise ValueError("stream tool call fragments must be text")
         fragments.call_id += id_fragment

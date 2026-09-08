@@ -222,6 +222,36 @@ async def test_streaming_translator_accepts_dashscope_tool_call_continuation_fra
 
 
 @pytest.mark.asyncio
+async def test_streaming_translator_accepts_null_tool_call_id_continuation_fragment():
+    client = FakeStreamingHttpClient([
+        sse_chunk({"tool_calls": [{"index": 0, "id": "call_real", "function": {"name": "calc", "arguments": ""}}]}), "",
+        sse_chunk({"tool_calls": [{"index": 0, "id": None, "function": {"name": "", "arguments": "{}"}}]}), "",
+        sse_chunk({}, "tool_calls"), "",
+        "data: [DONE]", "",
+    ])
+
+    events = [event async for event in OpenAICompatibleProvider("key", client).stream(Model(provider="openai_compatible"), context())]
+
+    assert not any(isinstance(event, StreamError) for event in events)
+    assert events[-1].message.tool_calls == [ToolCall(id="call_real", name="calc", arguments={})]
+
+
+@pytest.mark.asyncio
+async def test_streaming_translator_accepts_null_tool_call_function_continuation_fragments():
+    client = FakeStreamingHttpClient([
+        sse_chunk({"tool_calls": [{"index": 0, "id": "call_real", "function": {"name": "calc", "arguments": "{}"}}]}), "",
+        sse_chunk({"tool_calls": [{"index": 0, "function": {"name": None, "arguments": None}}]}), "",
+        sse_chunk({}, "tool_calls"), "",
+        "data: [DONE]", "",
+    ])
+
+    events = [event async for event in OpenAICompatibleProvider("key", client).stream(Model(provider="openai_compatible"), context())]
+
+    assert not any(isinstance(event, StreamError) for event in events)
+    assert events[-1].message.tool_calls == [ToolCall(id="call_real", name="calc", arguments={})]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("finish_reason, expected", [("stop", "stop"), ("length", "length")])
 async def test_streaming_translator_uses_existing_finish_reason_mapping(finish_reason, expected):
     client = FakeStreamingHttpClient([sse_chunk({"content": "done"}, finish_reason), "", "data: [DONE]", ""])

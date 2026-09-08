@@ -1,0 +1,2 @@
+This immutable template is expanded only inside a fresh, eval-owned workspace.
+Its expansion is fixed by evals.runtime_v1.fixtures._materialize_pressure_fixture.

@@ -242,6 +242,8 @@ def build_rova_runtime(
     artifact_root: Path | None = None,
     trace_root: Path | None = None,
     compaction_policy: CompactionPolicy | None = None,
+    enable_tool_result_externalization: bool = True,
+    enable_context_overflow_recovery: bool = True,
     max_turns: int = DEFAULT_MAX_TURNS,
     session_id: str | None = None,
     memory_store: MemoryStore | None = None,
@@ -293,6 +295,10 @@ def build_rova_runtime(
         raise ValueError("isolated_sandbox must be a boolean")
     if not isinstance(provider_max_retries, int) or isinstance(provider_max_retries, bool) or provider_max_retries < 0:
         raise ValueError("provider_max_retries must be a non-negative integer")
+    if not isinstance(enable_tool_result_externalization, bool):
+        raise ValueError("enable_tool_result_externalization must be a boolean")
+    if not isinstance(enable_context_overflow_recovery, bool):
+        raise ValueError("enable_context_overflow_recovery must be a boolean")
     if isolated_sandbox and terminal_backend != "docker":
         raise ValueError("isolated_sandbox requires terminal_backend='docker'")
 
@@ -417,7 +423,11 @@ def build_rova_runtime(
         tools,
         stream_fn,
         max_turns=max_turns,
-        tool_output_processor=ToolOutputProcessor(artifact_store),
+        tool_output_processor=(
+            ToolOutputProcessor(artifact_store)
+            if enable_tool_result_externalization
+            else None
+        ),
         tool_execution_mode=tool_execution_mode,
         tool_governance=tool_governance,
         hook_registry=hook_registry,
@@ -553,7 +563,9 @@ def build_rova_runtime(
         )
 
     agent.set_context_preparer(prepare_runtime_context)
-    agent.set_context_overflow_recovery(recover_context_overflow)
+    agent.set_context_overflow_recovery(
+        recover_context_overflow if enable_context_overflow_recovery else None
+    )
 
     return RovaRuntime(
         agent=agent,
