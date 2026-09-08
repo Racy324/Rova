@@ -15,6 +15,7 @@ from rova.agent_session.compaction import CompactionPolicy
 from rova.eval import CheckResult, EvalCase, EvalExecution, EvalResult, EvalRunner, JsonlEvalStore
 from rova.trace import JsonlTraceStore
 
+from .context_cases import prompt_script, snapshot_workspace, validate_workspace
 from .fixtures import SmokeFixture, dry_run_context_fixtures, fresh_workspace
 from .runtime_factory import ContextManagementProfile, build_context_runtime
 from .spec import RunManifestRecord
@@ -94,24 +95,6 @@ class _DevelopmentContextProvider:
             yield StreamDone(AssistantMessage([TextBlock("constraint acknowledged")]))
 
 
-def _prompts(case_id: str, workspace: Path) -> list[str]:
-    if case_id == "CM01_large_tool_output_repair":
-        return [
-            "Read reference.txt in full, find ROVA_EVAL_TARGET_MAPPING, and update only "
-            "src/rule_engine.py so selected_mapping returns that mapping. Do not change other files."
-        ]
-    prompts = [
-        (workspace / "constraints" / f"constraint-{index}.txt").read_text(encoding="utf-8")
-        + f"\nAcknowledge constraint block {index}; do not modify files yet."
-        for index in range(1, 5)
-    ]
-    prompts.append(
-        "FINAL_IMPLEMENT: Based on the prior immutable constraint blocks, update only "
-        "src/followthrough.py so required_constraint returns keep-violet-3. Do not modify other files."
-    )
-    return prompts
-
-
 async def _run_case(
     fixture: SmokeFixture,
     profile: ContextManagementProfile,
@@ -135,6 +118,7 @@ async def _run_case(
 
     effective_stream = provider if provider is not None else counted_stream
     with fresh_workspace(fixture, root / "workspaces", keep_failed=keep_failed_workspace) as workspace:
+        baseline = snapshot_workspace(workspace)
         state_root = root / "state"
         runtime = build_context_runtime(
             profile=profile,
@@ -149,7 +133,7 @@ async def _run_case(
         )
         try:
             responses = []
-            for prompt in _prompts(fixture.case_id, workspace):
+            for prompt in prompt_script(fixture.case_id, workspace):
                 responses = await runtime.prompt(prompt)
                 if responses[-1].stop_reason in {"error", "aborted"}:
                     break
@@ -176,21 +160,15 @@ async def _run_case(
                 sum(item.duration_ms or 0.0 for item in traces),
             )
             validator_root = execution_workspace_root(runtime, workspace)
-            target = (
-                validator_root / "src" / "rule_engine.py"
-                if fixture.case_id == "CM01_large_tool_output_repair"
-                else validator_root / "src" / "followthrough.py"
-            )
-            expected = (
-                'def selected_mapping() -> str:\n    return "violet-47"\n'
-                if fixture.case_id == "CM01_large_tool_output_repair"
-                else 'def required_constraint() -> str:\n    return "keep-violet-3"\n'
-            )
+            validation = validate_workspace(fixture.case_id, validator_root, baseline)
             return EvalExecution(
                 fixture.case_id,
                 trace,
                 responses[-1],
-                artifacts={"validator_passed": target.read_text(encoding="utf-8") == expected},
+                artifacts={
+                    "validator_passed": validation.passed,
+                    "validator_reason": validation.reason,
+                },
             ), observation.provider_requests, observation
         finally:
             await runtime.close()

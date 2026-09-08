@@ -1,0 +1,166 @@
+{
+  "context_cases": [
+    {
+      "allowed_change_paths": [
+        "src/rule_engine.py"
+      ],
+      "case_id": "CM01_large_tool_output_repair",
+      "fixture_sha256": "e99ff93be9ead43e053a3fed440c856553020bc9ad734a7e192b683d45d21e3d",
+      "fixture_source": "evals/runtime_v1/fixtures/cm01_dry",
+      "prompt_sha256": "8e26be25b7bf7fbdfa823f95b067d6153c6e2b593b6d379050010b74e7f59ade",
+      "validator_sha256": "143ded54c70076e7ade1c3d9bae46e857695e844181a5249e2aca64bc2008ec8"
+    },
+    {
+      "allowed_change_paths": [
+        "src/followthrough.py"
+      ],
+      "case_id": "CM02_long_history_followthrough",
+      "fixture_sha256": "0e2d12fb998098a08b1e0bdb11160769fa97eb1578adaa14b00c61eca36b28ec",
+      "fixture_source": "evals/runtime_v1/fixtures/cm02_dry",
+      "prompt_sha256": "cbb499e2fad25b72ff93d123323108dacaaaaeb0bf53ca66915e13aa588d76fb",
+      "validator_sha256": "f220242d48a579a3cdf58814f3415f4b5609c96601bc6e893f5494b5137b37ce"
+    }
+  ],
+  "context_profiles": {
+    "base": {
+      "compaction": false,
+      "overflow_recovery": false,
+      "tool_result_externalization": false
+    },
+    "full": {
+      "compaction": true,
+      "compaction_policy": {
+        "context_window": 64000,
+        "keep_recent_tokens": 20000,
+        "reserve_tokens": 12000
+      },
+      "overflow_recovery": true,
+      "tool_result_externalization": true
+    }
+  },
+  "fault_injection": {
+    "case_ids": [
+      "FI01",
+      "FI02",
+      "FI03",
+      "FI04",
+      "FI05",
+      "FI06",
+      "FI07",
+      "FI08",
+      "FI09",
+      "FI10",
+      "FI11",
+      "FI12"
+    ],
+    "provider_requests": 0,
+    "repeats": 3
+  },
+  "formal_change_lock": true,
+  "formal_change_lock_rule": "After this manifest is frozen, formal results cannot be used to modify fixtures, prompts, validators, profiles, metrics, or repeat counts. An invalidating Runtime bug requires a new suite version and a new freeze manifest before any formal rerun.",
+  "formal_runs": {
+    "context_ab": 12,
+    "fault_injection": 36,
+    "tool_parallelism_batches": 360
+  },
+  "frozen_at": "2026-09-08T14:48:03.931342Z",
+  "git_commit_sha": "3d33e093e8e8b22e996a7d33ef0db69cdbb081f6",
+  "historical_run_disposition": [
+    {
+      "aggregation_status": "invalid",
+      "experiment_id": "dry-run-live-20260908",
+      "reason": "Context correctness validator used the wrong Host/Sandbox path: it read the Host fixture copy rather than the Sandbox execution filesystem; results are not comparable."
+    },
+    {
+      "aggregation_status": "invalid",
+      "experiment_id": "dry-run-live-20260908-r2",
+      "reason": "Context correctness validator used the wrong Host/Sandbox path: it read the Host fixture copy rather than the Sandbox execution filesystem; results are not comparable."
+    },
+    {
+      "aggregation_status": "invalid",
+      "experiment_id": "dry-run-live-20260908-r3",
+      "reason": "Context correctness validator used the wrong Host/Sandbox path: it read the Host fixture copy rather than the Sandbox execution filesystem; results are not comparable."
+    },
+    {
+      "aggregation_status": "invalid",
+      "experiment_id": "dry-run-live-20260908-r4",
+      "reason": "Context correctness validator used the wrong Host/Sandbox path: it read the Host fixture copy rather than the Sandbox execution filesystem; results are not comparable."
+    },
+    {
+      "aggregation_status": "calibration_only",
+      "experiment_id": "pre-freeze-calibration-20260908",
+      "reason": "Used only to verify freeze criteria; it is not a formal benchmark repeat."
+    }
+  ],
+  "implementation_file_sha256": {
+    "evals/runtime_v1/context_ab.py": "2ea84c941292e4c2bdc821bb19890ce5c136483a391240cdb0f8f6776358415d",
+    "evals/runtime_v1/context_cases.py": "43bbf7b0308569fcbc3934505d56f1d33c5b22b391a00fd92eda9ded4ed42578",
+    "evals/runtime_v1/fault_benchmark.py": "59e05d418ba6466d35feaa5d19dbdbacb6df5f62ffd687557c9c5e47e926e90f",
+    "evals/runtime_v1/fixtures.py": "1f8e64476a973b19247e7a0d924923a9653f1cb6b0b30cc65b5c14ab3af56b23",
+    "evals/runtime_v1/runtime_factory.py": "c40599d02daca11d5859a674f9852d02f33e45ef2f32ae5081a8c5d72d162b40",
+    "evals/runtime_v1/tool_parallel.py": "ae62e53d8c1a040eb9bad68043551a175753894de4c715ae1183bc144e199cfa",
+    "rova/ai/providers/openai_compatible.py": "2bd62f9a84d379d7113ff49106d72a48b45b3026888fadd0ac810f035067b661",
+    "rova/app/runtime.py": "b1f217dd670044568397f8278ccce46944b439335b411169dda311194fe1633d"
+  },
+  "metric_definitions": {
+    "context_ab": [
+      "success",
+      "actual_input_tokens",
+      "actual_output_tokens",
+      "duration_ms",
+      "overflow_recovery_count",
+      "compaction_count",
+      "externalization_count",
+      "tool_call_count",
+      "termination_reason"
+    ],
+    "fault_injection": [
+      "recoverable_fault_recovery_rate",
+      "failure_policy_correctness",
+      "duplicate_side_effect_count",
+      "partial_commit_violations",
+      "transparent_tool_retry_violations"
+    ],
+    "tool_parallelism": [
+      "p50_duration_ms",
+      "p95_duration_ms",
+      "speedup",
+      "source_order_correct",
+      "failure_isolation",
+      "mutation_fallback"
+    ]
+  },
+  "model": {
+    "context_window": 64000,
+    "max_tokens": null,
+    "name": "mimo-v2.5",
+    "provider": "openai_compatible",
+    "provider_timeout_seconds": 60.0,
+    "temperature": null
+  },
+  "sandbox": {
+    "image": "python:3.12-slim",
+    "image_digest": "sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9"
+  },
+  "schema_version": 1,
+  "shared_runtime_settings": {
+    "approval_handler": "AlwaysApprove",
+    "cleanup_policy": "discard_sandbox_and_delete_workspace_after_every_run",
+    "execution_environment": "sandbox",
+    "experience_review_enabled": false,
+    "keep_failed_workspace": false,
+    "max_turns": 6,
+    "permission_mode": "full",
+    "provider_max_retries": 2,
+    "terminal_backend": "docker",
+    "workspace_policy": "fresh_eval_owned_sandbox_no_apply"
+  },
+  "suite": "runtime-v1-evaluation",
+  "suite_version": "runtime_v1_context_64k_v1",
+  "tool_parallelism": {
+    "measured_samples_per_scenario": 30,
+    "provider_requests": 0,
+    "scenario_count": 12,
+    "warmup_samples_per_scenario": 3
+  }
+}

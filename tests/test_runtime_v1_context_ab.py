@@ -35,6 +35,29 @@ def test_context_validator_uses_the_execution_environment_filesystem_root_for_sa
     assert execution_workspace_root(runtime, host_root) == sandbox_root
 
 
+def test_context_validator_enforces_the_frozen_allowed_change_boundary(tmp_path: Path) -> None:
+    from evals.runtime_v1.context_cases import (
+        expected_workspace_content,
+        snapshot_workspace,
+        validate_workspace,
+    )
+    from evals.runtime_v1.fixtures import dry_run_context_fixtures, fresh_workspace
+
+    fixture = dry_run_context_fixtures()[0]
+    with fresh_workspace(fixture, tmp_path / "workspaces") as workspace:
+        baseline = snapshot_workspace(workspace)
+        (workspace / "src" / "rule_engine.py").write_text(
+            expected_workspace_content(fixture.case_id), encoding="utf-8"
+        )
+        passed = validate_workspace(fixture.case_id, workspace, baseline)
+        assert passed.passed is True
+
+        (workspace / "unexpected.txt").write_text("not allowed", encoding="utf-8")
+        rejected = validate_workspace(fixture.case_id, workspace, baseline)
+        assert rejected.passed is False
+        assert "unexpected.txt" in rejected.reason
+
+
 @pytest.mark.asyncio
 async def test_context_dry_run_uses_only_profile_seams_and_observes_externalization_and_compaction(
     tmp_path: Path,

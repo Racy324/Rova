@@ -8,6 +8,15 @@ from pathlib import Path
 from uuid import uuid4
 
 
+def _is_fixture_authority_file(source: Path, path: Path) -> bool:
+    relative = path.relative_to(source)
+    return (
+        path.is_file()
+        and "__pycache__" not in relative.parts
+        and path.suffix not in {".pyc", ".pyo"}
+    )
+
+
 @dataclass(frozen=True)
 class SmokeFixture:
     case_id: str
@@ -16,7 +25,7 @@ class SmokeFixture:
     @property
     def sha256(self) -> str:
         digest = hashlib.sha256()
-        for path in sorted(item for item in self.source.rglob("*") if item.is_file()):
+        for path in sorted(item for item in self.source.rglob("*") if _is_fixture_authority_file(self.source, item)):
             digest.update(path.relative_to(self.source).as_posix().encode("utf-8"))
             digest.update(path.read_bytes())
         return digest.hexdigest()
@@ -50,7 +59,11 @@ def fresh_workspace(fixture: SmokeFixture, root: Path, *, keep_failed: bool = Fa
     """Copy one immutable fixture into an eval-owned workspace and clean it by default."""
     root = Path(root)
     workspace = root / f"{fixture.case_id}-{uuid4().hex}"
-    shutil.copytree(fixture.source, workspace)
+    shutil.copytree(
+        fixture.source,
+        workspace,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
     _materialize_pressure_fixture(fixture.case_id, workspace)
     try:
         yield workspace
