@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -10,11 +11,21 @@ import pytest
 from rova.ai.messages import ToolCall
 from rova.agent_core.tools import ToolRegistry, ToolRuntime
 from rova.app.file_lock import FileLock
-from rova.app.skills import FileSkillStore, SkillStoreError, create_skill_tools
+from rova.app.skills import FileSkillStore, SkillStoreError, create_skill_tools, validate_skill_document
 
 
 def _skill_markdown(name: str, description: str, body: str = "## Procedure\n\nFollow the checks.") -> str:
     return f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\n{body}\n"
+
+
+def test_shared_main_document_validator_normalizes_and_validates_name() -> None:
+    content = "---\r\nname: code-review\r\ndescription: Review code.\r\n---\r\n"
+
+    assert validate_skill_document("code-review", content) == (
+        "---\nname: code-review\ndescription: Review code.\n---\n"
+    )
+    with pytest.raises(SkillStoreError, match="match"):
+        validate_skill_document("other", content)
 
 
 def test_catalog_discovery_handles_missing_empty_and_multiple_skills(tmp_path: Path) -> None:
@@ -129,6 +140,26 @@ def test_store_edits_skill_main_file_with_matching_frontmatter(tmp_path: Path) -
         ("code-review", "Review changes carefully."),
     ]
     assert "Updated procedure." in store.read("code-review")
+
+
+def test_store_main_document_edit_fails_closed_when_expected_baseline_is_stale(
+    tmp_path: Path,
+) -> None:
+    store = FileSkillStore(tmp_path / "skills")
+    original = _skill_markdown("code-review", "Original review.")
+    store.create("code-review", original)
+    baseline = hashlib.sha256(original.encode("utf-8")).hexdigest()
+    changed = _skill_markdown("code-review", "Changed review.")
+    store.edit("code-review", changed)
+
+    with pytest.raises(SkillStoreError, match="baseline has changed"):
+        store.edit(
+            "code-review",
+            _skill_markdown("code-review", "Candidate review."),
+            expected_main_document_sha256=baseline,
+        )
+
+    assert store.read_main_document("code-review") == changed
 
 
 @pytest.mark.parametrize("path", ["../outside.md", "/absolute.md", "C:/absolute.md"])

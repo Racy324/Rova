@@ -293,6 +293,8 @@ Rova 默认将本地运行数据保存在：
 ├── artifacts/
 ├── memory/
 ├── skills/
+├── skill-proposals/
+├── skill-candidates/
 ├── extensions/
 └── experience/
 ```
@@ -314,6 +316,7 @@ ROVA_DATA_DIR
 - `memory/`：长期 Memory
 - `skills/`：本地 Skills
 - `skill-proposals/`：Experience Evolution 生成的待处理 Skill Proposal
+- `skill-candidates/`：由 Proposal 生成、等待人工审阅的隔离 Candidate
 - `extensions/`：用户安装的本地 Extensions
 - `experience/`：Experience Evolution 运行状态
 
@@ -324,6 +327,21 @@ ROVA_EXPERIENCE_REVIEW_ENABLED=false
 ```
 
 其他可调参数见 `.env.example`。
+
+### 审阅和发布 Skill Candidate
+
+Experience Review 只会生成待处理 Proposal，不会直接改动已安装的 Active Skill。可通过以下命令将 Proposal 生成 Candidate、检查内容，再由用户确认后发布：
+
+```bash
+python -m rova skills proposals
+python -m rova skills candidate create <proposal-id>
+python -m rova skills candidate list
+python -m rova skills candidate show <candidate-id>
+python -m rova skills candidate promote <candidate-id>
+python -m rova skills candidate reject <candidate-id> --reason "原因"
+```
+
+`promote` 会显示审阅摘要；交互终端中只有输入小写 `y` 才会继续，非交互环境必须显式传入 `--yes`。Candidate 在 Promote 前不会进入正常 Skill Catalog、System Context 或 `skill_view`；发布成功后，只有新建或恢复的 Runtime 会看到新的 Active Skill。日常发布不以自动效果评测为前置条件。
 
 ---
 

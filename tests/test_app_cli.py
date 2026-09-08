@@ -19,6 +19,8 @@ from rova.app.context.local import LocalContextItem, LocalResearchContext
 from rova.app.web.sources import ResearchSourceStore, SearchHit
 from rova.artifacts import FileArtifactStore
 from rova.app.workspace.terminal import TerminalEnvironment
+from rova.app.skill_proposals import FileSkillProposalStore, SkillProposal
+from rova.app.skill_candidates import FileSkillCandidateStore
 
 
 @pytest.fixture(autouse=True)
@@ -74,6 +76,322 @@ def test_unified_cli_parses_explicit_tools_context_and_prompt() -> None:
 def test_unified_cli_defaults_permission_to_ask() -> None:
     assert parse_rova_cli_args([]).permission == "ask"
     assert parse_rova_cli_args([]).data_dir is None
+
+
+@pytest.mark.asyncio
+async def test_skills_proposals_lists_pending_proposals_without_building_runtime(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    proposal = FileSkillProposalStore(data_dir / "skill-proposals").save(
+        3,
+        [
+            SkillProposal(
+                action="create",
+                name="paper-review",
+                content="---\nname: paper-review\ndescription: Review papers.\n---\n",
+                rationale="Capture a reusable workflow.",
+            )
+        ],
+    )[0]
+
+    def runtime_must_not_be_created(*_args, **_kwargs):
+        raise AssertionError("skills management must not build a Runtime")
+
+    monkeypatch.setattr(cli, "_build_runtime_from_args", runtime_must_not_be_created)
+
+    await run_rova_cli(["--data-dir", str(data_dir), "skills", "proposals"])
+
+    rendered = capsys.readouterr().out
+    assert proposal.proposal_id in rendered
+    assert "create paper-review" in rendered
+
+
+@pytest.mark.asyncio
+async def test_skills_candidate_create_materializes_pending_proposal_without_runtime(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    proposal = FileSkillProposalStore(data_dir / "skill-proposals").save(
+        3,
+        [
+            SkillProposal(
+                action="create",
+                name="paper-review",
+                content="---\nname: paper-review\ndescription: Review papers.\n---\n",
+                rationale="Capture a reusable workflow.",
+            )
+        ],
+    )[0]
+    monkeypatch.setattr(
+        cli,
+        "_build_runtime_from_args",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build Runtime")),
+    )
+
+    await run_rova_cli([
+        "--data-dir", str(data_dir), "skills", "candidate", "create", proposal.proposal_id,
+    ])
+
+    candidates = FileSkillCandidateStore(data_dir / "skill-candidates").list()
+    assert len(candidates) == 1
+    assert candidates[0].proposal_id == proposal.proposal_id
+    assert candidates[0].candidate_id in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_skills_candidate_list_and_show_use_candidate_store_and_review_service(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    proposal = FileSkillProposalStore(data_dir / "skill-proposals").save(
+        3,
+        [
+            SkillProposal(
+                action="create",
+                name="paper-review",
+                content="---\nname: paper-review\ndescription: Review papers.\n---\n# paper-review\n",
+                rationale="Capture a reusable workflow.",
+            )
+        ],
+    )[0]
+    active_store = cli.FileSkillStore(data_dir / "skills")
+    candidate_store = FileSkillCandidateStore(data_dir / "skill-candidates")
+    candidate = cli.CandidateMaterializer(
+        proposal_store=FileSkillProposalStore(data_dir / "skill-proposals"),
+        active_skill_store=active_store,
+        candidate_store=candidate_store,
+    ).materialize(proposal.proposal_id)
+    monkeypatch.setattr(
+        cli,
+        "_build_runtime_from_args",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build Runtime")),
+    )
+
+    await run_rova_cli(["--data-dir", str(data_dir), "skills", "candidate", "list"])
+    listed = capsys.readouterr().out
+    await run_rova_cli([
+        "--data-dir", str(data_dir), "skills", "candidate", "show", candidate.candidate_id,
+    ])
+    shown = capsys.readouterr().out
+
+    assert candidate.candidate_id in listed
+    assert "ready create paper-review" in listed
+    assert candidate.candidate_id in shown
+    assert "Capture a reusable workflow." in shown
+    assert "target_absent" in shown
+    assert "Validation errors: none" in shown
+    assert "# paper-review" in shown
+
+
+@pytest.mark.asyncio
+async def test_skills_candidate_promote_requires_yes_when_stdin_is_noninteractive(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    proposal = FileSkillProposalStore(data_dir / "skill-proposals").save(
+        1,
+        [
+            SkillProposal(
+                action="create",
+                name="paper-review",
+                content="---\nname: paper-review\ndescription: Review papers.\n---\n",
+                rationale="Capture a reusable workflow.",
+            )
+        ],
+    )[0]
+    active_store = cli.FileSkillStore(data_dir / "skills")
+    candidate_store = FileSkillCandidateStore(data_dir / "skill-candidates")
+    candidate = cli.CandidateMaterializer(
+        proposal_store=FileSkillProposalStore(data_dir / "skill-proposals"),
+        active_skill_store=active_store,
+        candidate_store=candidate_store,
+    ).materialize(proposal.proposal_id)
+
+    class NonInteractiveInput:
+        def isatty(self) -> bool:
+            return False
+
+    monkeypatch.setattr(cli.sys, "stdin", NonInteractiveInput())
+    monkeypatch.setattr(
+        cli,
+        "_build_runtime_from_args",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build Runtime")),
+    )
+
+    await run_rova_cli([
+        "--data-dir", str(data_dir), "skills", "candidate", "promote", candidate.candidate_id,
+    ])
+
+    assert not (active_store.root / "paper-review").exists()
+    assert candidate_store.read(candidate.candidate_id).state.value == "ready"
+    assert "requires --yes in non-interactive mode" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_skills_candidate_reject_forwards_reason_without_building_runtime(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    proposal = FileSkillProposalStore(data_dir / "skill-proposals").save(
+        1,
+        [
+            SkillProposal(
+                action="create",
+                name="paper-review",
+                content="---\nname: paper-review\ndescription: Review papers.\n---\n",
+                rationale="Capture a reusable workflow.",
+            )
+        ],
+    )[0]
+    active_store = cli.FileSkillStore(data_dir / "skills")
+    candidate_store = FileSkillCandidateStore(data_dir / "skill-candidates")
+    candidate = cli.CandidateMaterializer(
+        proposal_store=FileSkillProposalStore(data_dir / "skill-proposals"),
+        active_skill_store=active_store,
+        candidate_store=candidate_store,
+    ).materialize(proposal.proposal_id)
+    monkeypatch.setattr(
+        cli,
+        "_build_runtime_from_args",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build Runtime")),
+    )
+
+    await run_rova_cli([
+        "--data-dir", str(data_dir), "skills", "candidate", "reject", candidate.candidate_id,
+        "--reason", "Needs a narrower scope.",
+    ])
+
+    assert candidate_store.read(candidate.candidate_id).state.value == "rejected"
+    assert candidate_store.read(candidate.candidate_id).rejection_reason == "Needs a narrower scope."
+    assert not (active_store.root / "paper-review").exists()
+    assert "Candidate rejected" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("response", "promoted"), [("y", True), ("Y", False)])
+async def test_skills_candidate_promote_interactive_accepts_only_exact_y(
+    monkeypatch, tmp_path: Path, capsys, response: str, promoted: bool
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    proposal = FileSkillProposalStore(data_dir / "skill-proposals").save(
+        1,
+        [
+            SkillProposal(
+                action="create",
+                name="paper-review",
+                content="---\nname: paper-review\ndescription: Review papers.\n---\n",
+                rationale="Capture a reusable workflow.",
+            )
+        ],
+    )[0]
+    active_store = cli.FileSkillStore(data_dir / "skills")
+    candidate_store = FileSkillCandidateStore(data_dir / "skill-candidates")
+    candidate = cli.CandidateMaterializer(
+        proposal_store=FileSkillProposalStore(data_dir / "skill-proposals"),
+        active_skill_store=active_store,
+        candidate_store=candidate_store,
+    ).materialize(proposal.proposal_id)
+
+    class InteractiveInput:
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(cli.sys, "stdin", InteractiveInput())
+    monkeypatch.setattr(
+        cli,
+        "_build_runtime_from_args",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build Runtime")),
+    )
+
+    await run_rova_cli(
+        ["--data-dir", str(data_dir), "skills", "candidate", "promote", candidate.candidate_id],
+        input_fn=lambda _prompt: response,
+    )
+
+    assert (active_store.root / "paper-review").exists() is promoted
+    assert candidate_store.read(candidate.candidate_id).state.value == (
+        "promoted" if promoted else "ready"
+    )
+    output = capsys.readouterr().out
+    assert "Target status: target_absent" in output
+    assert ("Candidate promoted" if promoted else "Promotion cancelled") in output
+
+
+@pytest.mark.asyncio
+async def test_skills_candidate_promote_yes_confirms_without_interactive_input(
+    monkeypatch, tmp_path: Path
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    proposal = FileSkillProposalStore(data_dir / "skill-proposals").save(
+        1,
+        [
+            SkillProposal(
+                action="create",
+                name="paper-review",
+                content="---\nname: paper-review\ndescription: Review papers.\n---\n",
+                rationale="Capture a reusable workflow.",
+            )
+        ],
+    )[0]
+    active_store = cli.FileSkillStore(data_dir / "skills")
+    candidate_store = FileSkillCandidateStore(data_dir / "skill-candidates")
+    candidate = cli.CandidateMaterializer(
+        proposal_store=FileSkillProposalStore(data_dir / "skill-proposals"),
+        active_skill_store=active_store,
+        candidate_store=candidate_store,
+    ).materialize(proposal.proposal_id)
+    monkeypatch.setattr(
+        cli,
+        "_build_runtime_from_args",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build Runtime")),
+    )
+
+    await run_rova_cli([
+        "--data-dir", str(data_dir), "skills", "candidate", "promote", candidate.candidate_id, "--yes",
+    ])
+
+    assert active_store.read_main_document("paper-review").startswith("---\nname: paper-review")
+    assert candidate_store.read(candidate.candidate_id).state.value == "promoted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_args", [(), ("--reason", "")])
+async def test_skills_candidate_reject_requires_nonempty_reason(
+    monkeypatch, tmp_path: Path, capsys, reason_args: tuple[str, ...]
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    proposal = FileSkillProposalStore(data_dir / "skill-proposals").save(
+        1,
+        [
+            SkillProposal(
+                action="create",
+                name="paper-review",
+                content="---\nname: paper-review\ndescription: Review papers.\n---\n",
+                rationale="Capture a reusable workflow.",
+            )
+        ],
+    )[0]
+    active_store = cli.FileSkillStore(data_dir / "skills")
+    candidate_store = FileSkillCandidateStore(data_dir / "skill-candidates")
+    candidate = cli.CandidateMaterializer(
+        proposal_store=FileSkillProposalStore(data_dir / "skill-proposals"),
+        active_skill_store=active_store,
+        candidate_store=candidate_store,
+    ).materialize(proposal.proposal_id)
+    monkeypatch.setattr(
+        cli,
+        "_build_runtime_from_args",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build Runtime")),
+    )
+
+    await run_rova_cli([
+        "--data-dir", str(data_dir), "skills", "candidate", "reject", candidate.candidate_id, *reason_args,
+    ])
+
+    assert candidate_store.read(candidate.candidate_id).state.value == "ready"
+    assert not (active_store.root / "paper-review").exists()
+    assert "requires --reason" in capsys.readouterr().out
 
 
 def test_cli_renders_only_recovery_counts_and_side_effect_warning(capsys) -> None:

@@ -23,6 +23,11 @@ from .web.settings import WebSettings
 from .web.sources import ResearchSourceStore
 from .runtime import DEFAULT_MAX_TURNS, MAX_PRODUCT_TURNS, build_rova_runtime
 from .settings import AppSettings
+from .skill_candidate_review import CandidateReviewService
+from .skill_candidates import CandidateMaterializer, FileSkillCandidateStore, SkillCandidateStoreError
+from .skill_proposals import FileSkillProposalStore, SkillProposalStoreError
+from .skill_promotion import SkillPromotionError, SkillPromotionService
+from .skills import FileSkillStore
 from .vision import OpenAICompatibleVisionClient, VisionSettings
 from .workspace.terminal import TerminalEnvironment
 from .workspace.sandbox import SandboxError
@@ -62,7 +67,12 @@ def _console_print(
 
 
 def parse_rova_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Run the local Rova agent")
+    parser.set_defaults(skill_yes=False, skill_reason=None)
+    if _is_skill_candidate_mutation_argv(raw_argv):
+        parser.add_argument("--yes", action="store_true", dest="skill_yes")
+        parser.add_argument("--reason", dest="skill_reason")
     parser.add_argument("--workspace", type=Path, help="enable filesystem and shell tools within this workspace")
     parser.add_argument(
         "--environment",
@@ -111,13 +121,24 @@ def parse_rova_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace
         help=f"maximum provider turns per request (1-{MAX_PRODUCT_TURNS}, default: {DEFAULT_MAX_TURNS})",
     )
     parser.add_argument("prompt_parts", nargs="*", help="initial request")
-    parsed = parser.parse_args(argv)
+    parsed = parser.parse_args(raw_argv)
     parsed.prompt = " ".join(parsed.prompt_parts)
     if parsed.tui and parsed.save:
         parser.error("--save is not available in TUI mode")
     if parsed.tui and parsed.prompt:
         parser.error("an initial prompt is not available in TUI mode; submit it from the composer")
     return parsed
+
+
+def _is_skill_candidate_mutation_argv(argv: Sequence[str]) -> bool:
+    try:
+        index = tuple(argv).index("skills")
+    except ValueError:
+        return False
+    return tuple(argv[index:index + 3]) in {
+        ("skills", "candidate", "promote"),
+        ("skills", "candidate", "reject"),
+    }
 
 
 async def run_rova_cli(
@@ -127,6 +148,8 @@ async def run_rova_cli(
     args: argparse.Namespace | None = None,
 ) -> None:
     args = parse_rova_cli_args(argv) if args is None else args
+    if await _run_skill_management_command(args, input_fn=input_fn):
+        return
     runtime = _build_runtime_from_args(args)
     start_mcp_discovery = getattr(runtime, "start_mcp_discovery", None)
     if callable(start_mcp_discovery):
@@ -172,6 +195,141 @@ async def run_rova_cli(
             await runtime.prompt(prompt)
         except SandboxError as error:
             _console_print(f"Request blocked: {error}")
+
+
+async def _run_skill_management_command(
+    args: argparse.Namespace,
+    *,
+    input_fn: Callable[[str], str],
+) -> bool:
+    parts = tuple(getattr(args, "prompt_parts", ()))
+    if not parts or parts[0] != "skills":
+        return False
+    data_paths = AppSettings.from_env().data_paths(args.data_dir)
+    proposal_store = FileSkillProposalStore(data_paths.skill_proposals)
+    candidate_store = FileSkillCandidateStore(data_paths.skill_candidates)
+    active_skill_store = FileSkillStore(data_paths.skills)
+    materializer = CandidateMaterializer(
+        proposal_store=proposal_store,
+        active_skill_store=active_skill_store,
+        candidate_store=candidate_store,
+    )
+    review_service = CandidateReviewService(
+        candidate_store=candidate_store,
+        active_skill_store=active_skill_store,
+    )
+    promotion_service = SkillPromotionService(
+        candidate_store=candidate_store,
+        active_skill_store=active_skill_store,
+        review_service=review_service,
+    )
+    try:
+        if parts == ("skills", "proposals"):
+            _render_skill_proposals(proposal_store.list())
+            return True
+        if len(parts) == 4 and parts[:3] == ("skills", "candidate", "create"):
+            candidate = materializer.materialize(parts[3])
+            _console_print(f"Candidate created: {candidate.candidate_id}")
+            return True
+        if parts == ("skills", "candidate", "list"):
+            _render_skill_candidates(candidate_store.list())
+            return True
+        if len(parts) == 4 and parts[:3] == ("skills", "candidate", "show"):
+            _render_candidate_review(review_service.review(parts[3]))
+            return True
+        if len(parts) == 4 and parts[:3] == ("skills", "candidate", "promote"):
+            candidate_id = parts[3]
+            review = review_service.review(candidate_id)
+            _render_candidate_review_summary(review)
+            if getattr(args, "skill_yes", False):
+                confirmed = True
+            elif not _stdin_is_interactive():
+                _console_print("Promotion requires --yes in non-interactive mode.")
+                return True
+            else:
+                response = await asyncio.to_thread(input_fn, "Promote this Candidate? [y/N] ")
+                confirmed = response.strip() == "y"
+            if not confirmed:
+                _console_print("Promotion cancelled.")
+                return True
+            promoted = promotion_service.promote(candidate_id, confirmed=True)
+            _console_print(f"Candidate promoted: {promoted.candidate_id}")
+            return True
+        if len(parts) == 4 and parts[:3] == ("skills", "candidate", "reject"):
+            reason = getattr(args, "skill_reason", None)
+            if not isinstance(reason, str) or not reason.strip():
+                _console_print("Candidate rejection requires --reason TEXT.")
+                return True
+            rejected = promotion_service.reject(parts[3], reason=reason)
+            _console_print(f"Candidate rejected: {rejected.candidate_id}")
+            return True
+    except (SkillProposalStoreError, SkillCandidateStoreError, SkillPromotionError) as error:
+        _console_print(f"Skill management error: {error}")
+        return True
+    return False
+
+
+def _render_skill_proposals(proposals) -> None:
+    if not proposals:
+        _console_print("No pending Skill proposals.")
+        return
+    for proposal in proposals:
+        _console_print(
+            f"{proposal.proposal_id}  generation={proposal.review_generation}  "
+            f"{proposal.action} {proposal.name}"
+        )
+        _console_print(f"  rationale: {proposal.rationale}")
+
+
+def _render_skill_candidates(candidates) -> None:
+    if not candidates:
+        _console_print("No Skill Candidates.")
+        return
+    for candidate in candidates:
+        _console_print(
+            f"{candidate.candidate_id}  {candidate.state.value} "
+            f"{candidate.action} {candidate.name}"
+        )
+
+
+def _render_candidate_review(review) -> None:
+    candidate = review.candidate
+    _console_print(f"Candidate: {candidate.candidate_id}")
+    _console_print(f"Proposal: {candidate.proposal_id}")
+    _console_print(f"Review generation: {candidate.review_generation}")
+    _console_print(f"Created at: {candidate.created_at}")
+    _console_print(f"State: {candidate.state.value}")
+    _console_print(f"Action: {candidate.action}")
+    _console_print(f"Skill: {candidate.name}")
+    _console_print(f"Content SHA-256: {candidate.content_sha256}")
+    _console_print(f"Active baseline SHA-256: {candidate.active_baseline_sha256 or 'none'}")
+    _console_print(f"Rationale: {review.proposal_rationale}")
+    _console_print(f"Target status: {review.target_status.value}")
+    if review.validation_errors:
+        _console_print("Validation errors:")
+        for error in review.validation_errors:
+            _console_print(f"- {error}")
+    else:
+        _console_print("Validation errors: none")
+    _console_print("SKILL.md:")
+    _console_print(review.content, end="" if review.content.endswith("\n") else "\n")
+
+
+def _render_candidate_review_summary(review) -> None:
+    candidate = review.candidate
+    _console_print(f"Candidate: {candidate.candidate_id} ({candidate.action} {candidate.name})")
+    _console_print(f"Target status: {review.target_status.value}")
+    if review.validation_errors:
+        _console_print("Validation errors:")
+        for error in review.validation_errors:
+            _console_print(f"- {error}")
+    else:
+        _console_print("Validation errors: none")
+
+
+def _stdin_is_interactive() -> bool:
+    isatty = getattr(sys.stdin, "isatty", None)
+    return bool(callable(isatty) and isatty())
 
 
 def _build_runtime_from_args(

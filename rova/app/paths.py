@@ -52,5 +52,9 @@ class RovaDataPaths:
         return self.root / "skill-proposals"
 
     @property
+    def skill_candidates(self) -> Path:
+        return self.root / "skill-candidates"
+
+    @property
     def sandboxes(self) -> Path:
         return self.root / "sandboxes"

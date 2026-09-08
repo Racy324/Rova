@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -76,13 +77,17 @@ class FileSkillStore:
         renderer = skill_directory_renderer or _host_skill_directory
         return _substitute_skill_directory(_read_utf8(target), renderer(skill_directory))
 
+    def read_main_document(self, name: str) -> str:
+        """Read the stored SKILL.md without runtime path substitution."""
+        skill_directory = self._skill_directory(name)
+        return _read_utf8(self._resolve_skill_file(skill_directory, None))
+
     def resolved_directory(self, name: str) -> Path:
         """Return the installed package directory for an explicitly loaded Skill."""
         return self._skill_directory(name).resolve()
 
     def create(self, name: str, content: str) -> None:
-        _validate_skill_name(name)
-        _parse_skill_metadata(_validate_content(content), name)
+        normalized = validate_skill_document(name, content)
         self._ensure_root()
         try:
             with FileLock(self.root / ".skills.lock"):
@@ -93,7 +98,7 @@ class FileSkillStore:
                 try:
                     directory.mkdir()
                     created = True
-                    _write_utf8_atomically(directory / _SKILL_FILENAME, content)
+                    _write_utf8_atomically(directory / _SKILL_FILENAME, normalized)
                 except OSError:
                     if created:
                         try:
@@ -106,15 +111,28 @@ class FileSkillStore:
         except OSError as error:
             raise SkillStoreError(f"could not create Skill: {name}") from error
 
-    def edit(self, name: str, content: str, path: str | None = None) -> None:
+    def edit(
+        self,
+        name: str,
+        content: str,
+        path: str | None = None,
+        *,
+        expected_main_document_sha256: str | None = None,
+    ) -> None:
         normalized = _validate_content(content)
         if path is None:
-            _parse_skill_metadata(normalized, name)
+            normalized = validate_skill_document(name, normalized)
+        elif expected_main_document_sha256 is not None:
+            raise SkillStoreError("a main document baseline requires editing SKILL.md")
         try:
             self._ensure_root()
             with FileLock(self.root / ".skills.lock"):
                 skill_directory = self._skill_directory(name)
                 target = self._resolve_skill_file(skill_directory, path, allow_missing=True)
+                if expected_main_document_sha256 is not None:
+                    current = _read_utf8(target)
+                    if hashlib.sha256(current.encode("utf-8")).hexdigest() != expected_main_document_sha256:
+                        raise SkillStoreError("Active SKILL.md baseline has changed")
                 _write_utf8_atomically(target, normalized)
         except FileLockError as error:
             raise SkillStoreError("could not acquire Skill store lock") from error
@@ -259,6 +277,14 @@ def _parse_skill_metadata(content: str, expected_name: str) -> SkillMetadata:
     if not description:
         raise SkillStoreError("SKILL.md requires a description")
     return SkillMetadata(name, description)
+
+
+def validate_skill_document(name: str, content: object) -> str:
+    """Validate and normalize an Active or Candidate SKILL.md main document."""
+    _validate_skill_name(name)
+    normalized = _validate_content(content)
+    _parse_skill_metadata(normalized, name)
+    return normalized
 
 
 def _validate_skill_name(name: str) -> None:
