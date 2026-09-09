@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -9,8 +10,9 @@ import pytest
 def test_formal_plan_is_manifest_driven_and_simulation_only_changes_scale() -> None:
     from evals.runtime_v1.formal import FormalExecutionKind, FormalExecutionPlan
 
-    manifest = json.loads(Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v3.json").read_text(encoding="utf-8"))
-    formal = FormalExecutionPlan.from_manifest(manifest, eval_suite_commit="e" * 40)
+    manifest_path = Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v5.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    formal = FormalExecutionPlan.from_frozen_manifest(manifest_path, eval_suite_commit="e" * 40)
     simulation = formal.for_simulation()
     sandboxed_simulation = formal.for_simulation(sandboxed_context=True)
 
@@ -26,13 +28,14 @@ def test_formal_plan_is_manifest_driven_and_simulation_only_changes_scale() -> N
     assert simulation.manifest_sha256 == formal.manifest_sha256
     assert simulation.sandboxed_context is False
     assert sandboxed_simulation.sandboxed_context is True
+    assert formal.manifest_sha256 == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
 
 
 def test_formal_store_persists_metadata_and_rejects_duplicate_logical_identity(tmp_path: Path) -> None:
     from evals.runtime_v1.formal import FormalExecutionKind, FormalExecutionPlan, FormalExecutionStore, FormalRecord, FormalStoreError
 
-    manifest = json.loads(Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v3.json").read_text(encoding="utf-8"))
-    plan = FormalExecutionPlan.from_manifest(manifest, eval_suite_commit="e" * 40).for_simulation()
+    manifest_path = Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v5.json")
+    plan = FormalExecutionPlan.from_frozen_manifest(manifest_path, eval_suite_commit="e" * 40).for_simulation()
     store = FormalExecutionStore.create(tmp_path / "simulation", plan)
     record = FormalRecord.from_payload(
         plan, experiment="tool_parallelism", item_id="TP_uniform_1_parallel", profile="parallel",
@@ -41,6 +44,8 @@ def test_formal_store_persists_metadata_and_rejects_duplicate_logical_identity(t
     store.append(record)
 
     assert store.execution_metadata()["execution_kind"] == "simulation"
+    assert store.execution_metadata()["manifest_sha256"] == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    assert (tmp_path / "simulation" / "frozen-manifest.json").read_bytes() == manifest_path.read_bytes()
     assert len(store.records("tool_parallelism")) == 1
     with pytest.raises(FormalStoreError, match="duplicate logical identity"):
         store.append(record)
@@ -55,8 +60,8 @@ def test_completeness_rejects_interrupted_or_malformed_formal_records(tmp_path: 
         FormalRecord,
     )
 
-    manifest = json.loads(Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v3.json").read_text(encoding="utf-8"))
-    plan = FormalExecutionPlan.from_manifest(manifest, eval_suite_commit="e" * 40).for_simulation()
+    manifest_path = Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v5.json")
+    plan = FormalExecutionPlan.from_frozen_manifest(manifest_path, eval_suite_commit="e" * 40).for_simulation()
     store = FormalExecutionStore.create(tmp_path / "simulation", plan)
     store.mark_running()
     store.append(FormalRecord.from_payload(
@@ -73,10 +78,10 @@ def test_completeness_rejects_interrupted_or_malformed_formal_records(tmp_path: 
 
 @pytest.mark.asyncio
 async def test_formal_simulation_runs_through_store_completeness_and_aggregation(tmp_path: Path) -> None:
-    from evals.runtime_v1.formal import FormalExecutionPlan, FormalRunner
+    from evals.runtime_v1.formal import FormalExecutionPlan, FormalExecutionStore, FormalRunner
 
-    manifest = json.loads(Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v3.json").read_text(encoding="utf-8"))
-    plan = FormalExecutionPlan.from_manifest(manifest, eval_suite_commit="e" * 40).for_simulation()
+    manifest_path = Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v5.json")
+    plan = FormalExecutionPlan.from_frozen_manifest(manifest_path, eval_suite_commit="e" * 40).for_simulation()
     output_root = tmp_path / "simulation"
     summary = await FormalRunner(plan, output_root).run()
     execution_root = output_root / "simulations" / plan.execution_id
@@ -91,3 +96,12 @@ async def test_formal_simulation_runs_through_store_completeness_and_aggregation
     assert (execution_root / "traces" / "runs.jsonl").is_file()
     assert not (execution_root / "cw").exists()
     assert summary["tool"]["pairs"]
+    store = FormalExecutionStore(execution_root, plan)
+    traces = {trace.run_id: trace for trace in store.trace_store.load_all()}
+    for record in store.records("context_ab"):
+        trace_duration_ms = sum(
+            traces[trace_id].duration_ms or 0.0
+            for trace_id in record.payload["trace_run_ids"]
+        )
+        assert record.duration_ms == pytest.approx(trace_duration_ms)
+        assert record.payload["duration_ms"] == pytest.approx(trace_duration_ms)

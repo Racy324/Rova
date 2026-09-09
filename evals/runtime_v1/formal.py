@@ -31,6 +31,7 @@ from rova.trace import JsonlTraceStore
 from .context_ab import _ContextValidator, _DRY_MODEL, _run_case
 from .fixtures import dry_run_context_fixtures
 from .fault_benchmark import run_fault_case
+from .frozen_manifest import load_frozen_manifest, manifest_sha256
 from .runtime_factory import ContextManagementProfile
 from .tool_parallel import FrozenToolScenario, run_tool_parallel_scenarios
 
@@ -56,10 +57,6 @@ class FormalCompletenessError(RuntimeError):
     pass
 
 
-def _json_sha256(value: object) -> str:
-    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -70,6 +67,16 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     with temporary.open("w", encoding="utf-8", newline="\n") as handle:
         json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
@@ -119,6 +126,7 @@ def _contains_sensitive_key(value: object) -> bool:
 @dataclass(frozen=True)
 class FormalExecutionPlan:
     manifest: dict[str, object]
+    manifest_bytes: bytes
     manifest_sha256: str
     runtime_commit: str
     eval_suite_commit: str
@@ -132,7 +140,30 @@ class FormalExecutionPlan:
     sandboxed_context: bool
 
     @classmethod
-    def from_manifest(cls, manifest: dict[str, object], *, eval_suite_commit: str, execution_id: str | None = None) -> "FormalExecutionPlan":
+    def from_frozen_manifest(
+        cls,
+        path: Path,
+        *,
+        eval_suite_commit: str,
+        execution_id: str | None = None,
+    ) -> "FormalExecutionPlan":
+        frozen = load_frozen_manifest(path)
+        return cls.from_manifest(
+            frozen.document,
+            manifest_bytes=frozen.raw_bytes,
+            eval_suite_commit=eval_suite_commit,
+            execution_id=execution_id,
+        )
+
+    @classmethod
+    def from_manifest(
+        cls,
+        manifest: dict[str, object],
+        *,
+        manifest_bytes: bytes,
+        eval_suite_commit: str,
+        execution_id: str | None = None,
+    ) -> "FormalExecutionPlan":
         if manifest.get("suite_version") is None or len(str(manifest.get("runtime_commit", ""))) != 40:
             raise ValueError("invalid frozen formal manifest")
         cases = manifest["context_cases"]
@@ -152,7 +183,8 @@ class FormalExecutionPlan:
             "max_tokens": provider["max_tokens"], "provider_timeout_seconds": provider["provider_timeout_seconds"],
         }
         return cls(
-            manifest=dict(manifest), manifest_sha256=_json_sha256(manifest), runtime_commit=str(manifest["runtime_commit"]),
+            manifest=dict(manifest), manifest_bytes=manifest_bytes,
+            manifest_sha256=manifest_sha256(manifest_bytes), runtime_commit=str(manifest["runtime_commit"]),
             eval_suite_commit=eval_suite_commit, execution_kind=FormalExecutionKind.FORMAL,
             execution_id=execution_id or uuid4().hex, context_repeats=context_total // divisor,
             tool_warmups=int(tool["warmup_samples_per_scenario"]), tool_measurements=int(tool["measured_samples_per_scenario"]),
@@ -230,7 +262,7 @@ class FormalExecutionStore:
         if _contains_sensitive_key(plan.resolved_provider_fingerprint):
             raise FormalStoreError("provider fingerprint must not contain credentials")
         store.root.mkdir(parents=True)
-        _write_json(store.root / "frozen-manifest.json", plan.manifest)
+        _write_bytes(store.root / "frozen-manifest.json", plan.manifest_bytes)
         _write_json(store.root / "formal-metadata.json", {
             "suite_version": plan.suite_version, "runtime_commit": plan.runtime_commit,
             "eval_suite_commit": plan.eval_suite_commit, "manifest_sha256": plan.manifest_sha256,
@@ -294,8 +326,7 @@ class CompletenessValidator:
         state = store.state()
         if state is not FormalExecutionState.COMPLETED and not (allow_running and state is FormalExecutionState.RUNNING):
             raise FormalCompletenessError(f"execution is not complete: {state.value}")
-        frozen_manifest = json.loads((store.root / "frozen-manifest.json").read_text(encoding="utf-8"))
-        if _json_sha256(frozen_manifest) != store.plan.manifest_sha256:
+        if manifest_sha256((store.root / "frozen-manifest.json").read_bytes()) != store.plan.manifest_sha256:
             raise FormalCompletenessError("persisted frozen manifest does not match the execution plan")
         metadata = store.execution_metadata()
         for key, expected in {
@@ -645,11 +676,12 @@ class FormalRunner:
                         for trace in traces:
                             store.append_trace(trace)
                         usage = [trace.actual_usage for trace in traces if trace.actual_usage is not None]
+                        runtime_duration_ms = sum(trace.duration_ms or 0.0 for trace in traces)
                         input_tokens = [item.input_tokens for item in usage]
                         output_tokens = [item.output_tokens for item in usage]
                         payload = {
                             "validator_success": result.task_success,
-                            "duration_ms": result.duration_ms,
+                            "duration_ms": runtime_duration_ms,
                             "input_tokens": sum(input_tokens) if input_tokens else None,
                             "average_input_tokens": (sum(input_tokens) / requests) if input_tokens and requests else None,
                             "max_input_tokens": max(input_tokens) if input_tokens else None,
@@ -688,7 +720,7 @@ class FormalRunner:
                             phase="run",
                             payload=payload,
                             trace_run_id=execution.run_trace.run_id,
-                            started_at=started, duration_ms=result.duration_ms))
+                            started_at=started, duration_ms=runtime_duration_ms))
                         if not payload["retained_workspace"]:
                             shutil.rmtree(root, ignore_errors=True)
         finally:

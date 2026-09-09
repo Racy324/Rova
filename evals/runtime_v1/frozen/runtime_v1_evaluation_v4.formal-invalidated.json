@@ -1,0 +1,7 @@
+{
+  "aggregation_status": "formal_invalidated",
+  "execution_id": "1e88c3fcf70b41a18b32b6d6c087b0cb",
+  "must_not_enter_formal_aggregation": true,
+  "reason": "The only v4 Formal execution (1e88c3fcf70b41a18b32b6d6c087b0cb) was fail-closed invalidated: metadata used a canonical JSON manifest hash rather than the frozen file-byte hash, and Context duration instrumentation recorded evaluator time rather than Runtime wall-clock.",
+  "suite_version": "runtime_v1_evaluation_v4"
+}
