@@ -6,6 +6,48 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.mark.asyncio
+async def test_run_case_wraps_runtime_prompt_failure_without_treating_setup_as_a_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Only the runtime.prompt phase becomes a formal Context failure result."""
+    from evals.runtime_v1 import context_ab
+    from evals.runtime_v1.fixtures import dry_run_context_fixtures
+    from evals.runtime_v1.runtime_factory import ContextManagementProfile
+    from rova.agent_session.agent_session import CompactionInputTooLarge
+    from rova.ai.models import Model
+
+    class RuntimeThatFailsDuringPrompt:
+        sandbox_control = None
+
+        async def prompt(self, _prompt: str):
+            raise CompactionInputTooLarge("summary input does not fit")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(context_ab, "build_context_runtime", lambda **_kwargs: RuntimeThatFailsDuringPrompt())
+    monkeypatch.setattr(context_ab, "_assert_context_runtime_contract", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(context_ab.ContextRuntimeExecutionError) as raised:
+        await context_ab._run_case(
+            dry_run_context_fixtures()[0],
+            ContextManagementProfile.base(),
+            root=tmp_path,
+            model=Model("test", context_window=64_000),
+            stream_fn=lambda *_args: None,
+            use_development_provider=False,
+            isolated_sandbox=False,
+            sandbox_image=None,
+            keep_failed_workspace=False,
+        )
+
+    assert raised.value.failure_type == "CompactionInputTooLarge"
+    assert raised.value.provider_request_count == 0
+    assert raised.value.traces == ()
+
+
 def test_dry_run_context_fixtures_materialize_immutable_large_input(tmp_path: Path) -> None:
     from evals.runtime_v1.fixtures import dry_run_context_fixtures, fresh_workspace
 

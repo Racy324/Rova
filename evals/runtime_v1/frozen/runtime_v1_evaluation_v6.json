@@ -1,0 +1,524 @@
+{
+  "authority_file_sha256": {
+    "evals/runtime_v1/context_ab.py": "bdcf380451e72d4330acfec7cbffff4f4f244dbf56d0a490be1aee2170918431",
+    "evals/runtime_v1/context_cases.py": "43bbf7b0308569fcbc3934505d56f1d33c5b22b391a00fd92eda9ded4ed42578",
+    "evals/runtime_v1/fault_benchmark.py": "06701ee593b229231ccdab2a78c2efb1fa752388dd519c5cdaafe911e3f9ca69",
+    "evals/runtime_v1/fixtures.py": "d3a8255e1da626ac4b8419b151e52e6742602684abe77d0022ac0d8095065e51",
+    "evals/runtime_v1/formal.py": "59c6c394ad07585d8302ac046efb6c4b25701112b05dcd4cf3089c96eeca9728",
+    "evals/runtime_v1/formal_preflight_v6.py": "08d9790daaa6c4464397a68c1cc4f3bd8ec349af64247fa6e2821a41cda1a105",
+    "evals/runtime_v1/freeze_v6.py": "4253569b9f43ab4cc009dd91c43c78a2b5481a562a83818cf598dce90eac1f44",
+    "evals/runtime_v1/frozen_manifest.py": "2496d68077ba9e61c244e9bb4c912a31359356582a017e1f2688c43a63516978",
+    "evals/runtime_v1/runner.py": "c0c0c55c917a6763c10ac5ec2e2f8a7c979b9be497f346224f19eea96e8f38df",
+    "evals/runtime_v1/runtime_factory.py": "3c1cee80c8ab14f08030ae409b29683b7103f40709ef7d96a2bfd164a784ad50",
+    "evals/runtime_v1/tool_parallel.py": "121fe17d715347a6bba33299efc6d617467e46eb1f434c239ee6cfc6eea1ccc8",
+    "rova/agent_core/agent.py": "f7d189852464609a6238af45a0874134b4f289349df60a6e682c85aec389e77c",
+    "rova/agent_core/retry.py": "34dd5fe6813017454aaf0af9132d3f294e2205760043fb36e8b5cfa6e3a54a03",
+    "rova/agent_core/tool_output.py": "a2a4bd77642a47243ad2205cb15270d8e65d5aa98a2930f42103b02d14f314fb",
+    "rova/agent_core/tools.py": "288e38c22f31884cef554a3ed3c83e9a5b87d187acfb16dfc4901347e5bd4a22",
+    "rova/agent_session/agent_session.py": "8e76dc15c5100b93990fcb6dfa39ca58c0db41045fc973bb61e4eeaa8e723c0f",
+    "rova/agent_session/compaction.py": "a789a1dece1fccedc3a2ec0b57d80fc1925e5c6777aac7b2dd07442a140d8565",
+    "rova/ai/context.py": "d67f7268390a5c388b420931d78c00867d032e5f7a7c38f2c537af80fdf1e743",
+    "rova/ai/events.py": "86c7811eaf66cd4d6e8ce4197b25f54f457fc4623bcc254bcdd1d0cd72c5b557",
+    "rova/ai/messages.py": "61904b6d36185d0fc9b55e535a7b5469f86fef3281ff1055b7776d74f4f1346e",
+    "rova/ai/models.py": "8d1fea78da8471290082882ec88178f7243f5a6978ef2c716317c307ce6cd500",
+    "rova/ai/providers/openai_compatible.py": "2bd62f9a84d379d7113ff49106d72a48b45b3026888fadd0ac810f035067b661",
+    "rova/ai/stream.py": "925364a3c8a70ddfee43548c6db912a3d371991d1732d0588354a684f51f2c0d",
+    "rova/app/runtime.py": "b1f217dd670044568397f8278ccce46944b439335b411169dda311194fe1633d",
+    "rova/app/workspace/approval.py": "efdf3dc2dae38a156ad3f7137702bcfc1876496b1a342794ce40abae4eada44b",
+    "rova/app/workspace/environment.py": "10c13f474576bb1bcfe709416da39e04c0c1026079eb21bf23e1d1b8e578955d",
+    "rova/app/workspace/sandbox.py": "58e63fcb9b64939c1812eeabded1a7f7a15d295d472c18aaf640b3f08d426365",
+    "rova/app/workspace/sandbox_control.py": "d2562837c61fc5d12e0facad4fa2f493bf83ced611f9b974f467ab06e9f03588",
+    "rova/app/workspace/terminal.py": "96a21f02617880b3c8b455a54f1799b8c066962f0089bdae9a8d2482c6bdfc6c",
+    "rova/app/workspace/workspace.py": "9de7a9d69257bd7cd85b790863d9b5700249c7e82dd53aa4dbaf0d06f51d0f4b",
+    "rova/eval/models.py": "e1181758578bc6c5c0da5087682e3333e83c07e4ce0e7b820c526c920b467172",
+    "rova/eval/runner.py": "a1c4b17c0da0e8fc618a8bafe12248322e1ef94811695691474d53dc6e2b2618",
+    "rova/trace/models.py": "30a0ddf9059a5750fbe2ffe16a42394148e139ff3d91432a51ee878f608a5354",
+    "rova/trace/store.py": "bf4cb707077c99a9c68f22acf89896f079bc66902748e295f43fb0950c4c418c"
+  },
+  "context_cases": [
+    {
+      "allowed_change_paths": [
+        "src/rule_engine.py"
+      ],
+      "case_id": "CM01_large_tool_output_repair",
+      "fixture_sha256": "e99ff93be9ead43e053a3fed440c856553020bc9ad734a7e192b683d45d21e3d",
+      "fixture_source": "evals/runtime_v1/fixtures/cm01_dry",
+      "prompt_sha256": "8e26be25b7bf7fbdfa823f95b067d6153c6e2b593b6d379050010b74e7f59ade",
+      "validator_sha256": "143ded54c70076e7ade1c3d9bae46e857695e844181a5249e2aca64bc2008ec8"
+    },
+    {
+      "allowed_change_paths": [
+        "src/followthrough.py"
+      ],
+      "case_id": "CM02_long_history_followthrough",
+      "fixture_sha256": "0e2d12fb998098a08b1e0bdb11160769fa97eb1578adaa14b00c61eca36b28ec",
+      "fixture_source": "evals/runtime_v1/fixtures/cm02_dry",
+      "prompt_sha256": "cbb499e2fad25b72ff93d123323108dacaaaaeb0bf53ca66915e13aa588d76fb",
+      "validator_sha256": "f220242d48a579a3cdf58814f3415f4b5609c96601bc6e893f5494b5137b37ce"
+    }
+  ],
+  "context_profiles": {
+    "base": {
+      "compaction": false,
+      "overflow_recovery": false,
+      "tool_result_externalization": false
+    },
+    "full": {
+      "compaction": true,
+      "compaction_policy": {
+        "context_window": 64000,
+        "keep_recent_tokens": 20000,
+        "reserve_tokens": 12000
+      },
+      "overflow_recovery": true,
+      "tool_result_externalization": true
+    }
+  },
+  "fault_injection": {
+    "authority_file_sha256": {
+      "evals/runtime_v1/fault_benchmark.py": "7ceedc2f3d173b5e88432501848bd0ab11c3ffbff337e7ff3893592353989dae",
+      "evals/runtime_v1/runner.py": "c0c0c55c917a6763c10ac5ec2e2f8a7c979b9be497f346224f19eea96e8f38df"
+    },
+    "case_ids": [
+      "FI01",
+      "FI02",
+      "FI03",
+      "FI04",
+      "FI05",
+      "FI06",
+      "FI07",
+      "FI08",
+      "FI09",
+      "FI10",
+      "FI11",
+      "FI12"
+    ],
+    "observation_authority": {
+      "actual_observation": "FaultRunObservation",
+      "evaluation": "FaultRunResult",
+      "expected_policy": "ExpectedFaultPolicy"
+    },
+    "observation_schema": [
+      "provider_attempt_count",
+      "recovered",
+      "terminated",
+      "termination_reason",
+      "compaction_count",
+      "tool_execution_count",
+      "side_effect_execution_count",
+      "partial_tool_execution_count",
+      "partial_commit_violations",
+      "transparent_tool_retry_violations",
+      "unexpected_retry_violations",
+      "duplicate_side_effect_count"
+    ],
+    "provider_requests": 0,
+    "repeats": 3
+  },
+  "formal_change_lock": true,
+  "formal_change_lock_rule": "Formal results cannot change frozen fixtures, prompts, validators, profiles, metrics, repeats, Tool scenarios, or Fault scripts. An invalidating defect requires a new suite version and manifest.",
+  "formal_execution_contract": {
+    "context_runtime_failure_boundary": {
+      "eval_infrastructure_phases": "fail_closed",
+      "runtime_prompt_exception": "persist_failed_context_record_and_continue"
+    },
+    "execution_states": [
+      "created",
+      "running",
+      "completed",
+      "interrupted",
+      "invalid"
+    ],
+    "formal_execution_started": false,
+    "formal_record_schema_version": 2,
+    "interruption_policy": "interrupted records are diagnostic only; aggregation fails closed",
+    "logical_identity": [
+      "experiment",
+      "item_id",
+      "profile",
+      "repeat_index",
+      "sample_index",
+      "phase"
+    ],
+    "manifest_sha256_semantics": "sha256(frozen manifest raw bytes)",
+    "raw_persistence_layout": [
+      "execution.json",
+      "frozen-manifest.json",
+      "formal-metadata.json",
+      "raw/context-results.jsonl",
+      "raw/tool-samples.jsonl",
+      "raw/fault-results.jsonl",
+      "raw/run-index.jsonl",
+      "traces/runs.jsonl"
+    ],
+    "resume_policy": "unsupported; start a new execution_id from the frozen manifest"
+  },
+  "formal_runs": {
+    "context_ab": 12,
+    "fault_injection": 36,
+    "tool_parallelism_measurements": 360,
+    "tool_parallelism_warmups": 36
+  },
+  "frozen_at": "2026-09-09T08:45:00Z",
+  "historical_run_disposition": [
+    {
+      "aggregation_status": "invalid",
+      "experiment_id": "dry-run-live-20260908*",
+      "reason": "Host/Sandbox validator path error."
+    },
+    {
+      "aggregation_status": "calibration_only",
+      "experiment_id": "pre-freeze-calibration-20260908",
+      "reason": "Pre-freeze calibration only."
+    },
+    {
+      "aggregation_status": "pre_formal_superseded",
+      "experiment_id": "runtime_v1_evaluation_v2",
+      "reason": "Context and Tool contracts were complete, but Fault formal observations did not persist actual runtime facts; no Formal Run used v2."
+    },
+    {
+      "aggregation_status": "pre_formal_superseded",
+      "experiment_id": "runtime_v1_context_64k_v1",
+      "reason": "Tool and Fault freeze contracts were incomplete; no Formal Run used v1."
+    },
+    {
+      "aggregation_status": "pre_formal_superseded",
+      "experiment_id": "runtime_v1_evaluation_v3",
+      "reason": "Formal benchmark contract was complete, but the new Formal execution, persistence, completeness, aggregation, and simulation authority had not yet been frozen; no Formal Run used v3."
+    },
+    {
+      "aggregation_status": "simulation_only",
+      "experiment_id": "simulation-*",
+      "reason": "Simulation executions never enter Formal aggregation."
+    },
+    {
+      "aggregation_status": "formal_invalidated",
+      "execution_id": "1e88c3fcf70b41a18b32b6d6c087b0cb",
+      "experiment_id": "runtime_v1_evaluation_v4",
+      "reason": "The only v4 Formal execution (1e88c3fcf70b41a18b32b6d6c087b0cb) was fail-closed invalidated: metadata used a canonical JSON manifest hash rather than the frozen file-byte hash, and Context duration instrumentation recorded evaluator time rather than Runtime wall-clock."
+    },
+    {
+      "aggregation_status": "formal_interrupted_diagnostic",
+      "execution_id": "bacd33b52df14f0aaccf18a2d11f35e5",
+      "experiment_id": "runtime_v1_evaluation_v5",
+      "reason": "The v5 Formal execution bacd33b52df14f0aaccf18a2d11f35e5 was interrupted and remains diagnostic only: a Runtime Context failure escaped the Formal Context executor instead of becoming a failed Context record."
+    }
+  ],
+  "metadata_contract": {
+    "provider_fingerprint": "sanitized; credentials are prohibited",
+    "required": [
+      "suite_version",
+      "runtime_commit",
+      "eval_suite_commit",
+      "manifest_sha256",
+      "authority_hashes",
+      "execution_id",
+      "execution_kind",
+      "resolved_provider_fingerprint",
+      "timestamps"
+    ]
+  },
+  "metric_definitions": {
+    "context_ab": [
+      "validator_success",
+      "total_input_tokens",
+      "average_input_tokens",
+      "max_input_tokens",
+      "output_tokens",
+      "duration_ms",
+      "provider_request_count",
+      "tool_call_count",
+      "externalization_count",
+      "compaction_count",
+      "overflow_recovery_count",
+      "harness_failure",
+      "termination_reason"
+    ],
+    "fault_injection": [
+      "recoverable_fault_recovery_rate",
+      "failure_policy_correctness",
+      "provider_attempt_count",
+      "termination_reason",
+      "compaction_count",
+      "tool_execution_count",
+      "duplicate_side_effect_count",
+      "partial_commit_violations",
+      "transparent_tool_retry_violations",
+      "unexpected_retry_violations"
+    ],
+    "tool_parallelism": [
+      "sequential_p50_ms",
+      "parallel_p50_ms",
+      "sequential_p95_ms",
+      "parallel_p95_ms",
+      "speedup",
+      "latency_reduction",
+      "ordering_violations",
+      "failure_isolation_violations",
+      "sequential_fallback_violations"
+    ]
+  },
+  "model": {
+    "context_window": 64000,
+    "max_tokens": null,
+    "name": "mimo-v2.5",
+    "provider": "openai_compatible",
+    "provider_timeout_seconds": 60.0,
+    "temperature": null
+  },
+  "runtime_commit": "3d33e093e8e8b22e996a7d33ef0db69cdbb081f6",
+  "sandbox": {
+    "image": "python:3.12-slim",
+    "image_digest": "sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9"
+  },
+  "schema_version": 6,
+  "shared_runtime_settings": {
+    "approval_handler": "AlwaysApprove",
+    "cleanup_policy": "discard_sandbox_and_delete_workspace_after_every_run",
+    "execution_environment": "sandbox",
+    "experience_review_enabled": false,
+    "keep_failed_workspace": false,
+    "max_turns": 6,
+    "permission_mode": "full",
+    "provider_max_retries": 2,
+    "terminal_backend": "docker",
+    "workspace_policy": "fresh_eval_owned_sandbox_no_apply"
+  },
+  "suite": "runtime-v1-evaluation",
+  "suite_version": "runtime_v1_evaluation_v6",
+  "supersedes": {
+    "reason": "The v5 Formal execution bacd33b52df14f0aaccf18a2d11f35e5 was interrupted and remains diagnostic only: a Runtime Context failure escaped the Formal Context executor instead of becoming a failed Context record.",
+    "status": "formal_interrupted_diagnostic",
+    "suite_version": "runtime_v1_evaluation_v5"
+  },
+  "tool_parallelism": {
+    "authority_file_sha256": {
+      "evals/runtime_v1/tool_parallel.py": "121fe17d715347a6bba33299efc6d617467e46eb1f434c239ee6cfc6eea1ccc8"
+    },
+    "measured_samples_per_scenario": 30,
+    "provider_requests": 0,
+    "scenarios": [
+      {
+        "batch_size": 1,
+        "expected_execution_mode": "sequential",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          25
+        ],
+        "requested_runtime_mode": "sequential",
+        "scenario_id": "TP_uniform_1_sequential",
+        "tool_classes": [
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 1,
+        "expected_execution_mode": "parallel",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          25
+        ],
+        "requested_runtime_mode": "parallel",
+        "scenario_id": "TP_uniform_1_parallel",
+        "tool_classes": [
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 2,
+        "expected_execution_mode": "sequential",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          25,
+          25
+        ],
+        "requested_runtime_mode": "sequential",
+        "scenario_id": "TP_uniform_2_sequential",
+        "tool_classes": [
+          "read_only",
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 2,
+        "expected_execution_mode": "parallel",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          25,
+          25
+        ],
+        "requested_runtime_mode": "parallel",
+        "scenario_id": "TP_uniform_2_parallel",
+        "tool_classes": [
+          "read_only",
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 4,
+        "expected_execution_mode": "sequential",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          25,
+          25,
+          25,
+          25
+        ],
+        "requested_runtime_mode": "sequential",
+        "scenario_id": "TP_uniform_4_sequential",
+        "tool_classes": [
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 4,
+        "expected_execution_mode": "parallel",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          25,
+          25,
+          25,
+          25
+        ],
+        "requested_runtime_mode": "parallel",
+        "scenario_id": "TP_uniform_4_parallel",
+        "tool_classes": [
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 8,
+        "expected_execution_mode": "sequential",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "requested_runtime_mode": "sequential",
+        "scenario_id": "TP_uniform_8_sequential",
+        "tool_classes": [
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 8,
+        "expected_execution_mode": "parallel",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "requested_runtime_mode": "parallel",
+        "scenario_id": "TP_uniform_8_parallel",
+        "tool_classes": [
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 4,
+        "expected_execution_mode": "sequential",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          5,
+          15,
+          60,
+          120
+        ],
+        "requested_runtime_mode": "sequential",
+        "scenario_id": "TP_skewed_sequential",
+        "tool_classes": [
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 4,
+        "expected_execution_mode": "parallel",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          5,
+          15,
+          60,
+          120
+        ],
+        "requested_runtime_mode": "parallel",
+        "scenario_id": "TP_skewed_parallel",
+        "tool_classes": [
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 4,
+        "expected_execution_mode": "parallel",
+        "failing_call_index": 1,
+        "per_tool_latency_ms": [
+          25,
+          25,
+          25,
+          25
+        ],
+        "requested_runtime_mode": "parallel",
+        "scenario_id": "TP_failure_isolation",
+        "tool_classes": [
+          "read_only",
+          "read_only",
+          "read_only",
+          "read_only"
+        ]
+      },
+      {
+        "batch_size": 2,
+        "expected_execution_mode": "sequential",
+        "failing_call_index": null,
+        "per_tool_latency_ms": [
+          25,
+          25
+        ],
+        "requested_runtime_mode": "parallel",
+        "scenario_id": "TP_mutation_fallback",
+        "tool_classes": [
+          "read_only",
+          "mutation"
+        ]
+      }
+    ],
+    "warmup_samples_per_scenario": 3
+  }
+}

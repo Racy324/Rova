@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -44,6 +45,31 @@ class ContextDryRunReport:
     results: tuple[EvalResult, ...]
     observations: tuple[ContextDryRunObservation, ...]
     provider_request_count: int
+
+
+class ContextRuntimeExecutionError(RuntimeError):
+    """A Runtime-phase failure observed by the Eval harness.
+
+    This is deliberately raised only for ``runtime.prompt()`` failures.  It
+    lets the Formal executor record one failed logical Context run without
+    confusing fixture preparation, validation, persistence, or cleanup errors
+    with an experiment result.
+    """
+
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        provider_request_count: int,
+        traces: tuple[object, ...],
+        duration_ms: float,
+    ) -> None:
+        self.failure_type = type(error).__name__
+        self.failure_message = f"runtime execution raised {self.failure_type}"
+        self.provider_request_count = provider_request_count
+        self.traces = traces
+        self.duration_ms = duration_ms
+        super().__init__(self.failure_message)
 
 
 class _ContextValidator:
@@ -159,10 +185,23 @@ async def _run_case(
                 isolated_sandbox=isolated_sandbox,
             )
             responses = []
-            for prompt in prompt_script(fixture.case_id, workspace):
-                responses = await runtime.prompt(prompt)
-                if responses[-1].stop_reason in {"error", "aborted"}:
-                    break
+            runtime_started = time.perf_counter()
+            try:
+                for prompt in prompt_script(fixture.case_id, workspace):
+                    responses = await runtime.prompt(prompt)
+                    if responses[-1].stop_reason in {"error", "aborted"}:
+                        break
+            except Exception as error:
+                # Reading the trace is intentionally outside the Runtime error
+                # wrapper: a trace association failure is Eval infrastructure
+                # failure and must fail the whole Formal execution closed.
+                traces = tuple(JsonlTraceStore(state_root / "traces" / "runs.jsonl").load_all())
+                raise ContextRuntimeExecutionError(
+                    error,
+                    provider_request_count=provider.calls if provider is not None else provider_requests,
+                    traces=traces,
+                    duration_ms=(time.perf_counter() - runtime_started) * 1000.0,
+                ) from error
             traces = JsonlTraceStore(state_root / "traces" / "runs.jsonl").load_all()
             trace = traces[-1]
             tool_calls = [call for item in traces for step in item.steps for call in step.tool_calls]

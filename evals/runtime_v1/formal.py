@@ -28,7 +28,7 @@ from rova.ai.models import Model
 from rova.eval import EvalCase, EvalExecution, EvalRunner
 from rova.trace import JsonlTraceStore
 
-from .context_ab import _ContextValidator, _DRY_MODEL, _run_case
+from .context_ab import ContextRuntimeExecutionError, _ContextValidator, _DRY_MODEL, _run_case
 from .fixtures import dry_run_context_fixtures
 from .fault_benchmark import run_fault_case
 from .frozen_manifest import load_frozen_manifest, manifest_sha256
@@ -367,8 +367,19 @@ class CompletenessValidator:
             raise FormalCompletenessError("missing trace reference")
         for item in context:
             run_ids = item.payload.get("trace_run_ids")
-            if not isinstance(run_ids, list) or not run_ids or any(run_id not in trace_ids for run_id in run_ids):
+            runtime_failure = bool(item.payload.get("runtime_execution_failure"))
+            if not isinstance(run_ids, list) or any(run_id not in trace_ids for run_id in run_ids):
                 raise FormalCompletenessError("Context result has incomplete trace references")
+            if runtime_failure:
+                if (
+                    item.payload.get("validator_success") is not False
+                    or item.payload.get("validator_status") != "not_run"
+                    or not isinstance(item.payload.get("runtime_failure_type"), str)
+                    or not isinstance(item.payload.get("runtime_failure_message"), str)
+                ):
+                    raise FormalCompletenessError("runtime-failed Context result is malformed")
+            elif not run_ids:
+                raise FormalCompletenessError("successful Context result has no trace reference")
         index = _read_jsonl(store.raw_root / "run-index.jsonl")
         if {tuple(item.get("logical_identity", ())) for item in index} != set(identities):
             raise FormalCompletenessError("run index does not cover exactly the persisted raw records")
@@ -402,7 +413,7 @@ class CompletenessValidator:
 
     @staticmethod
     def _validate_payloads(store: FormalExecutionStore, context: list[FormalRecord], tool: list[FormalRecord], fault: list[FormalRecord]) -> None:
-        context_fields = {"validator_success", "input_tokens", "average_input_tokens", "max_input_tokens", "output_tokens", "provider_request_count", "tool_call_count", "compaction_count", "externalization_count", "overflow_recovery_count", "termination_reason", "harness_failure", "fixture_sha256", "prompt_sha256", "validator_sha256", "trace_run_ids"}
+        context_fields = {"validator_success", "validator_status", "runtime_execution_failure", "runtime_failure_type", "runtime_failure_message", "input_tokens", "average_input_tokens", "max_input_tokens", "output_tokens", "provider_request_count", "tool_call_count", "compaction_count", "externalization_count", "overflow_recovery_count", "termination_reason", "harness_failure", "fixture_sha256", "prompt_sha256", "validator_sha256", "trace_run_ids"}
         tool_fields = {"scenario_id", "duration_ms", "source_order_correct", "failure_isolated", "mutation_fallback"}
         fault_fields = {"expected_policy", "observation", "passed", "violations"}
         if any(not context_fields.issubset(item.payload) for item in context):
@@ -458,6 +469,9 @@ class FormalAggregator:
             payloads = [item.payload for item in items]
             inputs = [value["input_tokens"] for value in payloads if value.get("input_tokens") is not None]
             output[key] = {"runs": len(items), "success_rate": sum(bool(value["validator_success"]) for value in payloads) / len(items),
+                           "task_failures": sum(not bool(value["validator_success"]) for value in payloads),
+                           "harness_failures": sum(bool(value["harness_failure"]) for value in payloads),
+                           "runtime_execution_failures": sum(bool(value["runtime_execution_failure"]) for value in payloads),
                            "mean_input_tokens": statistics.mean(inputs) if inputs else None,
                            "median_input_tokens": statistics.median(inputs) if inputs else None,
                            "mean_average_input_tokens": statistics.mean(value["average_input_tokens"] for value in payloads if value.get("average_input_tokens") is not None) if inputs else None,
@@ -643,23 +657,94 @@ class FormalRunner:
                     for repeat in range(1, self.plan.context_repeats + 1):
                         root = self._context_work_root / f"{case_number}-{profile_name[:1]}-{repeat}"
                         started = _now()
-                        execution, requests, observation = await _run_case(
-                            fixture,
-                            profile,
-                            root=root,
-                            model=self.model or _DRY_MODEL,
-                            stream_fn=self.stream_fn,
-                            use_development_provider=self.plan.execution_kind is FormalExecutionKind.SIMULATION,
-                        isolated_sandbox=(
-                            self.plan.execution_kind is FormalExecutionKind.FORMAL
-                            or self.plan.sandboxed_context
-                        ),
-                            sandbox_image=str(sandbox["image"]),
-                            keep_failed_workspace=self.keep_failed_workspace,
-                            max_turns=int(settings["max_turns"]),
-                            provider_max_retries=int(settings["provider_max_retries"]),
-                            exercise_sandbox_shell=self.plan.sandboxed_context,
-                        )
+                        try:
+                            execution, requests, observation = await _run_case(
+                                fixture,
+                                profile,
+                                root=root,
+                                model=self.model or _DRY_MODEL,
+                                stream_fn=self.stream_fn,
+                                use_development_provider=self.plan.execution_kind is FormalExecutionKind.SIMULATION,
+                                isolated_sandbox=(
+                                    self.plan.execution_kind is FormalExecutionKind.FORMAL
+                                    or self.plan.sandboxed_context
+                                ),
+                                sandbox_image=str(sandbox["image"]),
+                                keep_failed_workspace=self.keep_failed_workspace,
+                                max_turns=int(settings["max_turns"]),
+                                provider_max_retries=int(settings["provider_max_retries"]),
+                                exercise_sandbox_shell=self.plan.sandboxed_context,
+                            )
+                        except ContextRuntimeExecutionError as failure:
+                            for trace in failure.traces:
+                                store.append_trace(trace)
+                            usage = [trace.actual_usage for trace in failure.traces if trace.actual_usage is not None]
+                            input_tokens = [item.input_tokens for item in usage]
+                            output_tokens = [item.output_tokens for item in usage]
+                            tool_calls = [
+                                call
+                                for trace in failure.traces
+                                for step in trace.steps
+                                for call in step.tool_calls
+                            ]
+                            compactions = [item for trace in failure.traces for item in trace.compactions]
+                            trace_run_ids = [trace.run_id for trace in failure.traces]
+                            payload = {
+                                "validator_success": False,
+                                "validator_status": "not_run",
+                                "runtime_execution_failure": True,
+                                "runtime_failure_type": failure.failure_type,
+                                "runtime_failure_message": failure.failure_message,
+                                "duration_ms": failure.duration_ms,
+                                "input_tokens": sum(input_tokens) if input_tokens else None,
+                                "average_input_tokens": (
+                                    sum(input_tokens) / failure.provider_request_count
+                                    if input_tokens and failure.provider_request_count
+                                    else None
+                                ),
+                                "max_input_tokens": max(input_tokens) if input_tokens else None,
+                                "output_tokens": sum(output_tokens) if output_tokens else None,
+                                "total_tokens": sum(item.total_tokens for item in usage) if usage else None,
+                                "provider_request_count": failure.provider_request_count,
+                                "tool_call_count": len(tool_calls),
+                                "compaction_count": len(compactions),
+                                "externalization_count": sum(
+                                    call.result is not None and call.result.externalized for call in tool_calls
+                                ),
+                                "overflow_recovery_count": sum(
+                                    item.trigger.value == "overflow_recovery" for item in compactions
+                                ),
+                                "termination_reason": "runtime_execution_error",
+                                "harness_failure": False,
+                                "fixture_sha256": fixture.sha256,
+                                "prompt_sha256": raw_case["prompt_sha256"],
+                                "validator_sha256": raw_case["validator_sha256"],
+                                "allowed_change_paths": raw_case["allowed_change_paths"],
+                                "provider_fingerprint": self.plan.resolved_provider_fingerprint,
+                                "max_turns": settings["max_turns"],
+                                "trace_run_ids": trace_run_ids,
+                                "retained_workspace": False,
+                                "sandbox_created": None,
+                                "sandbox_discarded": None,
+                                "host_workspace_unchanged": None,
+                                "sandbox_shell_verified": None,
+                                "sandbox_image": sandbox["image"] if (self.plan.execution_kind is FormalExecutionKind.FORMAL or self.plan.sandboxed_context) else None,
+                                "sandbox_image_digest": sandbox["image_digest"] if (self.plan.execution_kind is FormalExecutionKind.FORMAL or self.plan.sandboxed_context) else None,
+                            }
+                            store.append(FormalRecord.from_payload(
+                                self.plan,
+                                experiment="context_ab",
+                                item_id=fixture.case_id,
+                                profile=profile_name,
+                                repeat_index=repeat,
+                                sample_index=1,
+                                phase="run",
+                                payload=payload,
+                                trace_run_id=trace_run_ids[-1] if trace_run_ids else None,
+                                started_at=started,
+                                duration_ms=failure.duration_ms,
+                            ))
+                            continue
 
                         class Executor:
                             async def execute(self, _case):
@@ -681,6 +766,10 @@ class FormalRunner:
                         output_tokens = [item.output_tokens for item in usage]
                         payload = {
                             "validator_success": result.task_success,
+                            "validator_status": "passed" if result.task_success else "failed",
+                            "runtime_execution_failure": False,
+                            "runtime_failure_type": None,
+                            "runtime_failure_message": None,
                             "duration_ms": runtime_duration_ms,
                             "input_tokens": sum(input_tokens) if input_tokens else None,
                             "average_input_tokens": (sum(input_tokens) / requests) if input_tokens and requests else None,
