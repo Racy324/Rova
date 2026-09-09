@@ -55,7 +55,13 @@ def dry_run_context_fixtures() -> tuple[SmokeFixture, ...]:
 
 
 @contextmanager
-def fresh_workspace(fixture: SmokeFixture, root: Path, *, keep_failed: bool = False):
+def fresh_workspace(
+    fixture: SmokeFixture,
+    root: Path,
+    *,
+    keep_failed: bool = False,
+    failure_state: dict[str, bool] | None = None,
+):
     """Copy one immutable fixture into an eval-owned workspace and clean it by default."""
     root = Path(root)
     workspace = root / f"{fixture.case_id}-{uuid4().hex}"
@@ -77,7 +83,10 @@ def fresh_workspace(fixture: SmokeFixture, root: Path, *, keep_failed: bool = Fa
             pass
         raise
     else:
-        shutil.rmtree(workspace, ignore_errors=True)
+        # A deterministic validator failure is a failed evaluation outcome too.
+        # The caller marks it before leaving the context after validation.
+        if not (keep_failed and failure_state is not None and failure_state.get("failed", False)):
+            shutil.rmtree(workspace, ignore_errors=True)
         try:
             root.rmdir()
         except OSError:

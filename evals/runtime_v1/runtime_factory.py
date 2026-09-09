@@ -50,6 +50,7 @@ def build_context_runtime(
     isolated_sandbox: bool = False,
     sandbox_root: Path | None = None,
     sandbox_image: str | None = None,
+    provider_max_retries: int = 2,
 ) -> RovaRuntime:
     """Build one isolated Context A/B runtime through the product assembly path."""
     state_root = Path(state_root)
@@ -73,4 +74,5 @@ def build_context_runtime(
         docker_image=sandbox_image,
         isolated_sandbox=isolated_sandbox,
         sandbox_root=sandbox_root,
+        provider_max_retries=provider_max_retries,
     )

@@ -58,8 +58,9 @@ class _ContextValidator:
 class _DevelopmentContextProvider:
     """Deterministic development provider; it is not used for the real capability call."""
 
-    def __init__(self, case_id: str) -> None:
+    def __init__(self, case_id: str, *, exercise_sandbox_shell: bool = False) -> None:
         self.case_id = case_id
+        self.exercise_sandbox_shell = exercise_sandbox_shell
         self.calls = 0
 
     async def __call__(self, _model: Model, context: Context, _options: object | None = None):
@@ -73,9 +74,13 @@ class _DevelopmentContextProvider:
             return
         tool_results = [item for item in context.messages if isinstance(item, ToolResultMessage)]
         if self.case_id == "CM01_large_tool_output_repair":
-            if not tool_results:
+            shell_results = [item for item in tool_results if item.tool_call_id == "sandbox-pwd"]
+            fixture_results = [item for item in tool_results if item.tool_call_id != "sandbox-pwd"]
+            if self.exercise_sandbox_shell and not shell_results:
+                yield StreamDone(AssistantMessage([ToolCall("sandbox-pwd", "shell", {"command": "pwd"})], stop_reason="tool_calls"))
+            elif not fixture_results:
                 yield StreamDone(AssistantMessage([ToolCall("read-large", "read", {"path": "reference.txt"})], stop_reason="tool_calls"))
-            elif len(tool_results) == 1:
+            elif len(fixture_results) == 1:
                 yield StreamDone(AssistantMessage([ToolCall("write-repair", "write", {
                     "path": "src/rule_engine.py",
                     "content": 'def selected_mapping() -> str:\n    return "violet-47"\n',
@@ -106,8 +111,14 @@ async def _run_case(
     isolated_sandbox: bool,
     sandbox_image: str | None,
     keep_failed_workspace: bool,
+    max_turns: int = 6,
+    provider_max_retries: int = 2,
+    exercise_sandbox_shell: bool = False,
 ) -> tuple[EvalExecution, int, ContextDryRunObservation]:
-    provider = _DevelopmentContextProvider(fixture.case_id) if use_development_provider else None
+    provider = _DevelopmentContextProvider(
+        fixture.case_id,
+        exercise_sandbox_shell=exercise_sandbox_shell,
+    ) if use_development_provider else None
     provider_requests = 0
 
     async def counted_stream(model: Model, context: Context, options: object | None = None):
@@ -117,7 +128,13 @@ async def _run_case(
             yield event
 
     effective_stream = provider if provider is not None else counted_stream
-    with fresh_workspace(fixture, root / "workspaces", keep_failed=keep_failed_workspace) as workspace:
+    failure_state: dict[str, bool] = {}
+    with fresh_workspace(
+        fixture,
+        root / "workspaces",
+        keep_failed=keep_failed_workspace,
+        failure_state=failure_state,
+    ) as workspace:
         baseline = snapshot_workspace(workspace)
         state_root = root / "state"
         runtime = build_context_runtime(
@@ -129,9 +146,18 @@ async def _run_case(
             trace_root=state_root / "traces",
             isolated_sandbox=isolated_sandbox,
             sandbox_root=state_root / "sandboxes",
-            sandbox_image=sandbox_image,
+            sandbox_image=sandbox_image if isolated_sandbox else None,
+            max_turns=max_turns,
+            provider_max_retries=provider_max_retries,
         )
         try:
+            _assert_context_runtime_contract(
+                runtime,
+                profile=profile,
+                max_turns=max_turns,
+                provider_max_retries=provider_max_retries,
+                isolated_sandbox=isolated_sandbox,
+            )
             responses = []
             for prompt in prompt_script(fixture.case_id, workspace):
                 responses = await runtime.prompt(prompt)
@@ -140,6 +166,11 @@ async def _run_case(
             traces = JsonlTraceStore(state_root / "traces" / "runs.jsonl").load_all()
             trace = traces[-1]
             tool_calls = [call for item in traces for step in item.steps for call in step.tool_calls]
+            shell_results = [
+                call.result.content.strip()
+                for call in tool_calls
+                if call.tool_name == "shell" and call.result is not None
+            ]
             externalization_count = sum(
                 call.result is not None and call.result.externalized for call in tool_calls
             )
@@ -161,19 +192,52 @@ async def _run_case(
             )
             validator_root = execution_workspace_root(runtime, workspace)
             validation = validate_workspace(fixture.case_id, validator_root, baseline)
-            return EvalExecution(
+            failure_state["failed"] = not validation.passed
+            execution = EvalExecution(
                 fixture.case_id,
                 trace,
                 responses[-1],
                 artifacts={
                     "validator_passed": validation.passed,
                     "validator_reason": validation.reason,
+                    # Eval-side formal persistence needs every Main Agent Run
+                    # in this scripted case, not only the last response trace.
+                    "run_traces": tuple(traces),
+                    "sandbox_created": runtime.sandbox_control is not None,
+                    "host_workspace_unchanged": snapshot_workspace(workspace) == baseline,
+                    "sandbox_discarded": False,
+                    "sandbox_shell_verified": (not exercise_sandbox_shell) or any(
+                        "/workspace" in result for result in shell_results
+                    ),
                 },
-            ), observation.provider_requests, observation
+            )
+            return execution, observation.provider_requests, observation
         finally:
             await runtime.close()
             if runtime.sandbox_control is not None:
                 runtime.sandbox_control.discard(confirm=lambda _plan: True)
+                if "execution" in locals():
+                    execution.artifacts["sandbox_discarded"] = True
+
+
+def _assert_context_runtime_contract(
+    runtime,
+    *,
+    profile: ContextManagementProfile,
+    max_turns: int,
+    provider_max_retries: int,
+    isolated_sandbox: bool,
+) -> None:
+    """Fail closed if the Runtime assembled for an eval differs from its inputs."""
+    agent = runtime.agent
+    if agent.max_turns != max_turns or agent.provider_retry_policy.max_retries != provider_max_retries:
+        raise RuntimeError("Context eval Runtime settings differ from the resolved execution plan")
+    if (agent.tool_runtime._tool_output_processor is not None) != profile.enable_tool_result_externalization:
+        raise RuntimeError("Context eval externalization setting differs from the selected profile")
+    if (agent._context_overflow_recovery is not None) != profile.enable_context_overflow_recovery:
+        raise RuntimeError("Context eval overflow recovery setting differs from the selected profile")
+    if isolated_sandbox != (runtime.sandbox_control is not None):
+        raise RuntimeError("Context eval execution environment differs from the selected plan")
 
 
 async def run_context_dry_run(

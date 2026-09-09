@@ -41,3 +41,14 @@ def test_fixture_hash_and_workspace_copy_ignore_python_cache_files(tmp_path: Pat
     with fresh_workspace(fixture, tmp_path / "workspaces") as workspace:
         assert (workspace / "tracked.txt").read_text(encoding="utf-8") == "fixture authority"
         assert not (workspace / "__pycache__").exists()
+
+
+def test_keep_failed_workspace_preserves_validator_failure(tmp_path: Path) -> None:
+    from evals.runtime_v1.fixtures import fresh_workspace, smoke_fixtures
+
+    state: dict[str, bool] = {}
+    root = tmp_path / "validator-failed"
+    with fresh_workspace(smoke_fixtures()[0], root, keep_failed=True, failure_state=state):
+        state["failed"] = True
+
+    assert len(list(root.glob("CM01_fixture_probe-*"))) == 1

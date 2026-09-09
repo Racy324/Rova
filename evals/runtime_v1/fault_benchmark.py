@@ -42,6 +42,7 @@ class FaultRunObservation:
     partial_commit_violations: int
     transparent_tool_retry_violations: int
     unexpected_retry_violations: int = 0
+    duplicate_side_effect_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,7 @@ async def run_fault_case(case_id: str, *, repeat_index: int, trace_root: Path | 
         compaction_count=int(artifacts["compaction_count"]),
         tool_execution_count=int(artifacts["tool_execution_count"]),
         side_effect_execution_count=int(artifacts["side_effect_execution_count"]),
+        duplicate_side_effect_count=max(0, int(artifacts["side_effect_execution_count"]) - 1),
         partial_tool_execution_count=int(artifacts["partial_tool_execution_count"]),
         partial_commit_violations=int(artifacts["partial_commit_violations"]),
         transparent_tool_retry_violations=0,

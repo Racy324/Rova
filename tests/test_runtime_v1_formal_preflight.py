@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,19 @@ def _git_clean(arguments: tuple[str, ...]) -> str:
     if arguments[:2] == ("merge-base", "--is-ancestor"):
         return ""
     raise AssertionError(f"unexpected git invocation: {arguments}")
+
+
+def _v2_manifest_with_current_authorities(tmp_path: Path) -> Path:
+    """Construct a historical v2 input whose authority matches this unit-test tree."""
+    source = Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v2.json")
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    for relative in payload["authority_file_sha256"]:
+        payload["authority_file_sha256"][relative] = hashlib.sha256(
+            Path(relative).read_bytes()
+        ).hexdigest()
+    path = tmp_path / "current-authority-v2.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def test_v2_manifest_freezes_complete_tool_fault_authority_without_eval_suite_commit(tmp_path: Path) -> None:
@@ -108,7 +122,7 @@ def test_v3_freeze_preserves_v2_context_tool_contract_and_freezes_fault_observat
 
     manifest_path = write_v3_freeze_manifest(
         tmp_path / "runtime_v1_evaluation_v3.json",
-        v2_manifest_path=Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v2.json"),
+        v2_manifest_path=_v2_manifest_with_current_authorities(tmp_path),
         frozen_at="2026-09-09T00:00:00Z",
     )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -141,7 +155,7 @@ def test_v3_preflight_rejects_fault_authority_hash_mismatch(tmp_path: Path) -> N
 
     manifest_path = write_v3_freeze_manifest(
         tmp_path / "runtime_v1_evaluation_v3.json",
-        v2_manifest_path=Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v2.json"),
+        v2_manifest_path=_v2_manifest_with_current_authorities(tmp_path),
         frozen_at="2026-09-09T00:00:00Z",
     )
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))

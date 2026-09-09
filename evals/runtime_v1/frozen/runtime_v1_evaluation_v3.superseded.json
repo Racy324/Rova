@@ -1,0 +1,6 @@
+{
+  "reason": "Formal benchmark contract was complete, but the new Formal execution, persistence, completeness, aggregation, and simulation authority had not yet been frozen; no Formal Run used v3.",
+  "status": "pre_formal_superseded",
+  "suite_version": "runtime_v1_evaluation_v3",
+  "superseded_by": "runtime_v1_evaluation_v4"
+}
