@@ -1,0 +1,6 @@
+{
+  "reason": "Context freeze was reproducible, but Tool/Fault authority contracts were incomplete; no Formal Run used v1.",
+  "status": "pre_formal_superseded",
+  "suite_version": "runtime_v1_context_64k_v1",
+  "superseded_by": "runtime_v1_evaluation_v2"
+}
