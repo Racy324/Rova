@@ -282,18 +282,28 @@ async def _fault_execution(case: EvalCase, trace_store: JsonlTraceStore) -> Eval
     case_id = case.case_id
     attempts = 0
     tool_calls = 0
+    side_effect_calls = 0
+    partial_tool_calls = 0
+    recovery_calls = 0
 
     async def recover(context: Context) -> Context:
+        nonlocal recovery_calls
+        recovery_calls += 1
         return Context("compacted", list(context.messages), list(context.tools))
 
-    async def failing_tool(_tool_call_id: str, _arguments: dict) -> AgentToolResult:
-        nonlocal tool_calls
+    async def failing_tool(tool_call_id: str, _arguments: dict) -> AgentToolResult:
+        nonlocal tool_calls, partial_tool_calls
         tool_calls += 1
+        if tool_call_id == "partial":
+            partial_tool_calls += 1
         raise ToolExecutionError("expected tool failure")
 
-    async def side_effect_tool(_tool_call_id: str, _arguments: dict) -> AgentToolResult:
-        nonlocal tool_calls
+    async def side_effect_tool(tool_call_id: str, _arguments: dict) -> AgentToolResult:
+        nonlocal tool_calls, side_effect_calls, partial_tool_calls
         tool_calls += 1
+        side_effect_calls += 1
+        if tool_call_id == "partial":
+            partial_tool_calls += 1
         return AgentToolResult([TextBlock("side effect once")])
 
     def stream(_model: Model, _context: Context, _options: object | None = None):
@@ -363,7 +373,23 @@ async def _fault_execution(case: EvalCase, trace_store: JsonlTraceStore) -> Eval
         passed = passed and tool_calls == 1
     if case_id == "FI06":
         passed = passed and all(message.text != "partial" for message in agent.messages if isinstance(message, AssistantMessage))
-    return EvalExecution(case.case_id, trace, responses[-1], artifacts={"passed": passed})
+    return EvalExecution(
+        case.case_id,
+        trace,
+        responses[-1],
+        artifacts={
+            "passed": passed,
+            "provider_attempt_count": attempts,
+            "compaction_count": recovery_calls,
+            "tool_execution_count": tool_calls,
+            "side_effect_execution_count": side_effect_calls,
+            "partial_tool_execution_count": partial_tool_calls,
+            "partial_commit_violations": sum(
+                isinstance(message, AssistantMessage) and message.text == "partial"
+                for message in agent.messages
+            ),
+        },
+    )
 
 
 async def _run_fault_smoke(store: _ResultStore) -> list[EvalResult]:
@@ -411,7 +437,19 @@ async def _cancel_backoff_execution(case: EvalCase, trace_store: JsonlTraceStore
     trace = recorder.last_trace
     assert trace is not None
     trace_store.append(trace)
-    return EvalExecution(case.case_id, trace, artifacts={"passed": attempts == 1 and agent.messages == [UserMessage(case.case_id)]})
+    return EvalExecution(
+        case.case_id,
+        trace,
+        artifacts={
+            "passed": attempts == 1 and agent.messages == [UserMessage(case.case_id)],
+            "provider_attempt_count": attempts,
+            "compaction_count": 0,
+            "tool_execution_count": 0,
+            "side_effect_execution_count": 0,
+            "partial_tool_execution_count": 0,
+            "partial_commit_violations": 0,
+        },
+    )
 
 
 async def run_infrastructure_smoke(result_root: Path, *, keep_failed_workspace: bool = False) -> InfrastructureSmokeReport:

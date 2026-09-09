@@ -101,3 +101,57 @@ def test_formal_preflight_rejects_dirty_worktree_and_authority_hash_mismatch(tmp
             git_runner=_git_clean,
             docker_image_digest=lambda _image: "sha256:" + "b" * 64,
         )
+
+
+def test_v3_freeze_preserves_v2_context_tool_contract_and_freezes_fault_observation(tmp_path: Path) -> None:
+    from evals.runtime_v1.freeze_v3 import write_v3_freeze_manifest
+
+    manifest_path = write_v3_freeze_manifest(
+        tmp_path / "runtime_v1_evaluation_v3.json",
+        v2_manifest_path=Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v2.json"),
+        frozen_at="2026-09-09T00:00:00Z",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["suite_version"] == "runtime_v1_evaluation_v3"
+    assert manifest["runtime_commit"] == "3d33e093e8e8b22e996a7d33ef0db69cdbb081f6"
+    assert manifest["fault_injection"]["observation_schema"] == [
+        "provider_attempt_count", "recovered", "terminated", "termination_reason",
+        "compaction_count", "tool_execution_count", "side_effect_execution_count",
+        "partial_tool_execution_count", "partial_commit_violations",
+        "transparent_tool_retry_violations", "unexpected_retry_violations",
+    ]
+    assert manifest["metric_definitions"]["fault_injection"] == [
+        "recoverable_fault_recovery_rate", "failure_policy_correctness",
+        "provider_attempt_count", "termination_reason", "compaction_count",
+        "tool_execution_count", "duplicate_side_effect_count",
+        "partial_commit_violations", "transparent_tool_retry_violations",
+        "unexpected_retry_violations",
+    ]
+    assert manifest["supersedes"] == {
+        "suite_version": "runtime_v1_evaluation_v2",
+        "status": "pre_formal_superseded",
+        "reason": "Context and Tool contracts were complete, but Fault formal observations did not persist actual runtime facts; no Formal Run used v2.",
+    }
+
+
+def test_v3_preflight_rejects_fault_authority_hash_mismatch(tmp_path: Path) -> None:
+    from evals.runtime_v1.formal_preflight_v3 import FormalPreflightError, preflight_formal_suite
+    from evals.runtime_v1.freeze_v3 import write_v3_freeze_manifest
+
+    manifest_path = write_v3_freeze_manifest(
+        tmp_path / "runtime_v1_evaluation_v3.json",
+        v2_manifest_path=Path("evals/runtime_v1/frozen/runtime_v1_evaluation_v2.json"),
+        frozen_at="2026-09-09T00:00:00Z",
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["fault_injection"]["authority_file_sha256"]["evals/runtime_v1/fault_benchmark.py"] = "0" * 64
+    mismatched = tmp_path / "mismatched-v3.json"
+    mismatched.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(FormalPreflightError, match="authority hash mismatch"):
+        preflight_formal_suite(
+            mismatched,
+            git_runner=_git_clean,
+            docker_image_digest=lambda _image: "sha256:" + "b" * 64,
+        )

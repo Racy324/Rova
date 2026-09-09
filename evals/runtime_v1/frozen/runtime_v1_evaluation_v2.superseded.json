@@ -1,0 +1,6 @@
+{
+  "reason": "Context and Tool contracts were complete, but Fault formal observations did not persist actual runtime facts; no Formal Run used v2.",
+  "status": "pre_formal_superseded",
+  "suite_version": "runtime_v1_evaluation_v2",
+  "superseded_by": "runtime_v1_evaluation_v3"
+}
